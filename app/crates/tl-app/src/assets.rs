@@ -153,7 +153,6 @@ impl LauncherAssets {
             NavTab::Play => self.nav_play.as_ref(),
             NavTab::Server => self.nav_server.as_ref(),
             NavTab::Mods => self.nav_mods.as_ref(),
-            NavTab::Host => self.nav_host.as_ref(),
             NavTab::Settings => self.nav_settings.as_ref(),
         }
     }

@@ -233,6 +233,54 @@ impl Default for ServerConfigData {
     }
 }
 
+fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+pub fn encode_terraria_safe_arg(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+pub fn decode_terraria_safe_arg(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                decode_hex_nibble(bytes[i + 1]),
+                decode_hex_nibble(bytes[i + 2]),
+            ) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 impl ServerConfigData {
     pub fn parse(text: &str) -> Self {
         let mut map: HashMap<String, String> = HashMap::new();
@@ -286,7 +334,7 @@ impl ServerConfigData {
             }
         }
         if let Some(v) = map.get("password") {
-            cfg.password = v.clone();
+            cfg.password = decode_terraria_safe_arg(v);
         }
         if let Some(v) = map.get("motd") {
             cfg.motd = v.clone();
@@ -366,7 +414,10 @@ impl ServerConfigData {
         lines.push(format!("maxplayers={}", self.maxplayers.clamp(1, 255)));
         lines.push(format!("port={}", self.port));
         if !self.password.is_empty() {
-            lines.push(format!("password={}", self.password));
+            lines.push(format!(
+                "password={}",
+                encode_terraria_safe_arg(&self.password)
+            ));
         }
         if !self.motd.trim().is_empty() {
             lines.push(format!("motd={}", self.motd.trim()));
@@ -447,8 +498,6 @@ pub struct LauncherConfig {
     pub active_server_id: String,
     pub servers: Vec<ServerProfile>,
     pub saved_join_servers: Vec<SavedJoinServer>,
-    pub bore_server: String,
-    pub bore_secret: String,
     pub proxy_url: String,
     pub auto_firewall: bool,
     pub auto_upnp: bool,
@@ -523,11 +572,9 @@ impl Default for LauncherConfig {
             active_server_id: tml_profile.id.clone(),
             servers: vec![tml_profile, vanilla_profile],
             saved_join_servers: Vec::new(),
-            bore_server: "bore.pub".to_string(),
-            bore_secret: String::new(),
             proxy_url: String::new(),
-            auto_firewall: true,
-            auto_upnp: true,
+            auto_firewall: false,
+            auto_upnp: false,
             tml_graphics_backend: GraphicsBackend::Auto,
             dotnet_tiered_pgo: true,
             dotnet_server_gc: false,
@@ -605,8 +652,10 @@ mod tests {
 
     #[test]
     fn legacy_launcher_config_json_uses_safe_performance_defaults() {
-        let legacy_json = r#"{"active_edition":"TModLoader","bore_server":"bore.pub"}"#;
+        let legacy_json = r#"{"active_edition":"TModLoader"}"#;
         let parsed: LauncherConfig = serde_json::from_str(legacy_json).unwrap();
+        assert!(!parsed.auto_firewall);
+        assert!(!parsed.auto_upnp);
         assert_eq!(parsed.tml_graphics_backend, GraphicsBackend::Auto);
         assert!(parsed.dotnet_tiered_pgo);
         assert!(!parsed.dotnet_server_gc);
@@ -629,5 +678,46 @@ mod tests {
         assert!(!roundtrip.dotnet_tiered_pgo);
         assert!(roundtrip.dotnet_server_gc);
         assert_eq!(roundtrip.game_process_priority, ProcessPriority::High);
+    }
+
+    #[test]
+    fn terraria_safe_arg_roundtrips_and_preserves_legacy_unescaped_percent() {
+        assert_eq!(encode_terraria_safe_arg("Alpha123-._~"), "Alpha123-._~");
+        assert_eq!(decode_terraria_safe_arg("Alpha123-._~"), "Alpha123-._~");
+
+        let special = "100% a+b";
+        let encoded = encode_terraria_safe_arg(special);
+        assert_eq!(encoded, "100%25%20a%2Bb");
+        assert_eq!(decode_terraria_safe_arg(&encoded), special);
+
+        let unicode = "mật khẩu 100% Việt";
+        let encoded_unicode = encode_terraria_safe_arg(unicode);
+        assert!(!encoded_unicode.contains(' '));
+        assert_eq!(decode_terraria_safe_arg(&encoded_unicode), unicode);
+
+        assert_eq!(decode_terraria_safe_arg("100%"), "100%");
+        assert_eq!(decode_terraria_safe_arg("100%G1%2"), "100%G1%2");
+    }
+
+    #[test]
+    fn serverconfig_password_escapes_percent_and_spaces_on_roundtrip() {
+        let cfg = ServerConfigData {
+            password: "100% my pass+word".to_string(),
+            ..ServerConfigData::default()
+        };
+
+        let vanilla_text = cfg.to_config_text(GameEdition::Vanilla);
+        assert!(vanilla_text.contains("password=100%25%20my%20pass%2Bword\r\n"));
+        let parsed_vanilla = ServerConfigData::parse(&vanilla_text);
+        assert_eq!(parsed_vanilla.password, "100% my pass+word");
+
+        let tml_text = cfg.to_config_text(GameEdition::TModLoader);
+        assert!(tml_text.contains("password=100%25%20my%20pass%2Bword\r\n"));
+        let parsed_tml = ServerConfigData::parse(&tml_text);
+        assert_eq!(parsed_tml.password, "100% my pass+word");
+
+        let legacy_raw = "port=7777\r\npassword=100%\r\n";
+        let parsed_legacy = ServerConfigData::parse(legacy_raw);
+        assert_eq!(parsed_legacy.password, "100%");
     }
 }

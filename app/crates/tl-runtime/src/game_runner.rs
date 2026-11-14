@@ -8,10 +8,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tl_core::{
-    is_xna_framework_installed, GameEdition, GraphicsBackend, LauncherError, LauncherPaths,
-    LauncherResult, ProcessPriority,
+    encode_terraria_safe_arg, is_xna_framework_installed, GameEdition, GraphicsBackend,
+    LauncherError, LauncherPaths, LauncherResult, ProcessPriority,
 };
 
 #[cfg(windows)]
@@ -44,6 +44,7 @@ pub struct RuntimeTuning {
     pub tiered_pgo: bool,
     pub server_gc: bool,
     pub process_priority: ProcessPriority,
+    pub disable_builtin_upnp: bool,
 }
 
 impl Default for RuntimeTuning {
@@ -52,6 +53,7 @@ impl Default for RuntimeTuning {
             tiered_pgo: true,
             server_gc: false,
             process_priority: ProcessPriority::Normal,
+            disable_builtin_upnp: false,
         }
     }
 }
@@ -100,6 +102,7 @@ impl GameLaunchOptions {
             tiered_pgo: self.dotnet_tiered_pgo,
             server_gc: self.dotnet_server_gc,
             process_priority: self.process_priority,
+            disable_builtin_upnp: false,
         }
     }
 }
@@ -569,8 +572,170 @@ fn append_join_args(cmd: &mut Command, opts: &GameLaunchOptions) {
     cmd.arg("-join").arg(host);
     cmd.arg("-port").arg(port.to_string());
     if !opts.join_password.is_empty() {
-        cmd.arg("-password").arg(&opts.join_password);
+        cmd.arg("-password")
+            .arg(encode_terraria_safe_arg(&opts.join_password));
     }
+}
+
+fn extract_exe_stem(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"');
+    let file_name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
+    let lower = file_name.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+}
+
+fn is_rejected_client_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "cmd"
+            | "powershell"
+            | "pwsh"
+            | "conhost"
+            | "wt"
+            | "terrarialauncher"
+            | "terrariallauncher"
+            | "terrariaserver"
+    )
+}
+
+fn parse_game_client_cmdline(
+    process_name: &str,
+    exe_path: Option<&Path>,
+    args: &[String],
+) -> Option<GameEdition> {
+    let name_stem = extract_exe_stem(process_name);
+    let exe_stem = exe_path.map(|p| extract_exe_stem(&p.to_string_lossy()));
+
+    if is_rejected_client_stem(&name_stem)
+        || exe_stem.as_deref().is_some_and(is_rejected_client_stem)
+    {
+        return None;
+    }
+
+    if args.iter().any(|arg| arg.eq_ignore_ascii_case("-server")) {
+        return None;
+    }
+
+    let has_tml_dll_arg = args.iter().any(|arg| {
+        let trimmed = arg.trim().trim_matches('"');
+        trimmed
+            .rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("tmodloader.dll"))
+    });
+    if has_tml_dll_arg
+        || name_stem == "tmodloader"
+        || exe_stem.as_deref() == Some("tmodloader")
+    {
+        return Some(GameEdition::TModLoader);
+    }
+
+    let is_vanilla_stem = |s: &str| s == "terraria" || s.starts_with("terraria_v");
+    if is_vanilla_stem(&name_stem) || exe_stem.as_deref().is_some_and(is_vanilla_stem) {
+        return Some(GameEdition::Vanilla);
+    }
+
+    None
+}
+
+fn normalize_path_for_match(raw: &str) -> String {
+    let replaced = raw.trim().trim_matches('"').replace('/', "\\");
+    let stripped = replaced.strip_prefix(r"\\?\").unwrap_or(&replaced);
+    stripped.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn text_references_dir(text: &str, dir_norm: &str) -> bool {
+    if dir_norm.is_empty() {
+        return false;
+    }
+    let norm = normalize_path_for_match(text);
+    let Some(pos) = norm.find(dir_norm) else {
+        return false;
+    };
+    let after = &norm[pos + dir_norm.len()..];
+    after.is_empty() || after.starts_with('\\')
+}
+
+fn process_references_launcher_paths(
+    exe_path: Option<&Path>,
+    args: &[String],
+    known_dirs: &[String],
+) -> bool {
+    if let Some(exe) = exe_path {
+        let exe_str = exe.to_string_lossy();
+        if known_dirs.iter().any(|dir| text_references_dir(&exe_str, dir)) {
+            return true;
+        }
+    }
+    args.iter()
+        .any(|arg| known_dirs.iter().any(|dir| text_references_dir(arg, dir)))
+}
+
+pub fn detect_existing_game_process(
+    sys: &mut System,
+    paths: &LauncherPaths,
+) -> Option<RunningGameSnapshot> {
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_memory()
+            .with_cpu(),
+    );
+
+    let self_pid = std::process::id();
+    let known_dirs: Vec<String> = [
+        &paths.terraria_dir,
+        &paths.tmodloader_dir,
+        &paths.vanilla_saves_dir,
+        &paths.tml_saves_dir,
+    ]
+    .into_iter()
+    .map(|p| normalize_path_for_match(&p.to_string_lossy()))
+    .filter(|s| !s.is_empty())
+    .collect();
+
+    let mut best: Option<((bool, u32), RunningGameSnapshot)> = None;
+
+    for (pid, process) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        if pid_u32 == self_pid {
+            continue;
+        }
+        let proc_name = process.name().to_string_lossy();
+        let exe_path = process.exe();
+        let args: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        let Some(edition) = parse_game_client_cmdline(&proc_name, exe_path, &args) else {
+            continue;
+        };
+
+        let preferred = process_references_launcher_paths(exe_path, &args, &known_dirs);
+        let rank = (!preferred, pid_u32);
+        let should_replace = match &best {
+            None => true,
+            Some((best_rank, _)) => rank < *best_rank,
+        };
+        if should_replace {
+            best = Some((
+                rank,
+                RunningGameSnapshot {
+                    pid: pid_u32,
+                    edition,
+                    memory_mb: process.memory() / (1024 * 1024),
+                    cpu_percent: process.cpu_usage(),
+                },
+            ));
+        }
+    }
+
+    best.map(|(_, snapshot)| snapshot)
 }
 
 pub fn append_extra_args(cmd: &mut Command, raw: &str) {
@@ -614,9 +779,24 @@ pub fn install_xna_framework_elevated(msi_path: &Path) -> LauncherResult<()> {
 
 #[cfg(windows)]
 pub fn run_elevated_windows(file: &str, params: &str) -> LauncherResult<()> {
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HRESULT, PCWSTR};
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_CANCELLED, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0,
+    };
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
+
+    struct ProcessHandleGuard(HANDLE);
+    impl Drop for ProcessHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
 
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -625,22 +805,63 @@ pub fn run_elevated_windows(file: &str, params: &str) -> LauncherResult<()> {
     let op = to_wide("runas");
     let exe = to_wide(file);
     let args = to_wide(params);
-    let res = unsafe {
-        ShellExecuteW(
-            None,
-            PCWSTR(op.as_ptr()),
-            PCWSTR(exe.as_ptr()),
-            PCWSTR(args.as_ptr()),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(op.as_ptr()),
+        lpFile: PCWSTR(exe.as_ptr()),
+        lpParameters: PCWSTR(args.as_ptr()),
+        nShow: if file.eq_ignore_ascii_case("netsh.exe") || file.eq_ignore_ascii_case("netsh") {
+            SW_HIDE.0
+        } else {
+            SW_SHOWNORMAL.0
+        },
+        ..Default::default()
     };
-    if (res.0 as isize) <= 32 {
+
+    if let Err(err) = unsafe { ShellExecuteExW(&mut sei) } {
+        let last_err = unsafe { GetLastError() };
+        if last_err == ERROR_CANCELLED || err.code() == HRESULT::from_win32(ERROR_CANCELLED.0) {
+            return Err(LauncherError::Process(
+                "Người dùng đã hủy cấp quyền Administrator".to_string(),
+            ));
+        }
         return Err(LauncherError::Process(format!(
-            "Không thể khởi chạy tác vụ với quyền Administrator (mã {})",
-            res.0 as isize
+            "Không thể khởi chạy tác vụ với quyền Administrator: {err}"
         )));
     }
+
+    if sei.hProcess.is_invalid() {
+        return Ok(());
+    }
+    let _handle_guard = ProcessHandleGuard(sei.hProcess);
+
+    let wait_res = unsafe { WaitForSingleObject(sei.hProcess, 60_000) };
+    if wait_res != WAIT_OBJECT_0 {
+        return Err(LauncherError::Process(format!(
+            "Tác vụ quyền Administrator không hoàn tất trong 60 giây (mã chờ {})",
+            wait_res.0
+        )));
+    }
+
+    let mut exit_code = 0u32;
+    unsafe { GetExitCodeProcess(sei.hProcess, &mut exit_code) }.map_err(|e| {
+        LauncherError::Process(format!(
+            "Không đọc được mã thoát của tác vụ quyền Administrator: {e}"
+        ))
+    })?;
+
+    if exit_code == STILL_ACTIVE.0 as u32 {
+        return Err(LauncherError::Process(
+            "Tác vụ quyền Administrator vẫn đang chạy quá thời gian chờ".to_string(),
+        ));
+    }
+    if exit_code != 0 {
+        return Err(LauncherError::Process(format!(
+            "Tác vụ quyền Administrator thất bại (mã thoát {exit_code})"
+        )));
+    }
+
     Ok(())
 }
 
@@ -838,7 +1059,7 @@ mod tests {
             &GameLaunchOptions {
                 join_host: "10.0.0.5".to_string(),
                 join_port: 7788,
-                join_password: "pass word".to_string(),
+                join_password: "100% pass+word".to_string(),
                 ..Default::default()
             },
         );
@@ -848,7 +1069,105 @@ mod tests {
             .collect();
         assert_eq!(
             args_full,
-            vec!["-join", "10.0.0.5", "-port", "7788", "-password", "pass word"]
+            vec![
+                "-join",
+                "10.0.0.5",
+                "-port",
+                "7788",
+                "-password",
+                "100%25%20pass%2Bword"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_game_client_cmdline_distinguishes_clients_from_servers_and_wrappers() {
+        assert_eq!(
+            parse_game_client_cmdline(
+                "Terraria.exe",
+                Some(Path::new(r"C:\TerrariaLauncher\Terraria\Terraria.exe")),
+                &[
+                    r"C:\TerrariaLauncher\Terraria\Terraria.exe".to_string(),
+                    "-savedirectory".to_string(),
+                    r"C:\TerrariaLauncher\data\Saves\Vanilla".to_string(),
+                ],
+            ),
+            Some(GameEdition::Vanilla)
+        );
+        assert_eq!(
+            parse_game_client_cmdline("Terraria_v1.4.5.8.exe", None, &[]),
+            Some(GameEdition::Vanilla)
+        );
+        assert_eq!(
+            parse_game_client_cmdline(
+                "dotnet.exe",
+                Some(Path::new(
+                    r"C:\TerrariaLauncher\tModLoader\dotnet\dotnet.exe"
+                )),
+                &[
+                    "dotnet.exe".to_string(),
+                    r"C:\TerrariaLauncher\tModLoader\tModLoader.dll".to_string(),
+                    "-nosteam".to_string(),
+                ],
+            ),
+            Some(GameEdition::TModLoader)
+        );
+        assert_eq!(
+            parse_game_client_cmdline(
+                "tModLoader.exe",
+                Some(Path::new(r"C:\Steam\steamapps\common\tModLoader\tModLoader.exe")),
+                &[],
+            ),
+            Some(GameEdition::TModLoader)
+        );
+        assert_eq!(
+            parse_game_client_cmdline(
+                "TerrariaServer.exe",
+                Some(Path::new(
+                    r"C:\TerrariaLauncher\Terraria\TerrariaServer.exe"
+                )),
+                &["-config".to_string(), "serverconfig.txt".to_string()],
+            ),
+            None
+        );
+        assert_eq!(
+            parse_game_client_cmdline(
+                "dotnet.exe",
+                Some(Path::new(
+                    r"C:\TerrariaLauncher\tModLoader\dotnet\dotnet.exe"
+                )),
+                &[
+                    "dotnet".to_string(),
+                    r"C:\TerrariaLauncher\tModLoader\tModLoader.dll".to_string(),
+                    "-server".to_string(),
+                    "-config".to_string(),
+                    "serverconfig.txt".to_string(),
+                ],
+            ),
+            None
+        );
+        assert_eq!(
+            parse_game_client_cmdline(
+                "TerrariaLauncher.exe",
+                Some(Path::new(r"C:\TerrariaLauncher\TerrariaLauncher.exe")),
+                &[r"C:\TerrariaLauncher\Terraria\Terraria.exe".to_string()],
+            ),
+            None
+        );
+        assert_eq!(
+            parse_game_client_cmdline(
+                "powershell.exe",
+                Some(Path::new(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                )),
+                &[
+                    "powershell.exe".to_string(),
+                    "-Command".to_string(),
+                    r"C:\TerrariaLauncher\Terraria\Terraria.exe".to_string(),
+                    r"C:\TerrariaLauncher\tModLoader\tModLoader.dll".to_string(),
+                ],
+            ),
+            None
         );
     }
 
@@ -929,7 +1248,7 @@ mod tests {
                 let mut c = Command::new("cmd");
                 c.args([
                     "/C",
-                    "for /L %i in (1,1,90) do @echo out-line-%i & echo err-line-last 1>&2",
+                    "(for /L %i in (1,1,90) do @echo out-line-%i) & echo err-line-last 1>&2",
                 ]);
                 c
             }

@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 
 [workspace.lints.rust]
@@ -36,7 +36,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 quick-xml = "0.42.0"
 sysinfo = "0.40.1"
-bore-cli = "0.6.0"
 socket2 = "0.6"
 open = "5.4.5"
 rfd = "0.17.2"
@@ -46,8 +45,11 @@ egui = "0.37.0"
 egui_extras = { version = "0.37.0", features = ["all_loaders", "image"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Security",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 

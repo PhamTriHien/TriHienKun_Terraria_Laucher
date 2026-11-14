@@ -1,7 +1,7 @@
 use crate::assets::LauncherAssets;
 use crate::theme::{format_bytes, palette, ThemePalette};
 use egui::{ColorImage, TextureHandle, TextureOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,25 +15,30 @@ use tl_core::{
     TmodMetadata, WorldBackupInfo, WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 use tl_runtime::{
-    browse_workshop_mods, build_modpack_share_preview, check_firewall_rule_exists, close_upnp_port,
-    delete_installed_mod, delete_staged_workshop_mod, download_and_install_tmod_url_with_source,
+    browse_workshop_mods, build_modpack_share_preview, check_firewall_rule_exists,
+    delete_installed_mod, detect_existing_game_process,
+    detect_existing_server_processes, download_and_install_tmod_url_with_source,
     download_and_install_xna, download_workshop_mod_via_steamcmd, ensure_firewall_rule,
     fetch_github_latest_tmod, fetch_terraria_branch_manifest, fetch_tmodloader_releases,
     fetch_workshop_details, fetch_workshop_image_bytes, import_local_mod_files,
     inspect_share_key_against_local, install_dotnet8_portable, install_steamcmd_with_progress,
     install_terraria_from_local_zip, install_terraria_from_source, install_tmodloader_release,
-    install_xna_framework_elevated, launch_game, load_banlist, load_installed_terraria_receipt,
-    load_mod_sources, load_workshop_manifest, open_upnp_port, parse_mod_source_input,
-    parse_workshop_id, probe_network_snapshot, probe_tcp_endpoint, record_workshop_install,
-    remove_firewall_rule, save_banlist, scan_installed_mods, scan_staged_workshop_mods,
-    search_workshop_candidates_for_mod, set_mod_enabled, start_bore_tunnel, start_server,
-    sync_modpack_from_share_key, upsert_mod_source, ActiveGameProcess, BanEntry, BoreTunnelHandle,
-    GameLaunchOptions, InstallProgress, InstallTarget, InstalledModEntry,
-    InstalledTerrariaReceipt, ModPackImportPreview, ModPackSharePreview, ModPackSyncProgress,
-    ModPackSyncReport, ModSourceRecord, NetworkSnapshot, ProgressCallback, RemoteTmodAsset,
-    RepaintHandle, RunningGameSnapshot, RuntimeTuning, ServerLifecycleState, ServerRuntimeSnapshot,
-    ServerSupervisor, StagedWorkshopMod, TerrariaBranchManifest, TmodLoaderReleaseInfo,
-    TunnelStatus, UpnpLeaseInfo, WorkshopItemDetails, WorkshopManifestRecord, WorkshopQueryResult,
+    install_xna_framework_elevated, is_local_probe_host, launch_game, load_banlist,
+    load_installed_terraria_receipt, load_mod_sources, load_workshop_manifest,
+    parse_mod_source_input, parse_workshop_id, probe_local_endpoint_listening,
+    probe_local_tcp_listening, probe_network_snapshot, probe_tcp_endpoint,
+    read_server_log_summary, record_workshop_install, remove_firewall_rule,
+    resolve_ipv6_bridge_target, save_banlist, scan_installed_mods, scan_staged_workshop_mods,
+    search_workshop_candidates_for_mod, set_mod_enabled, split_endpoint_host_port,
+    start_direct_port_host, start_ipv4_to_ipv6_client_bridge, start_server,
+    sync_modpack_from_share_key, terminate_process_by_pid, upsert_mod_source, ActiveGameProcess,
+    BanEntry, DetectedExternalServer, DirectHostConfig, DirectHostStatus, DirectPortHostHandle,
+    ExternalServerLogSummary, GameLaunchOptions, InstallProgress, InstallTarget, InstalledModEntry,
+    InstalledTerrariaReceipt, LocalClientBridgeHandle, ModPackImportPreview, ModPackSharePreview,
+    ModPackSyncProgress, ModPackSyncReport, ModSourceRecord, NetworkSnapshot, ProgressCallback,
+    RemoteTmodAsset, RepaintHandle, RunningGameSnapshot, RuntimeTuning, ServerLifecycleState,
+    ServerRuntimeSnapshot, ServerSupervisor, StagedWorkshopMod, TerrariaBranchManifest,
+    TmodLoaderReleaseInfo, WorkshopItemDetails, WorkshopManifestRecord, WorkshopQueryResult,
     WorkshopSort,
 };
 use tokio::sync::mpsc;
@@ -43,7 +48,6 @@ pub enum NavTab {
     Play,
     Server,
     Mods,
-    Host,
     Settings,
 }
 
@@ -53,8 +57,24 @@ impl NavTab {
             Self::Play => "Chơi Game",
             Self::Server => "Server Game",
             Self::Mods => "Cài Mod",
-            Self::Host => "Host Online",
             Self::Settings => "Cài đặt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSubTab {
+    Config,
+    Network,
+    Console,
+}
+
+impl ServerSubTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Config => "Cấu hình",
+            Self::Network => "Mở Port & IP",
+            Self::Console => "Console & Người chơi",
         }
     }
 }
@@ -94,8 +114,6 @@ pub enum WorkshopThumbState {
 
 pub enum AppEvent {
     NetworkProbed(NetworkSnapshot),
-    UpnpOpened(Result<UpnpLeaseInfo, String>),
-    UpnpClosed(Result<(), String>),
     FirewallResult(Result<String, String>),
     PortProbed {
         endpoint: String,
@@ -150,25 +168,37 @@ pub struct AppState {
     pub sys: Option<System>,
 
     pub active_tab: NavTab,
+    pub server_tab: ServerSubTab,
     pub mods_tab: ModsSubTab,
     pub notification: Option<AppNotification>,
     pub last_poll_at: Instant,
 
     pub active_game: Option<ActiveGameProcess>,
     pub running_game: Option<RunningGameSnapshot>,
+    pub external_game: Option<RunningGameSnapshot>,
+    client_ipv6_bridge: Option<LocalClientBridgeHandle>,
 
-    pub server_supervisor: Option<ServerSupervisor>,
-    pub server_snapshot: Option<ServerRuntimeSnapshot>,
+    pub server_supervisors: HashMap<String, ServerSupervisor>,
+    pub server_snapshots: HashMap<String, ServerRuntimeSnapshot>,
+    pub external_servers: Vec<DetectedExternalServer>,
+    pub external_log_summaries: HashMap<String, ExternalServerLogSummary>,
+    cleared_external_log_pids: HashMap<String, u32>,
+    pub last_external_scan_at: Instant,
     pub console_input: String,
     pub console_autoscroll: bool,
     pub banlist_entries: Vec<BanEntry>,
     pub manual_ban_name: String,
     pub manual_ban_ip: String,
 
-    pub bore_handle: Option<BoreTunnelHandle>,
-    pub upnp_lease: Option<UpnpLeaseInfo>,
+    pub pending_auto_direct_host_profile_id: Option<String>,
+    pub direct_host_handle: Option<DirectPortHostHandle>,
+    pub direct_host_port_input: String,
+    pub direct_bind_ip: Option<std::net::Ipv4Addr>,
+    pub direct_try_upnp: bool,
+    pub firewall_busy: bool,
     pub network_snapshot: NetworkSnapshot,
     pub network_loading: bool,
+    network_reprobe_queued: bool,
     pub port_probe_host: String,
     pub port_probe_port: String,
     pub port_probe_status: Option<(bool, String)>,
@@ -228,14 +258,20 @@ pub struct AppState {
     pub install_last_error: Option<String>,
 
     pub worlds: Vec<WorldMetadata>,
+    pub vanilla_worlds: Vec<WorldMetadata>,
+    pub tml_worlds: Vec<WorldMetadata>,
     pub world_backups: Vec<WorldBackupInfo>,
+
+    pub quick_join_port_input: String,
+    pub server_port_input: String,
+    pub workshop_inspect_busy: bool,
+    pub show_new_profile_form: bool,
+    pub confirm_delete_profile_id: Option<String>,
+    pub confirm_restore_backup: Option<PathBuf>,
 
     pub new_profile_name: String,
     pub new_profile_edition: GameEdition,
     pub new_join_name: String,
-    pub new_join_host: String,
-    pub new_join_port: String,
-    pub new_join_password: String,
 }
 
 impl AppState {
@@ -263,7 +299,13 @@ impl AppState {
         let default_port = config
             .active_server()
             .map(|s| s.config.port)
+            .filter(|&p| p > 0)
             .unwrap_or(7777);
+        let quick_join_port_init = if config.quick_join_port > 0 {
+            config.quick_join_port
+        } else {
+            7777
+        };
         let last_saved_proxy = config.proxy_url.trim().to_string();
 
         let mut state = Self {
@@ -277,22 +319,34 @@ impl AppState {
             env,
             sys: System::new().ok(),
             active_tab: NavTab::Play,
+            server_tab: ServerSubTab::Config,
             mods_tab: ModsSubTab::Installed,
             notification: None,
             last_poll_at: Instant::now(),
             active_game: None,
             running_game: None,
-            server_supervisor: None,
-            server_snapshot: None,
+            external_game: None,
+            client_ipv6_bridge: None,
+            server_supervisors: HashMap::new(),
+            server_snapshots: HashMap::new(),
+            external_servers: Vec::new(),
+            external_log_summaries: HashMap::new(),
+            cleared_external_log_pids: HashMap::new(),
+            last_external_scan_at: Instant::now(),
             console_input: String::new(),
             console_autoscroll: true,
             banlist_entries: Vec::new(),
             manual_ban_name: String::new(),
             manual_ban_ip: String::new(),
-            bore_handle: None,
-            upnp_lease: None,
+            pending_auto_direct_host_profile_id: None,
+            direct_host_handle: None,
+            direct_host_port_input: default_port.to_string(),
+            direct_bind_ip: None,
+            direct_try_upnp: true,
+            firewall_busy: false,
             network_snapshot: NetworkSnapshot::default(),
             network_loading: false,
+            network_reprobe_queued: false,
             port_probe_host: String::new(),
             port_probe_port: default_port.to_string(),
             port_probe_status: None,
@@ -315,7 +369,7 @@ impl AppState {
             workshop_candidate_target: None,
             workshop_candidates: Vec::new(),
             workshop_candidates_busy: false,
-            github_repo_input: "JavidPack/RecipeBrowser".to_string(),
+            github_repo_input: String::new(),
             github_assets: Vec::new(),
             github_busy: false,
             direct_mod_url: String::new(),
@@ -347,20 +401,194 @@ impl AppState {
             install_progress: None,
             install_last_error: None,
             worlds: Vec::new(),
+            vanilla_worlds: Vec::new(),
+            tml_worlds: Vec::new(),
             world_backups: Vec::new(),
+            quick_join_port_input: quick_join_port_init.to_string(),
+            server_port_input: default_port.to_string(),
+            workshop_inspect_busy: false,
+            show_new_profile_form: false,
+            confirm_delete_profile_id: None,
+            confirm_restore_backup: None,
             new_profile_name: String::new(),
             new_profile_edition: GameEdition::TModLoader,
             new_join_name: String::new(),
-            new_join_host: String::new(),
-            new_join_port: "7777".to_string(),
-            new_join_password: String::new(),
         };
 
         state.refresh_worlds_and_backups();
         state.refresh_mods_and_packs();
         state.refresh_banlist();
-        state.spawn_network_probe();
+        state.scan_external_servers();
+        if state.active_external_server().is_none() {
+            if let Some(running_id) = state
+                .external_servers
+                .iter()
+                .filter_map(|ext| ext.profile_id.as_ref())
+                .find(|id| state.config.servers.iter().any(|p| &p.id == *id))
+                .cloned()
+            {
+                state.select_server_profile(running_id);
+            }
+        }
+        if !state.network_loading {
+            state.spawn_network_probe();
+        }
         state
+    }
+
+    pub fn current_running_game(&self) -> Option<&RunningGameSnapshot> {
+        self.running_game.as_ref().or(self.external_game.as_ref())
+    }
+
+    pub fn is_game_running(&self) -> bool {
+        self.active_game.is_some() || self.external_game.is_some()
+    }
+
+    pub fn active_server_supervisor(&self) -> Option<&ServerSupervisor> {
+        self.server_supervisors.get(&self.config.active_server_id)
+    }
+
+    pub fn active_server_snapshot(&self) -> Option<&ServerRuntimeSnapshot> {
+        self.server_snapshots.get(&self.config.active_server_id)
+    }
+
+    pub fn external_server_for_profile(&self, profile_id: &str) -> Option<&DetectedExternalServer> {
+        self.external_servers
+            .iter()
+            .find(|d| d.profile_id.as_deref() == Some(profile_id))
+    }
+
+    pub fn active_external_server(&self) -> Option<&DetectedExternalServer> {
+        if self.active_server_supervisor().is_some_and(|s| s.is_active()) {
+            return None;
+        }
+        let active_id = self.config.active_server_id.as_str();
+        if let Some(found) = self
+            .external_servers
+            .iter()
+            .find(|d| d.profile_id.as_deref() == Some(active_id))
+        {
+            return Some(found);
+        }
+        let active_port = self
+            .config
+            .active_server()
+            .map(|p| p.config.port)
+            .unwrap_or(0);
+        if active_port == 0 {
+            return None;
+        }
+        let collides_with_supervised = self.server_supervisors.iter().any(|(id, sup)| {
+            id != active_id
+                && sup.is_active()
+                && self
+                    .server_snapshots
+                    .get(id)
+                    .map(|s| s.port)
+                    .or_else(|| {
+                        self.config
+                            .servers
+                            .iter()
+                            .find(|p| p.id == *id)
+                            .map(|p| p.config.port)
+                    })
+                    == Some(active_port)
+        });
+        if collides_with_supervised {
+            return None;
+        }
+        self.external_servers.iter().find(|d| {
+            d.port == Some(active_port)
+                && d.profile_id
+                    .as_deref()
+                    .is_none_or(|pid| !self.config.servers.iter().any(|p| p.id == pid))
+        })
+    }
+
+    pub fn active_external_log_summary(&self) -> Option<&ExternalServerLogSummary> {
+        let ext = self.active_external_server()?;
+        let profile_id = ext.profile_id.as_deref()?;
+        self.external_log_summaries.get(profile_id)
+    }
+
+    pub fn total_running_servers_count(&self) -> usize {
+        let supervised = self
+            .server_supervisors
+            .values()
+            .filter(|sup| sup.is_active())
+            .count();
+        supervised + self.external_servers.len()
+    }
+
+    pub fn any_server_active(&self) -> bool {
+        self.total_running_servers_count() > 0
+    }
+
+    pub fn is_profile_running(&self, profile_id: &str) -> bool {
+        self.server_supervisors
+            .get(profile_id)
+            .is_some_and(|sup| sup.is_active())
+            || self.external_server_for_profile(profile_id).is_some()
+    }
+
+    pub fn is_active_external_starting(&self) -> bool {
+        self.showing_external_server()
+            && self.active_external_log_summary().is_some_and(|summary| {
+                !summary.is_listening
+                    && (!summary.lines.is_empty() || !summary.status_detail.is_empty())
+            })
+    }
+
+    pub fn running_supervised_snapshots(&self) -> Vec<(String, ServerRuntimeSnapshot)> {
+        let mut out: Vec<(String, ServerRuntimeSnapshot)> = self
+            .server_supervisors
+            .iter()
+            .filter(|(_, sup)| sup.is_active())
+            .filter_map(|(id, _)| {
+                self.server_snapshots
+                    .get(id)
+                    .cloned()
+                    .map(|snap| (id.clone(), snap))
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.1.profile_name
+                .to_lowercase()
+                .cmp(&b.1.profile_name.to_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
+    }
+
+    pub fn select_server_profile(&mut self, id: String) {
+        if !self.config.servers.iter().any(|s| s.id == id) {
+            return;
+        }
+        let changed = self.config.active_server_id != id;
+        if changed {
+            self.config.active_server_id = id;
+            self.save_config();
+        }
+        self.confirm_delete_profile_id = None;
+        self.refresh_banlist();
+        let cfg_port = self
+            .config
+            .active_server()
+            .map(|s| s.config.port)
+            .filter(|&p| p > 0)
+            .unwrap_or(7777);
+        self.server_port_input = cfg_port.to_string();
+        let port_str = self.active_server_port().to_string();
+        self.port_probe_port = port_str.clone();
+        if !matches!(
+            self.active_direct_host_status(),
+            DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
+        ) {
+            self.direct_host_port_input = port_str;
+        }
+        if changed {
+            self.spawn_network_probe();
+        }
     }
 
     pub fn notify_ok(&mut self, msg: impl Into<String>) {
@@ -412,29 +640,40 @@ impl AppState {
     }
 
     pub fn refresh_worlds_and_backups(&mut self) {
-        let worlds_dir = match self.config.active_edition {
-            GameEdition::Vanilla => self.paths.vanilla_worlds_dir(),
-            GameEdition::TModLoader => self.paths.tml_worlds_dir(),
-        };
-        let mut parsed = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&worlds_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("wld"))
-                    .unwrap_or(false)
-                {
-                    if let Ok(meta) = parse_world_file(&path) {
-                        parsed.push(meta);
+        let scan_dir = |dir: &std::path::Path| -> Vec<WorldMetadata> {
+            let mut parsed = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.eq_ignore_ascii_case("wld"))
+                    {
+                        if let Ok(meta) = parse_world_file(&path) {
+                            parsed.push(meta);
+                        }
                     }
                 }
             }
-        }
-        parsed.sort_by_key(|a| a.world_name.to_lowercase());
-        self.worlds = parsed;
+            parsed.sort_by_key(|a| a.world_name.to_lowercase());
+            parsed
+        };
+        self.vanilla_worlds = scan_dir(&self.paths.vanilla_worlds_dir());
+        self.tml_worlds = scan_dir(&self.paths.tml_worlds_dir());
+        self.worlds = match self.config.active_edition {
+            GameEdition::Vanilla => self.vanilla_worlds.clone(),
+            GameEdition::TModLoader => self.tml_worlds.clone(),
+        };
         self.world_backups = list_world_backups(&self.paths.backups_dir).unwrap_or_default();
+        self.confirm_restore_backup = None;
+    }
+
+    pub fn worlds_for_edition(&self, edition: GameEdition) -> &[WorldMetadata] {
+        match edition {
+            GameEdition::Vanilla => &self.vanilla_worlds,
+            GameEdition::TModLoader => &self.tml_worlds,
+        }
     }
 
     pub fn refresh_mods_and_packs(&mut self) {
@@ -490,34 +729,25 @@ impl AppState {
                 AppEvent::NetworkProbed(snap) => {
                     self.network_loading = false;
                     if self.port_probe_host.trim().is_empty() {
-                        if let Some(pub_ip) = snap.public_ip {
+                        if let Some((h, p)) = self
+                            .active_online_endpoint()
+                            .as_deref()
+                            .and_then(split_endpoint_host_port)
+                        {
+                            self.port_probe_host = h;
+                            self.port_probe_port = p.to_string();
+                        } else if let Some(pub_ip) = snap.public_ip {
                             self.port_probe_host = pub_ip.to_string();
+                            self.port_probe_port = self.active_server_port().to_string();
                         }
                     }
                     self.network_snapshot = snap;
-                }
-                AppEvent::UpnpOpened(res) => match res {
-                    Ok(lease) => {
-                        let warn = if lease.is_cgnat {
-                            " (Lưu ý: Router báo IP WAN thuộc dải CGNAT — hãy bật Tunnel cho bạn bè kết nối)"
-                        } else {
-                            ""
-                        };
-                        self.notify_ok(format!("Đã mở UPnP cổng {}{warn}", lease.port));
-                        self.upnp_lease = Some(lease);
-                    }
-                    Err(e) => {
-                        self.notify_err(e);
-                    }
-                },
-                AppEvent::UpnpClosed(res) => {
-                    self.upnp_lease = None;
-                    match res {
-                        Ok(()) => self.notify_ok("Đã đóng cổng UPnP trên router."),
-                        Err(e) => self.notify_err(e),
+                    if self.network_reprobe_queued {
+                        self.spawn_network_probe();
                     }
                 }
                 AppEvent::FirewallResult(res) => {
+                    self.firewall_busy = false;
                     let port = self.active_server_port();
                     self.network_snapshot.firewall_rule_active =
                         Some(check_firewall_rule_exists(port));
@@ -529,7 +759,19 @@ impl AppState {
                 AppEvent::PortProbed { endpoint, result } => {
                     self.port_probe_busy = false;
                     self.port_probe_status = Some(match result {
-                        Ok(ms) => (true, format!("{endpoint} phản hồi ({ms} ms)")),
+                        Ok(ms) => {
+                            let is_local = split_endpoint_host_port(&endpoint).is_some_and(
+                                |(h, _)| is_local_probe_host(&h, &self.network_snapshot),
+                            );
+                            let msg = if is_local {
+                                format!(
+                                    "{endpoint} đang mở nội bộ ({ms} ms — thử tự kiểm tra trên máy này, chưa xác nhận qua Modem)"
+                                )
+                            } else {
+                                format!("{endpoint} phản hồi ({ms} ms)")
+                            };
+                            (true, msg)
+                        }
                         Err(e) => (false, format!("{endpoint}: {e}")),
                     });
                 }
@@ -602,9 +844,7 @@ impl AppState {
                     self.workshop_thumbnails.insert(url, thumb_state);
                 }
                 AppEvent::WorkshopLookedUp(res) => {
-                    if self.workshop_downloading_id.is_none() {
-                        self.workshop_busy = false;
-                    }
+                    self.workshop_inspect_busy = false;
                     match res {
                         Ok(details) => self.workshop_details = Some(details),
                         Err(e) => self.notify_err(e),
@@ -812,6 +1052,7 @@ impl AppState {
                     let log_file = proc_handle.log_path().to_path_buf();
                     self.active_game = None;
                     self.running_game = None;
+                    self.stop_client_ipv6_bridge();
                     if exit.success() {
                         self.notify_ok(format!("{} đã đóng bình thường.", edition.label()));
                     } else {
@@ -846,48 +1087,140 @@ impl AppState {
                     self.refresh_worlds_and_backups();
                 } else {
                     self.running_game = Some(proc_handle.snapshot());
+                    self.external_game = None;
                 }
+            } else if self.external_game.is_some() {
+                if self.sys.is_none() {
+                    self.sys = System::new().ok();
+                }
+                self.external_game = self
+                    .sys
+                    .as_mut()
+                    .and_then(|sys| detect_existing_game_process(sys, &self.paths));
             }
 
-            if let Some(sup) = &self.server_supervisor {
-                let prev_player_count = self
-                    .server_snapshot
-                    .as_ref()
-                    .map(|s| s.players.len())
-                    .unwrap_or(0);
-                let prev_state = self
-                    .server_snapshot
-                    .as_ref()
-                    .map(|s| s.state.clone());
-                let snap = match self.sys.as_mut() {
-                    Some(sys) => sup.snapshot(sys),
-                    None => {
-                        if let Ok(mut fallback) = System::new() {
-                            sup.snapshot(&mut fallback)
-                        } else {
-                            return;
+            if !self.server_supervisors.is_empty() {
+                if self.sys.is_none() {
+                    self.sys = System::new().ok();
+                }
+                let mut any_banlist_dirty = false;
+                let mut any_just_stopped = false;
+                let mut any_network_dirty = false;
+
+                let sup_entries: Vec<(String, ServerSupervisor)> = self
+                    .server_supervisors
+                    .iter()
+                    .map(|(id, sup)| (id.clone(), sup.clone()))
+                    .collect();
+
+                for (profile_id, sup) in sup_entries {
+                    let prev_snap = self.server_snapshots.get(&profile_id);
+                    let prev_player_count = prev_snap.map(|s| s.players.len()).unwrap_or(0);
+                    let prev_state = prev_snap.map(|s| s.state.clone());
+
+                    let snap_opt = match self.sys.as_mut() {
+                        Some(sys) => Some(sup.snapshot(sys)),
+                        None => System::new()
+                            .ok()
+                            .map(|mut fallback| sup.snapshot(&mut fallback)),
+                    };
+
+                    if let Some(snap) = snap_opt {
+                        let curr_player_count = snap.players.len();
+                        let just_started_running =
+                            matches!(snap.state, ServerLifecycleState::Running)
+                                && !matches!(prev_state, Some(ServerLifecycleState::Running));
+                        let just_stopped = matches!(
+                            snap.state,
+                            ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_)
+                        ) && !matches!(
+                            prev_state,
+                            Some(ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_))
+                        );
+
+                        self.server_snapshots.insert(profile_id, snap);
+
+                        if curr_player_count != prev_player_count || just_stopped {
+                            any_banlist_dirty = true;
+                        }
+                        if just_stopped {
+                            any_just_stopped = true;
+                            any_network_dirty = true;
+                        }
+                        if just_started_running {
+                            any_network_dirty = true;
                         }
                     }
-                };
-                let curr_player_count = snap.players.len();
-                let just_stopped = matches!(
-                    snap.state,
-                    ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_)
-                ) && !matches!(
-                    prev_state,
-                    Some(ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_))
-                );
-                if curr_player_count != prev_player_count || just_stopped {
-                    self.refresh_banlist();
-                    if just_stopped {
-                        self.refresh_worlds_and_backups();
-                    }
                 }
-                self.server_snapshot = Some(snap);
+
+                if any_banlist_dirty {
+                    self.refresh_banlist();
+                }
+                if any_just_stopped {
+                    self.refresh_worlds_and_backups();
+                }
+                if any_network_dirty {
+                    self.spawn_network_probe();
+                }
             }
         }
 
-        ctx.request_repaint_after(Duration::from_millis(16));
+        if now.saturating_duration_since(self.last_external_scan_at) >= Duration::from_secs(2) {
+            self.scan_external_servers();
+        }
+
+        if let Some(target_id) = self.pending_auto_direct_host_profile_id.clone() {
+            let sup_active = self
+                .server_supervisors
+                .get(&target_id)
+                .is_some_and(|s| s.is_active());
+            match self.server_snapshots.get(&target_id).map(|s| &s.state) {
+                Some(ServerLifecycleState::Running) => {
+                    self.pending_auto_direct_host_profile_id = None;
+                    let port = self
+                        .server_snapshots
+                        .get(&target_id)
+                        .map(|s| s.port)
+                        .filter(|&p| p > 0)
+                        .unwrap_or_else(|| self.active_server_port());
+                    self.start_direct_host_on_port(port);
+                }
+                Some(ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_)) | None => {
+                    self.pending_auto_direct_host_profile_id = None;
+                    self.notify_err("Server đã dừng trước khi kịp mở Port mạng.");
+                }
+                Some(ServerLifecycleState::Starting | ServerLifecycleState::Stopping) => {
+                    if !sup_active {
+                        self.pending_auto_direct_host_profile_id = None;
+                        self.notify_err("Server đã dừng trước khi kịp mở Port mạng.");
+                    }
+                }
+            }
+        }
+
+        let any_task_busy = self.install_busy
+            || self.steamcmd_busy
+            || self.modpack_sync_busy
+            || self.workshop_busy
+            || self.workshop_inspect_busy
+            || self.workshop_browse_busy
+            || self.workshop_candidates_busy
+            || self.github_busy
+            || self.port_probe_busy
+            || self.firewall_busy
+            || self.network_loading
+            || self.tml_releases_busy
+            || self.terraria_check_busy
+            || matches!(
+                self.active_direct_host_status(),
+                DirectHostStatus::Starting { .. }
+            );
+        let repaint_interval = if any_task_busy {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(500)
+        };
+        ctx.request_repaint_after(repaint_interval);
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -912,11 +1245,21 @@ impl AppState {
     }
 
     pub fn active_server_port(&self) -> u16 {
-        self.server_snapshot
-            .as_ref()
-            .map(|s| s.port)
-            .or_else(|| self.config.active_server().map(|p| p.config.port))
-            .unwrap_or(7777)
+        let port = if self
+            .active_server_supervisor()
+            .is_some_and(|s| s.is_active())
+        {
+            self.active_server_snapshot()
+                .map(|s| s.port)
+                .or_else(|| self.config.active_server().map(|p| p.config.port))
+        } else {
+            self.config
+                .active_server()
+                .map(|p| p.config.port)
+                .filter(|&p| p > 0)
+                .or_else(|| self.active_external_server().and_then(|e| e.port))
+        };
+        port.filter(|&p| p > 0).unwrap_or(7777)
     }
 
     pub fn mod_icon_texture(
@@ -953,11 +1296,27 @@ impl AppState {
         self.save_config();
     }
 
+    fn stop_client_ipv6_bridge(&mut self) {
+        if let Some(bridge) = self.client_ipv6_bridge.take() {
+            bridge.stop();
+        }
+    }
+
     pub fn launch_selected_game(&mut self, join_server: Option<(String, u16, String)>) {
         if self.active_game.is_some() {
             self.notify_err("Game đang chạy. Hãy đóng phiên hiện tại trước khi mở mới.");
             return;
         }
+        if let Some(ext) = &self.external_game {
+            let msg = format!(
+                "{} đang mở sẵn (PID {}). Hãy kết nối trực tiếp trong menu Multiplayer của game hoặc nhấn 'Đóng Game' trước khi mở mới.",
+                ext.edition.label(),
+                ext.pid
+            );
+            self.notify_err(msg);
+            return;
+        }
+        self.stop_client_ipv6_bridge();
         if self.config.active_edition == GameEdition::TModLoader {
             let selected_pack = self.config.active_modpack.trim().to_string();
             if !selected_pack.is_empty()
@@ -975,21 +1334,61 @@ impl AppState {
                 );
             }
         }
+        let (join_host, join_port, join_password) = match join_server {
+            Some((raw_host, raw_port, password)) => {
+                let (h, p) = split_host_port_input(&raw_host, raw_port);
+                (h, p, password)
+            }
+            None => {
+                let fallback_p = self
+                    .quick_join_port_input
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|&p| p > 0)
+                    .unwrap_or(self.config.quick_join_port);
+                let (h, p) = split_host_port_input(&self.config.quick_join_host, fallback_p);
+                let final_p = if p > 0 { p } else { 7777 };
+                self.config.quick_join_host = h.clone();
+                self.config.quick_join_port = final_p;
+                self.quick_join_port_input = final_p.to_string();
+                (h, final_p, self.config.quick_join_password.clone())
+            }
+        };
         self.save_config();
 
-        let (join_host, join_port, join_password) = join_server.unwrap_or_else(|| {
-            (
-                self.config.quick_join_host.trim().to_string(),
-                self.config.quick_join_port,
-                self.config.quick_join_password.clone(),
-            )
-        });
+        // Terraria client connects via IPv4; bridge IPv6 targets over a local 127.0.0.1 forwarder.
+        let target_port = if join_port > 0 { join_port } else { 7777 };
+        let resolved_v6 = if !join_host.trim().is_empty() {
+            self.rt
+                .block_on(resolve_ipv6_bridge_target(&join_host, target_port))
+        } else {
+            None
+        };
+        let (effective_join_host, effective_join_port) = if let Some(v6_target) = resolved_v6 {
+            match self
+                .rt
+                .block_on(start_ipv4_to_ipv6_client_bridge(v6_target, target_port))
+            {
+                Ok(bridge) => {
+                    let local_port = bridge.local_port();
+                    self.client_ipv6_bridge = Some(bridge);
+                    ("127.0.0.1".to_string(), local_port)
+                }
+                Err(err) => {
+                    self.notify_err(err.to_string());
+                    return;
+                }
+            }
+        } else {
+            (join_host, join_port)
+        };
 
         let opts = GameLaunchOptions {
             edition: self.config.active_edition,
             modpack: self.config.active_modpack.clone(),
-            join_host,
-            join_port,
+            join_host: effective_join_host,
+            join_port: effective_join_port,
             join_password,
             extra_args: String::new(),
             graphics_backend: self.config.tml_graphics_backend,
@@ -1002,17 +1401,45 @@ impl AppState {
             Ok(mut proc_handle) => {
                 self.running_game = Some(proc_handle.snapshot());
                 self.active_game = Some(proc_handle);
+                self.external_game = None;
                 self.notify_ok(format!("Đã khởi chạy {}.", self.config.active_edition.label()));
             }
-            Err(e) => self.notify_err(e.to_string()),
+            Err(e) => {
+                self.stop_client_ipv6_bridge();
+                self.notify_err(e.to_string());
+            }
         }
     }
 
     pub fn kill_running_game(&mut self) {
+        self.stop_client_ipv6_bridge();
         if let Some(mut proc_handle) = self.active_game.take() {
             let _ = proc_handle.kill();
             self.running_game = None;
+            self.external_game = None;
             self.notify_ok("Đã đóng tiến trình game.");
+        } else if let Some(ext) = self.external_game.take() {
+            if self.sys.is_none() {
+                self.sys = System::new().ok();
+            }
+            let killed = self
+                .sys
+                .as_mut()
+                .is_some_and(|sys| terminate_process_by_pid(sys, ext.pid));
+            if killed {
+                self.notify_ok("Đã đóng tiến trình game.");
+            } else {
+                let still_there = self
+                    .sys
+                    .as_mut()
+                    .and_then(|sys| detect_existing_game_process(sys, &self.paths));
+                if still_there.is_none() {
+                    self.notify_ok("Đã đóng tiến trình game.");
+                } else {
+                    self.external_game = still_there;
+                    self.notify_err(format!("Không thể đóng tiến trình game PID {}.", ext.pid));
+                }
+            }
         }
     }
 
@@ -1027,24 +1454,37 @@ impl AppState {
 
     fn can_start_install(&mut self, overwriting_edition: Option<GameEdition>) -> bool {
         if let Some(edition) = overwriting_edition {
-            if self.active_game.is_some() {
+            if self.is_game_running() {
                 self.notify_err("Vui lòng đóng game trước khi cài đặt/cập nhật.");
                 return false;
             }
-            let server_active = self
-                .server_supervisor
-                .as_ref()
-                .is_some_and(|s| s.is_active());
-            if server_active {
-                let running_edition = self
-                    .server_snapshot
-                    .as_ref()
-                    .map(|s| s.edition)
-                    .or_else(|| self.config.active_server().map(|p| p.edition));
-                if running_edition == Some(edition) {
-                    self.notify_err("Vui lòng đóng game trước khi cài đặt/cập nhật.");
+            let supervised_conflict = self.server_supervisors.iter().any(|(id, sup)| {
+                if !sup.is_active() {
                     return false;
                 }
+                let running_edition = self
+                    .server_snapshots
+                    .get(id)
+                    .map(|s| s.edition)
+                    .or_else(|| {
+                        self.config
+                            .servers
+                            .iter()
+                            .find(|p| p.id == *id)
+                            .map(|p| p.edition)
+                    });
+                running_edition == Some(edition)
+            });
+            let external_conflict = self
+                .external_servers
+                .iter()
+                .any(|ext| ext.edition == edition);
+            if supervised_conflict || external_conflict {
+                self.notify_err(format!(
+                    "Vui lòng tắt server {} đang chạy trước khi cài đặt/cập nhật.",
+                    edition.label()
+                ));
+                return false;
             }
         }
         if self.install_busy {
@@ -1325,29 +1765,45 @@ impl AppState {
     }
 
     pub fn start_selected_server(&mut self) {
-        if self
-            .server_supervisor
-            .as_ref()
-            .map(|s| s.is_active())
-            .unwrap_or(false)
-        {
-            self.notify_err("Server đang chạy.");
-            return;
-        }
-        self.save_config();
         let Some(profile) = self.config.active_server().cloned() else {
             self.notify_err("Chưa có cấu hình server nào.");
             return;
         };
-
-        if self.config.auto_firewall {
-            let port = profile.config.port;
-            if !check_firewall_rule_exists(port) {
-                self.ensure_firewall(port);
-            }
+        if self
+            .server_supervisors
+            .get(&profile.id)
+            .is_some_and(|s| s.is_active())
+        {
+            self.notify_err("Server của hồ sơ này đang chạy.");
+            return;
         }
-        if self.config.auto_upnp && profile.config.upnp && self.upnp_lease.is_none() {
-            self.open_upnp(profile.config.port);
+        if let Some(ext) = self.external_server_for_profile(&profile.id) {
+            self.notify_err(format!(
+                "Server của hồ sơ này đang chạy từ phiên trước (PID {}). Hãy tắt trước khi khởi chạy mới.",
+                ext.pid
+            ));
+            return;
+        }
+        self.save_config();
+        if profile.config.port == 0 {
+            self.notify_err("Cổng TCP Server phải từ 1 đến 65535");
+            return;
+        }
+        let port_used_by_other = self.server_supervisors.iter().any(|(id, sup)| {
+            id != &profile.id
+                && sup.is_active()
+                && self.server_snapshots.get(id).map(|s| s.port) == Some(profile.config.port)
+        }) || self
+            .external_servers
+            .iter()
+            .any(|ext| ext.port == Some(profile.config.port));
+        if port_used_by_other || self.rt.block_on(probe_local_tcp_listening(profile.config.port)) {
+            self.scan_external_servers();
+            self.notify_err(format!(
+                "Cổng {} đang được tiến trình khác sử dụng (server khác hoặc Host & Play trong game). Hãy đổi cổng hoặc tắt tiến trình đang giữ cổng này.",
+                profile.config.port
+            ));
+            return;
         }
 
         let handle = self.rt.handle().clone();
@@ -1355,7 +1811,10 @@ impl AppState {
             tiered_pgo: self.config.dotnet_tiered_pgo,
             server_gc: self.config.dotnet_server_gc,
             process_priority: self.config.game_process_priority,
+            disable_builtin_upnp: true,
         };
+        let profile_id = profile.id.clone();
+        let profile_name = profile.name.clone();
         match start_server(
             &handle,
             self.paths.clone(),
@@ -1364,36 +1823,480 @@ impl AppState {
             self.repaint.clone(),
         ) {
             Ok(sup) => {
-                self.server_snapshot = self
-                    .sys
-                    .as_mut()
-                    .map(|sys| sup.snapshot(sys));
-                self.server_supervisor = Some(sup);
-                self.notify_ok("Đang khởi chạy server...");
+                if self.sys.is_none() {
+                    self.sys = System::new().ok();
+                }
+                if let Some(snap) = self.sys.as_mut().map(|sys| sup.snapshot(sys)) {
+                    self.server_snapshots.insert(profile_id.clone(), snap);
+                } else {
+                    self.server_snapshots.remove(&profile_id);
+                }
+                self.server_supervisors.insert(profile_id.clone(), sup);
+                self.external_log_summaries.remove(&profile_id);
+                self.cleared_external_log_pids.remove(&profile_id);
+                self.external_servers
+                    .retain(|e| e.profile_id.as_deref() != Some(profile_id.as_str()));
+                self.notify_ok(format!("Đang khởi chạy {profile_name}..."));
             }
             Err(e) => self.notify_err(e.to_string()),
         }
     }
 
+    pub fn scan_external_servers(&mut self) {
+        self.last_external_scan_at = Instant::now();
+        if self.sys.is_none() {
+            self.sys = System::new().ok();
+        }
+        self.external_game = if self.active_game.is_some() {
+            None
+        } else {
+            self.sys
+                .as_mut()
+                .and_then(|sys| detect_existing_game_process(sys, &self.paths))
+        };
+
+        let mut supervised_pids = HashSet::new();
+        let mut supervised_profile_ids = HashSet::new();
+        for (profile_id, sup) in &self.server_supervisors {
+            if sup.is_active() {
+                supervised_profile_ids.insert(profile_id.clone());
+                if let Some(pid) = self.server_snapshots.get(profile_id).and_then(|s| s.pid) {
+                    supervised_pids.insert(pid);
+                }
+            }
+        }
+
+        let detected = match self.sys.as_mut() {
+            Some(sys) => detect_existing_server_processes(sys, &self.paths),
+            None => Vec::new(),
+        };
+
+        let next: Vec<DetectedExternalServer> = detected
+            .into_iter()
+            .filter(|d| {
+                !supervised_pids.contains(&d.pid)
+                    && !d
+                        .profile_id
+                        .as_deref()
+                        .is_some_and(|pid| supervised_profile_ids.contains(pid))
+            })
+            .collect();
+
+        let mut next_summaries = HashMap::new();
+        for ext in &next {
+            if let Some(profile_id) = ext.profile_id.as_deref() {
+                let mut summary = read_server_log_summary(&self.paths, profile_id, 250);
+                if self.cleared_external_log_pids.get(profile_id) == Some(&ext.pid) {
+                    summary.lines.clear();
+                }
+                next_summaries.insert(profile_id.to_string(), summary);
+            }
+        }
+        self.cleared_external_log_pids.retain(|profile_id, pid| {
+            next.iter().any(|ext| {
+                ext.profile_id.as_deref() == Some(profile_id.as_str()) && ext.pid == *pid
+            })
+        });
+        self.external_log_summaries = next_summaries;
+
+        let prev_keys: Vec<(u32, Option<u16>)> = self
+            .external_servers
+            .iter()
+            .map(|e| (e.pid, e.port))
+            .collect();
+        let next_keys: Vec<(u32, Option<u16>)> = next.iter().map(|e| (e.pid, e.port)).collect();
+        let changed = prev_keys != next_keys;
+        self.external_servers = next;
+        if changed {
+            self.spawn_network_probe();
+        }
+    }
+
+    fn profile_effective_port(&self, profile_id: &str) -> Option<u16> {
+        self.server_snapshots
+            .get(profile_id)
+            .map(|s| s.port)
+            .filter(|&p| p > 0)
+            .or_else(|| {
+                self.config
+                    .servers
+                    .iter()
+                    .find(|p| p.id == profile_id)
+                    .map(|p| p.config.port)
+                    .filter(|&p| p > 0)
+            })
+            .or_else(|| {
+                self.external_server_for_profile(profile_id)
+                    .and_then(|e| e.port)
+                    .filter(|&p| p > 0)
+            })
+    }
+
+    fn is_port_used_by_other_active_server(
+        &self,
+        port: u16,
+        ignore_profile_id: Option<&str>,
+        ignore_ext_pid: Option<u32>,
+    ) -> bool {
+        if port == 0 {
+            return false;
+        }
+        let used_by_supervised = self.server_supervisors.iter().any(|(id, sup)| {
+            if ignore_profile_id == Some(id.as_str()) || !sup.is_active() {
+                return false;
+            }
+            let snap = self.server_snapshots.get(id);
+            if snap.is_some_and(|s| {
+                matches!(
+                    s.state,
+                    ServerLifecycleState::Stopping
+                        | ServerLifecycleState::Stopped
+                        | ServerLifecycleState::Crashed(_)
+                )
+            }) {
+                return false;
+            }
+            let srv_port = snap
+                .map(|s| s.port)
+                .filter(|&p| p > 0)
+                .or_else(|| {
+                    self.config
+                        .servers
+                        .iter()
+                        .find(|p| p.id == *id)
+                        .map(|p| p.config.port)
+                });
+            srv_port == Some(port)
+        });
+        if used_by_supervised {
+            return true;
+        }
+        self.external_servers.iter().any(|ext| {
+            if ignore_ext_pid == Some(ext.pid) {
+                return false;
+            }
+            if let (Some(ign_id), Some(ext_id)) = (ignore_profile_id, ext.profile_id.as_deref()) {
+                if ign_id == ext_id {
+                    return false;
+                }
+            }
+            let ext_port = ext.port.or_else(|| {
+                ext.profile_id
+                    .as_deref()
+                    .and_then(|pid| self.config.servers.iter().find(|p| p.id == pid))
+                    .map(|p| p.config.port)
+            });
+            ext_port == Some(port)
+        })
+    }
+
+    fn cleanup_host_for_stopped_port(
+        &mut self,
+        port: u16,
+        ignore_profile_id: Option<&str>,
+        ignore_ext_pid: Option<u32>,
+    ) {
+        if self.is_port_used_by_other_active_server(port, ignore_profile_id, ignore_ext_pid) {
+            return;
+        }
+        let stop_direct = match self.active_direct_host_status() {
+            DirectHostStatus::Starting { local_port, .. } => local_port == port,
+            DirectHostStatus::Running(info) => info.local_port == port,
+            DirectHostStatus::Stopped | DirectHostStatus::Error(_) => {
+                self.direct_host_handle.is_some()
+            }
+            DirectHostStatus::Idle => false,
+        };
+        if stop_direct {
+            self.stop_direct_host();
+        }
+    }
+
+    pub fn stop_external_pid(&mut self, pid: u32) {
+        let Some(ext) = self
+            .external_servers
+            .iter()
+            .find(|e| e.pid == pid)
+            .cloned()
+        else {
+            self.scan_external_servers();
+            return;
+        };
+        let ext_port = ext
+            .port
+            .filter(|&p| p > 0)
+            .or_else(|| {
+                ext.profile_id
+                    .as_deref()
+                    .and_then(|id| self.profile_effective_port(id))
+            })
+            .unwrap_or_else(|| self.active_server_port());
+        if self.sys.is_none() {
+            self.sys = System::new().ok();
+        }
+        let killed = match self.sys.as_mut() {
+            Some(sys) => terminate_process_by_pid(sys, ext.pid),
+            None => false,
+        };
+        if let Some(ref ext_profile_id) = ext.profile_id {
+            if self.pending_auto_direct_host_profile_id.as_deref()
+                == Some(ext_profile_id.as_str())
+            {
+                self.pending_auto_direct_host_profile_id = None;
+            }
+        }
+        if killed {
+            self.external_servers.retain(|e| e.pid != ext.pid);
+            if let Some(ref ext_profile_id) = ext.profile_id {
+                if !self
+                    .external_servers
+                    .iter()
+                    .any(|e| e.profile_id.as_deref() == Some(ext_profile_id.as_str()))
+                {
+                    self.external_log_summaries.remove(ext_profile_id);
+                    self.cleared_external_log_pids.remove(ext_profile_id);
+                }
+            }
+            self.cleanup_host_for_stopped_port(ext_port, ext.profile_id.as_deref(), Some(ext.pid));
+            self.spawn_network_probe();
+            self.notify_ok(format!(
+                "Đã tắt {} phiên trước (PID {}).",
+                ext.edition.label(),
+                ext.pid
+            ));
+        } else {
+            self.scan_external_servers();
+            if !self.external_servers.iter().any(|e| e.pid == ext.pid) {
+                self.cleanup_host_for_stopped_port(
+                    ext_port,
+                    ext.profile_id.as_deref(),
+                    Some(ext.pid),
+                );
+                self.spawn_network_probe();
+            }
+            self.notify_err(format!(
+                "Không thể tắt tiến trình server PID {}. Tiến trình có thể đã đóng hoặc thiếu quyền.",
+                ext.pid
+            ));
+        }
+    }
+
+    pub fn stop_external_server(&mut self) {
+        if let Some(pid) = self.active_external_server().map(|e| e.pid) {
+            self.stop_external_pid(pid);
+        }
+    }
+
+    pub fn stop_server_profile(&mut self, profile_id: &str) {
+        if self.pending_auto_direct_host_profile_id.as_deref() == Some(profile_id) {
+            self.pending_auto_direct_host_profile_id = None;
+        }
+        let is_sup_active = self
+            .server_supervisors
+            .get(profile_id)
+            .is_some_and(|s| s.is_active());
+        if is_sup_active {
+            let port = self
+                .profile_effective_port(profile_id)
+                .unwrap_or_else(|| self.active_server_port());
+            let was_stopping = self
+                .server_supervisors
+                .get(profile_id)
+                .is_some_and(|s| s.is_stopping());
+            if let Some(sup) = self.server_supervisors.get(profile_id) {
+                sup.request_graceful_stop();
+            }
+            self.cleanup_host_for_stopped_port(port, Some(profile_id), None);
+            let name = self
+                .config
+                .servers
+                .iter()
+                .find(|p| p.id == profile_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("server");
+            if was_stopping {
+                self.notify_ok(format!(
+                    "Server chưa thoát kịp, đã buộc dừng {name}."
+                ));
+            } else {
+                self.notify_ok(format!("Đang lưu thế giới & tắt {name}..."));
+            }
+            return;
+        }
+        if let Some(pid) = self
+            .external_server_for_profile(profile_id)
+            .map(|e| e.pid)
+        {
+            self.stop_external_pid(pid);
+            return;
+        }
+        if profile_id == self.config.active_server_id {
+            if let Some(pid) = self.active_external_server().map(|e| e.pid) {
+                self.stop_external_pid(pid);
+            }
+        }
+    }
+
     pub fn stop_selected_server(&mut self) {
-        if let Some(sup) = &self.server_supervisor {
-            sup.request_graceful_stop();
-            self.notify_ok("Đã gửi lệnh save & exit cho server.");
+        let id = self.config.active_server_id.clone();
+        self.stop_server_profile(&id);
+    }
+
+    pub fn force_kill_server_profile(&mut self, profile_id: &str) {
+        if self.pending_auto_direct_host_profile_id.as_deref() == Some(profile_id) {
+            self.pending_auto_direct_host_profile_id = None;
+        }
+        let is_sup_active = self
+            .server_supervisors
+            .get(profile_id)
+            .is_some_and(|s| s.is_active());
+        if is_sup_active {
+            let port = self
+                .profile_effective_port(profile_id)
+                .unwrap_or_else(|| self.active_server_port());
+            if let Some(sup) = self.server_supervisors.get(profile_id) {
+                sup.force_kill();
+            }
+            self.cleanup_host_for_stopped_port(port, Some(profile_id), None);
+            self.notify_ok("Đã buộc dừng tiến trình server.");
+            return;
+        }
+        if let Some(pid) = self
+            .external_server_for_profile(profile_id)
+            .map(|e| e.pid)
+        {
+            self.stop_external_pid(pid);
         }
     }
 
     pub fn force_kill_server(&mut self) {
-        if let Some(sup) = &self.server_supervisor {
-            sup.force_kill();
-            self.notify_ok("Đã buộc dừng tiến trình server.");
+        let id = self.config.active_server_id.clone();
+        self.force_kill_server_profile(&id);
+    }
+
+    pub fn stop_all_servers(&mut self) {
+        self.pending_auto_direct_host_profile_id = None;
+        let mut stopped_supervised = 0usize;
+        for sup in self.server_supervisors.values() {
+            if sup.is_active() {
+                sup.request_graceful_stop();
+                stopped_supervised += 1;
+            }
+        }
+
+        let ext_list = self.external_servers.clone();
+        let mut killed_ext = 0usize;
+        let mut failed_ext_pids = Vec::new();
+        if !ext_list.is_empty() {
+            if self.sys.is_none() {
+                self.sys = System::new().ok();
+            }
+            for ext in ext_list {
+                let killed = match self.sys.as_mut() {
+                    Some(sys) => terminate_process_by_pid(sys, ext.pid),
+                    None => false,
+                };
+                if killed {
+                    killed_ext += 1;
+                    self.external_servers.retain(|e| e.pid != ext.pid);
+                } else {
+                    failed_ext_pids.push(ext.pid);
+                }
+            }
+            if killed_ext > 0 {
+                let remaining_profiles: HashSet<String> = self
+                    .external_servers
+                    .iter()
+                    .filter_map(|e| e.profile_id.clone())
+                    .collect();
+                self.external_log_summaries
+                    .retain(|k, _| remaining_profiles.contains(k));
+                self.cleared_external_log_pids
+                    .retain(|k, _| remaining_profiles.contains(k));
+                self.spawn_network_probe();
+            }
+        }
+
+        if failed_ext_pids.is_empty() {
+            self.stop_direct_host();
+        } else {
+            self.scan_external_servers();
+            let check_port = match self.active_direct_host_status() {
+                DirectHostStatus::Starting { local_port, .. } => local_port,
+                DirectHostStatus::Running(info) => info.local_port,
+                _ => self.active_server_port(),
+            };
+            let still_used = self.external_servers.iter().any(|ext| {
+                ext.port
+                    .or_else(|| {
+                        ext.profile_id
+                            .as_deref()
+                            .and_then(|pid| self.config.servers.iter().find(|p| p.id == pid))
+                            .map(|p| p.config.port)
+                    })
+                    == Some(check_port)
+            });
+            if !still_used {
+                self.stop_direct_host();
+            }
+        }
+
+        if !failed_ext_pids.is_empty() {
+            let pid_list = failed_ext_pids
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.notify_err(format!(
+                "Đã dừng {stopped_supervised} server đang quản lý và {killed_ext} server phiên trước, nhưng không tắt được PID: {pid_list}."
+            ));
+        } else if stopped_supervised > 0 && killed_ext > 0 {
+            self.notify_ok(format!(
+                "Đã gửi lệnh lưu & tắt {stopped_supervised} server và tắt {killed_ext} server phiên trước."
+            ));
+        } else if stopped_supervised > 0 {
+            self.notify_ok(format!(
+                "Đã gửi lệnh save & exit cho {stopped_supervised} server."
+            ));
+        } else if killed_ext > 0 {
+            self.notify_ok(format!("Đã tắt {killed_ext} server phiên trước."));
+        } else {
+            self.notify_ok("Không có server nào đang chạy.");
+        }
+    }
+
+    pub fn clear_active_server_logs(&mut self) {
+        let active_id = self.config.active_server_id.clone();
+        if let Some(sup) = self.server_supervisors.get(&active_id) {
+            if sup.is_active() || !self.showing_external_server() {
+                sup.clear_logs();
+                return;
+            }
+        }
+        if let Some(ext) = self.active_external_server().cloned() {
+            if let Some(profile_id) = ext.profile_id {
+                self.cleared_external_log_pids
+                    .insert(profile_id.clone(), ext.pid);
+                if let Some(summary) = self.external_log_summaries.get_mut(&profile_id) {
+                    summary.lines.clear();
+                }
+            }
         }
     }
 
     pub fn send_server_command(&mut self, cmd: &str) {
-        if let Some(sup) = &self.server_supervisor {
-            if let Err(e) = sup.send_command(cmd) {
-                self.notify_err(e.to_string());
+        if let Some(sup) = self.active_server_supervisor() {
+            if sup.is_active() {
+                if let Err(e) = sup.send_command(cmd) {
+                    self.notify_err(e.to_string());
+                }
+                return;
             }
+        }
+        if self.active_external_server().is_some() {
+            self.notify_err(
+                "Server từ phiên trước chỉ hỗ trợ xem log; hãy tắt và khởi chạy lại từ Launcher để gửi lệnh điều khiển.",
+            );
         } else {
             self.notify_err("Server chưa chạy.");
         }
@@ -1450,20 +2353,27 @@ impl AppState {
 
     pub fn spawn_network_probe(&mut self) {
         if self.network_loading {
+            self.network_reprobe_queued = true;
             return;
         }
         self.network_loading = true;
+        self.network_reprobe_queued = false;
         let port = self.active_server_port();
+        let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn(async move {
-            let snap = probe_network_snapshot(port).await;
+            let snap = probe_network_snapshot(port, proxy.as_deref()).await;
             let _ = tx.send(AppEvent::NetworkProbed(snap));
             wake.wake();
         });
     }
 
     pub fn ensure_firewall(&mut self, port: u16) {
+        if self.firewall_busy || port == 0 {
+            return;
+        }
+        self.firewall_busy = true;
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn_blocking(move || {
@@ -1474,6 +2384,10 @@ impl AppState {
     }
 
     pub fn remove_firewall(&mut self, port: u16) {
+        if self.firewall_busy || port == 0 {
+            return;
+        }
+        self.firewall_busy = true;
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn_blocking(move || {
@@ -1483,71 +2397,270 @@ impl AppState {
         });
     }
 
-    pub fn open_upnp(&mut self, port: u16) {
-        let tx = self.event_tx.clone();
-        let wake = self.repaint.clone();
-        self.rt.spawn(async move {
-            let res = open_upnp_port(port).await.map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::UpnpOpened(res));
-            wake.wake();
-        });
+    pub fn active_direct_host_status(&self) -> DirectHostStatus {
+        self.direct_host_handle
+            .as_ref()
+            .map(DirectPortHostHandle::current_status)
+            .unwrap_or(DirectHostStatus::Idle)
     }
 
-    pub fn close_upnp(&mut self) {
-        let Some(lease) = self.upnp_lease.clone() else {
-            return;
-        };
-        let tx = self.event_tx.clone();
-        let wake = self.repaint.clone();
-        self.rt.spawn(async move {
-            let res = close_upnp_port(&lease).await.map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::UpnpClosed(res));
-            wake.wake();
-        });
+    pub fn active_online_endpoint(&self) -> Option<String> {
+        if let DirectHostStatus::Running(info) = self.active_direct_host_status() {
+            return info.preferred_online_endpoint();
+        }
+        None
     }
 
-    pub fn toggle_bore_tunnel(&mut self) {
-        if let Some(handle) = self.bore_handle.take() {
-            handle.stop();
-            self.notify_ok("Đang đóng Bore Tunnel...");
+    pub fn stop_direct_host(&mut self) {
+        if let Some(h) = self.direct_host_handle.take() {
+            h.stop();
+        }
+    }
+
+    fn start_direct_host_on_port(&mut self, local_target_port: u16) {
+        if matches!(
+            self.active_direct_host_status(),
+            DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
+        ) {
+            self.notify_ok("Port mạng đang mở.");
             return;
         }
-        let port = self.active_server_port();
-        let bore_server = self.config.bore_server.clone();
-        let secret = non_empty_opt(&self.config.bore_secret).map(ToString::to_string);
-        let handle = start_bore_tunnel(
+        if local_target_port == 0 {
+            self.notify_err("Cổng TCP Server phải từ 1 đến 65535");
+            return;
+        }
+        let host_port = self
+            .direct_host_port_input
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p > 0)
+            .unwrap_or(local_target_port);
+        if !self.firewall_busy && !check_firewall_rule_exists(host_port) {
+            self.ensure_firewall(host_port);
+        }
+        if let Some(prev) = self.direct_host_handle.take() {
+            prev.stop();
+        }
+        let handle = start_direct_port_host(
             self.rt.handle(),
-            port,
-            bore_server,
-            secret,
+            DirectHostConfig {
+                local_target_port,
+                host_port,
+                bind_ipv4: self.direct_bind_ip,
+                try_upnp: self.direct_try_upnp,
+            },
             self.repaint.clone(),
         );
-        self.bore_handle = Some(handle);
-        self.notify_ok("Đang kết nối Tunnel công khai...");
+        self.direct_host_handle = Some(handle);
+        self.notify_ok("Đang mở Port mạng...");
     }
 
-    pub fn active_tunnel_endpoint(&self) -> Option<String> {
-        self.bore_handle
-            .as_ref()
-            .and_then(|h| h.current_status().endpoint())
+    pub fn toggle_direct_host(&mut self) {
+        self.pending_auto_direct_host_profile_id = None;
+        if matches!(
+            self.active_direct_host_status(),
+            DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
+        ) {
+            self.stop_direct_host();
+            self.notify_ok("Đã đóng Port mạng hiện tại.");
+            return;
+        }
+        let trimmed_port = self.direct_host_port_input.trim();
+        let local_target_port = self.active_server_port();
+        if !trimmed_port.is_empty() {
+            let valid_port = trimmed_port.parse::<u16>().ok().filter(|&p| p > 0);
+            if valid_port.is_none() {
+                self.notify_err("Cổng mở không hợp lệ (1 - 65535).");
+                return;
+            }
+        } else {
+            self.direct_host_port_input = local_target_port.to_string();
+        }
+        self.start_direct_host_on_port(local_target_port);
+    }
+
+    pub fn start_self_host_online(&mut self) {
+        let port = self.active_server_port();
+        if port == 0 {
+            self.notify_err("Cổng TCP Server phải từ 1 đến 65535");
+            return;
+        }
+        let active_id = self
+            .config
+            .active_server()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| self.config.active_server_id.clone());
+        let srv_active = self
+            .active_server_supervisor()
+            .is_some_and(|s| s.is_active());
+        if srv_active {
+            match self.active_server_snapshot().map(|s| &s.state) {
+                Some(ServerLifecycleState::Running) => {
+                    self.pending_auto_direct_host_profile_id = None;
+                    self.start_direct_host_on_port(port);
+                }
+                Some(ServerLifecycleState::Stopping) => {
+                    self.notify_err("Server đang dừng — vui lòng chờ tắt hẳn rồi bật lại.");
+                }
+                _ => {
+                    if matches!(
+                        self.active_direct_host_status(),
+                        DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
+                    ) {
+                        self.notify_ok("Port mạng đang mở.");
+                    } else {
+                        self.pending_auto_direct_host_profile_id = Some(active_id);
+                        self.notify_ok(
+                            "Server đang khởi động — sẽ tự mở Port mạng ngay khi sẵn sàng.",
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
+        if self.rt.block_on(probe_local_tcp_listening(port)) {
+            self.pending_auto_direct_host_profile_id = None;
+            self.start_direct_host_on_port(port);
+            self.spawn_network_probe();
+            return;
+        }
+
+        self.start_selected_server();
+        if self
+            .server_supervisors
+            .get(&active_id)
+            .is_some_and(|s| s.is_active())
+        {
+            self.pending_auto_direct_host_profile_id = Some(active_id);
+            self.notify_ok("Đang khởi chạy Server và tự động mở Port mạng...");
+        }
+    }
+
+    pub fn join_own_hosted_server(&mut self) {
+        if self.active_game.is_some() {
+            self.notify_err("Game đang chạy. Hãy đóng phiên hiện tại trước khi mở mới.");
+            return;
+        }
+        if let Some(ext) = &self.external_game {
+            let msg = format!(
+                "{} đang mở sẵn (PID {}). Hãy kết nối trực tiếp trong menu Multiplayer của game hoặc nhấn 'Đóng Game' trước khi mở mới.",
+                ext.edition.label(),
+                ext.pid
+            );
+            self.notify_err(msg);
+            return;
+        }
+        let srv_active = self
+            .active_server_supervisor()
+            .is_some_and(|s| s.is_active());
+        let ext_server = if srv_active {
+            None
+        } else {
+            self.active_external_server()
+        };
+        let matched_profile = ext_server
+            .and_then(|ext| ext.profile_id.as_deref())
+            .and_then(|id| self.config.servers.iter().find(|s| s.id == id))
+            .or_else(|| self.config.active_server());
+        let server_password = matched_profile
+            .map(|s| s.config.password.clone())
+            .unwrap_or_default();
+        let server_edition = if srv_active {
+            self.active_server_snapshot()
+                .map(|s| s.edition)
+                .or_else(|| self.config.active_server().map(|s| s.edition))
+                .unwrap_or(self.config.active_edition)
+        } else if let Some(ext) = ext_server {
+            ext.edition
+        } else {
+            self.config
+                .active_server()
+                .map(|s| s.edition)
+                .unwrap_or(self.config.active_edition)
+        };
+        let target_port = if srv_active {
+            self.active_server_port()
+        } else {
+            ext_server
+                .and_then(|ext| ext.port)
+                .filter(|&p| p > 0)
+                .unwrap_or_else(|| self.active_server_port())
+        };
+        let edition_changed = self.config.active_edition != server_edition;
+        self.config.active_edition = server_edition;
+        if edition_changed {
+            self.refresh_worlds_and_backups();
+        }
+        self.config.quick_join_host = "127.0.0.1".to_string();
+        self.config.quick_join_port = target_port;
+        self.quick_join_port_input = target_port.to_string();
+        self.config.quick_join_password = server_password;
+        self.save_config();
+        self.launch_selected_game(None);
     }
 
     pub fn probe_port(&mut self) {
         if self.port_probe_busy {
             return;
         }
-        let host = self.port_probe_host.trim().to_string();
-        let Ok(port) = self.port_probe_port.trim().parse::<u16>() else {
+        let fallback_port = self
+            .port_probe_port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p > 0)
+            .unwrap_or_else(|| self.active_server_port());
+        let (split_host, port) = split_host_port_input(&self.port_probe_host, fallback_port);
+        if split_host.trim().is_empty() {
+            self.notify_err("Nhập địa chỉ Host / IP cần kiểm tra.");
+            return;
+        }
+        if port == 0 {
             self.notify_err("Cổng kiểm tra không hợp lệ.");
             return;
+        }
+        self.port_probe_host = split_host.clone();
+        self.port_probe_port = port.to_string();
+        let unbracketed = split_host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .map(str::trim)
+            .unwrap_or(split_host.trim());
+        let clean_host = unbracketed
+            .split('%')
+            .next()
+            .unwrap_or(unbracketed)
+            .trim()
+            .to_string();
+        if clean_host.is_empty() {
+            self.notify_err("Nhập địa chỉ Host / IP cần kiểm tra.");
+            return;
+        }
+        let local_port = self.active_server_port();
+        let is_local_target = is_local_probe_host(&clean_host, &self.network_snapshot);
+        let endpoint = if clean_host.contains(':') {
+            format!("[{clean_host}]:{port}")
+        } else {
+            format!("{clean_host}:{port}")
         };
-        let endpoint = format!("{host}:{port}");
         self.port_probe_busy = true;
         self.port_probe_status = None;
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn(async move {
-            let result = probe_tcp_endpoint(&host, port).await;
+            let result = if is_local_target {
+                if port == local_port && !probe_local_tcp_listening(local_port).await {
+                    Err(format!(
+                        "Cổng máy bạn ({clean_host}:{port}) chưa lắng nghe — hãy bật Server trước."
+                    ))
+                } else {
+                    probe_local_endpoint_listening(&clean_host, port).await
+                }
+            } else {
+                probe_tcp_endpoint(&clean_host, port).await
+            };
             let _ = tx.send(AppEvent::PortProbed { endpoint, result });
             wake.wake();
         });
@@ -1587,12 +2700,6 @@ impl AppState {
 
     pub fn create_new_modpack(&mut self) {
         let _ = self.create_modpack_internal();
-    }
-
-    pub fn create_modpack_and_share(&mut self) {
-        if let Some(pack) = self.create_modpack_internal() {
-            self.prepare_share_key_for_pack(&pack);
-        }
     }
 
     fn create_modpack_internal(&mut self) -> Option<ModPackInfo> {
@@ -2079,20 +3186,17 @@ impl AppState {
         });
     }
 
-    pub fn lookup_workshop(&mut self) {
-        let Some(id) = parse_workshop_id(&self.workshop_input) else {
-            self.notify_err("Nhập Workshop ID hoặc link Steam Workshop hợp lệ.");
-            return;
-        };
-        self.inspect_workshop_id(&id);
+    pub fn smart_workshop_query(&mut self) {
+        if let Some(id) = parse_workshop_id(&self.workshop_input) {
+            self.inspect_workshop_id(&id);
+        } else {
+            self.browse_workshop(1);
+        }
     }
 
     pub fn inspect_workshop_id(&mut self, id: &str) {
         let trimmed = id.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        if self.workshop_busy && self.workshop_downloading_id.is_none() {
+        if trimmed.is_empty() || self.workshop_inspect_busy {
             return;
         }
 
@@ -2102,9 +3206,7 @@ impl AppState {
             .find(|item| item.published_file_id == trimmed)
             .cloned();
 
-        if self.workshop_downloading_id.is_none() {
-            self.workshop_busy = true;
-        }
+        self.workshop_inspect_busy = true;
         let id_owned = trimmed.to_string();
         let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
         let tx = self.event_tx.clone();
@@ -2225,44 +3327,6 @@ impl AppState {
         None
     }
 
-    pub fn install_staged_workshop_mod(&mut self, staged: &StagedWorkshopMod) {
-        let sources = [staged.meta.file_path.clone()];
-        match import_local_mod_files(&sources, &self.paths, true) {
-            Ok(imported) => {
-                if imported.is_empty() {
-                    self.notify_err("Không tìm thấy file .tmod hợp lệ trong thư mục staging.");
-                    return;
-                }
-                let details = self.resolve_workshop_details_for_staged(staged);
-                if let Err(e) = record_workshop_install(
-                    &self.paths,
-                    details.as_ref(),
-                    &staged.workshop_id,
-                    &imported,
-                ) {
-                    self.notify_err(format!("Đã cài mod nhưng lỗi lưu thông tin Workshop: {e}"));
-                } else {
-                    self.notify_ok(format!(
-                        "Đã cài và bật {} từ bộ nhớ tạm Workshop.",
-                        staged.meta.display_name
-                    ));
-                }
-                self.refresh_mods_and_packs();
-            }
-            Err(e) => self.notify_err(format!("Lỗi cài mod từ staging: {e}")),
-        }
-    }
-
-    pub fn remove_staged_workshop_mod(&mut self, workshop_id: &str) {
-        match delete_staged_workshop_mod(&self.paths, workshop_id) {
-            Ok(()) => {
-                self.refresh_mods_and_packs();
-                self.notify_ok(format!("Đã xóa dữ liệu staging của ID {workshop_id}."));
-            }
-            Err(e) => self.notify_err(format!("Không xóa được staging: {e}")),
-        }
-    }
-
     pub fn workshop_install_status(
         &self,
         workshop_id: &str,
@@ -2308,67 +3372,6 @@ impl AppState {
         }
 
         None
-    }
-
-    fn resolve_workshop_details_for_staged(
-        &self,
-        staged: &StagedWorkshopMod,
-    ) -> Option<WorkshopItemDetails> {
-        self.workshop_details
-            .as_ref()
-            .filter(|d| d.published_file_id == staged.workshop_id)
-            .cloned()
-            .or_else(|| {
-                self.workshop_results
-                    .iter()
-                    .find(|d| d.published_file_id == staged.workshop_id)
-                    .cloned()
-            })
-            .or_else(|| {
-                let record = self
-                    .workshop_records
-                    .iter()
-                    .rev()
-                    .find(|r| r.published_file_id == staged.workshop_id);
-                let title = staged
-                    .workshop_title
-                    .clone()
-                    .or_else(|| record.map(|r| r.workshop_title.clone()))
-                    .filter(|s| !s.is_empty());
-                let author = staged
-                    .author
-                    .clone()
-                    .or_else(|| record.map(|r| r.author.clone()))
-                    .filter(|s| !s.is_empty());
-                let preview_url = staged
-                    .preview_url
-                    .clone()
-                    .or_else(|| record.map(|r| r.preview_url.clone()))
-                    .filter(|s| !s.is_empty());
-                let time_updated = staged
-                    .time_updated
-                    .or_else(|| record.map(|r| r.time_updated));
-
-                if title.is_some() || author.is_some() || preview_url.is_some() || time_updated.is_some() {
-                    Some(WorkshopItemDetails {
-                        published_file_id: staged.workshop_id.clone(),
-                        title: title.unwrap_or_else(|| staged.meta.display_name.clone()),
-                        author: author.unwrap_or_else(|| staged.meta.author.clone()),
-                        description: staged.meta.description.clone(),
-                        preview_url: preview_url.unwrap_or_default(),
-                        file_size: staged.meta.file_size,
-                        time_updated: time_updated.unwrap_or(0),
-                        subscriptions: 0,
-                        favorited: 0,
-                        views: 0,
-                        tags: Vec::new(),
-                        child_ids: Vec::new(),
-                        consumer_app_id: 1281930,
-                    })
-                } else {
-                    None
-                }
-            })
     }
 
     pub fn install_steamcmd(&mut self) {
@@ -2476,10 +3479,8 @@ impl AppState {
             },
         };
         self.config.servers.push(profile);
-        self.config.active_server_id = id;
         self.new_profile_name.clear();
-        self.save_config();
-        self.refresh_banlist();
+        self.select_server_profile(id);
         self.notify_ok("Đã thêm cấu hình server mới.");
     }
 
@@ -2489,59 +3490,150 @@ impl AppState {
             return;
         }
         let id = self.config.active_server_id.clone();
+        let is_supervised_active = self
+            .server_supervisors
+            .get(&id)
+            .is_some_and(|s| s.is_active());
+        let is_external_active = self.external_server_for_profile(&id).is_some();
+        if is_supervised_active || is_external_active {
+            self.notify_err("Vui lòng tắt server đang chạy của hồ sơ này trước khi xóa.");
+            return;
+        }
+        self.server_supervisors.remove(&id);
+        self.server_snapshots.remove(&id);
+        self.external_log_summaries.remove(&id);
+        self.cleared_external_log_pids.remove(&id);
+        if self.pending_auto_direct_host_profile_id.as_deref() == Some(id.as_str()) {
+            self.pending_auto_direct_host_profile_id = None;
+        }
         self.config.servers.retain(|s| s.id != id);
-        self.config.active_server_id = self.config.servers[0].id.clone();
-        self.save_config();
-        self.refresh_banlist();
+        let next_id = self.config.servers[0].id.clone();
+        self.select_server_profile(next_id);
         self.notify_ok("Đã xóa cấu hình server.");
     }
 
-    pub fn add_saved_join_server(&mut self) {
-        let host = self.new_join_host.trim().to_string();
+    pub fn save_quick_join_server(&mut self) {
+        let fallback_port = self
+            .quick_join_port_input
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p > 0)
+            .unwrap_or(if self.config.quick_join_port > 0 {
+                self.config.quick_join_port
+            } else {
+                7777
+            });
+        let (host, port) = split_host_port_input(&self.config.quick_join_host, fallback_port);
         if host.is_empty() {
-            self.notify_err("Nhập địa chỉ IP hoặc tên miền server.");
+            self.notify_err("Nhập địa chỉ Host / IP trước khi lưu server.");
             return;
         }
-        let port = self.new_join_port.trim().parse::<u16>().unwrap_or(7777);
+        let final_port = if port > 0 { port } else { 7777 };
+        self.config.quick_join_host = host.clone();
+        self.config.quick_join_port = final_port;
+        self.quick_join_port_input = final_port.to_string();
+        let default_label = if host.contains(':') {
+            format!("[{host}]:{final_port}")
+        } else {
+            format!("{host}:{final_port}")
+        };
         let name = if self.new_join_name.trim().is_empty() {
-            format!("{host}:{port}")
+            default_label
         } else {
             self.new_join_name.trim().to_string()
         };
-        self.config.saved_join_servers.push(SavedJoinServer {
-            name,
-            host,
-            port,
-            password: self.new_join_password.clone(),
-            edition: self.config.active_edition,
-        });
+        if let Some(existing) = self.config.saved_join_servers.iter_mut().find(|s| {
+            s.host.eq_ignore_ascii_case(&host)
+                && s.port == final_port
+                && s.edition == self.config.active_edition
+        }) {
+            existing.name = name;
+            existing.password = self.config.quick_join_password.clone();
+        } else {
+            self.config.saved_join_servers.push(SavedJoinServer {
+                name,
+                host,
+                port: final_port,
+                password: self.config.quick_join_password.clone(),
+                edition: self.config.active_edition,
+            });
+        }
         self.new_join_name.clear();
-        self.new_join_host.clear();
-        self.new_join_port = "7777".to_string();
-        self.new_join_password.clear();
         self.save_config();
-        self.notify_ok("Đã lưu server vào danh sách tham gia nhanh.");
+        self.notify_ok("Đã lưu server vào danh sách.");
     }
 
     pub fn shutdown_all(&mut self) {
         self.save_config();
-        if let Some(tunnel) = self.bore_handle.take() {
-            tunnel.stop();
-        }
-        if let Some(lease) = self.upnp_lease.take() {
-            let _ = self.rt.block_on(close_upnp_port(&lease));
-        }
-        if let Some(sup) = &self.server_supervisor {
-            if sup.is_active() {
+        self.pending_auto_direct_host_profile_id = None;
+        self.stop_client_ipv6_bridge();
+        self.stop_direct_host();
+
+        let active_sups: Vec<ServerSupervisor> = self
+            .server_supervisors
+            .values()
+            .filter(|sup| sup.is_active())
+            .cloned()
+            .collect();
+        if !active_sups.is_empty() {
+            for sup in &active_sups {
                 sup.request_graceful_stop();
-                std::thread::sleep(Duration::from_millis(600));
+            }
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while Instant::now() < deadline && active_sups.iter().any(|sup| sup.is_active()) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            for sup in &active_sups {
+                if sup.is_active() {
+                    sup.force_kill();
+                }
+            }
+            let kill_deadline = Instant::now() + Duration::from_millis(600);
+            while Instant::now() < kill_deadline && active_sups.iter().any(|sup| sup.is_active()) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        if self.sys.is_none() {
+            self.sys = System::new().ok();
+        }
+        let mut targets = self.external_servers.clone();
+        if let Some(sys) = self.sys.as_mut() {
+            for ext in detect_existing_server_processes(sys, &self.paths) {
+                if !targets.iter().any(|existing| existing.pid == ext.pid) {
+                    targets.push(ext);
+                }
+            }
+            for ext in targets {
+                if ext.profile_id.is_some() {
+                    let _ = terminate_process_by_pid(sys, ext.pid);
+                }
             }
         }
     }
 
+    pub fn showing_external_server(&self) -> bool {
+        let sup_active = self
+            .active_server_supervisor()
+            .is_some_and(|s| s.is_active());
+        !sup_active
+            && self.active_external_server().is_some()
+            && !matches!(
+                self.active_server_snapshot().map(|s| &s.state),
+                Some(ServerLifecycleState::Crashed(_))
+            )
+    }
+
     pub fn badge_color_for_server(&self) -> egui::Color32 {
         let p = self.palette();
-        match self.server_snapshot.as_ref().map(|s| &s.state) {
+        if self.showing_external_server() {
+            if self.is_active_external_starting() {
+                return p.accent_cyan;
+            }
+            return p.accent_emerald;
+        }
+        match self.active_server_snapshot().map(|s| &s.state) {
             Some(ServerLifecycleState::Running) => p.accent_emerald,
             Some(ServerLifecycleState::Starting) => p.accent_cyan,
             Some(ServerLifecycleState::Stopping) => p.accent_amber,
@@ -2551,17 +3643,15 @@ impl AppState {
     }
 
     pub fn server_status_short(&self) -> &str {
-        self.server_snapshot
-            .as_ref()
+        if self.showing_external_server() {
+            if self.is_active_external_starting() {
+                return "Đang khởi động (phiên trước)...";
+            }
+            return "Đang chạy (phiên trước)";
+        }
+        self.active_server_snapshot()
             .map(|s| s.state.label())
             .unwrap_or("Chưa bật")
-    }
-
-    pub fn active_tunnel_status(&self) -> TunnelStatus {
-        self.bore_handle
-            .as_ref()
-            .map(|h| h.current_status())
-            .unwrap_or(TunnelStatus::Idle)
     }
 }
 
@@ -2620,10 +3710,112 @@ pub fn non_empty_opt(s: &str) -> Option<&str> {
     }
 }
 
+fn strip_ipv6_zone_if_valid(s: &str) -> Option<String> {
+    let candidate = s.split('%').next().unwrap_or(s).trim();
+    if candidate.parse::<std::net::Ipv6Addr>().is_ok() {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn split_host_port_input(raw_host: &str, fallback_port: u16) -> (String, u16) {
+    let trimmed = raw_host.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((v6, port_str)) = rest.split_once("]:") {
+            let v6 = v6.trim();
+            if !v6.is_empty() {
+                if let Some(port) = port_str.trim().parse::<u16>().ok().filter(|&p| p > 0) {
+                    let host = strip_ipv6_zone_if_valid(v6).unwrap_or_else(|| v6.to_string());
+                    return (host, port);
+                }
+            }
+        } else if let Some(inner) = rest.strip_suffix(']') {
+            if let Some(host) = strip_ipv6_zone_if_valid(inner) {
+                return (host, fallback_port);
+            }
+        }
+        return (trimmed.to_string(), fallback_port);
+    }
+    if trimmed.matches(':').count() != 1 {
+        if let Some(host) = strip_ipv6_zone_if_valid(trimmed) {
+            return (host, fallback_port);
+        }
+        return (trimmed.to_string(), fallback_port);
+    }
+    match trimmed.rsplit_once(':') {
+        Some((left, right)) if !left.trim().is_empty() => right
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p > 0)
+            .map(|parsed_port| (left.trim().to_string(), parsed_port))
+            .unwrap_or_else(|| (trimmed.to_string(), fallback_port)),
+        _ => (trimmed.to_string(), fallback_port),
+    }
+}
+
 fn uuid_short() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("{:x}", now & 0xFFFF_FFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_host_port_input;
+
+    #[test]
+    fn split_host_port_input_handles_ipv6_and_plain_hosts() {
+        assert_eq!(
+            split_host_port_input("play.example.com:50355", 7777),
+            ("play.example.com".to_string(), 50355)
+        );
+        assert_eq!(
+            split_host_port_input("  192.168.1.10:7778 ", 7777),
+            ("192.168.1.10".to_string(), 7778)
+        );
+        assert_eq!(
+            split_host_port_input("play.example.com", 7777),
+            ("play.example.com".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input("[2405:4802:938c:caf0::1]:7778", 7777),
+            ("2405:4802:938c:caf0::1".to_string(), 7778)
+        );
+        assert_eq!(
+            split_host_port_input("[::1]:7779", 7777),
+            ("::1".to_string(), 7779)
+        );
+        assert_eq!(
+            split_host_port_input("[::1]", 7777),
+            ("::1".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input("::1", 7777),
+            ("::1".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input("[fe80::1%12]:7777", 7777),
+            ("fe80::1".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input("[2405:4802::1%12]", 7777),
+            ("2405:4802::1".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input("2405:4802::1%12", 7777),
+            ("2405:4802::1".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input("play.example.com:0", 7777),
+            ("play.example.com:0".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input(":50355", 7777),
+            (":50355".to_string(), 7777)
+        );
+    }
 }

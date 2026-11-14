@@ -39,18 +39,14 @@ C:\TerrariaLauncher\
 
 - **Chơi Game**:
   - Chạy **Terraria 1.4.5.8** hoặc **tModLoader 2026.9**.
-  - Tham gia nhanh server theo `Host:Port` và lưu danh sách server thường chơi.
+  - Tham gia nhanh server theo `Host:Port` hoặc `[IPv6]:port` (tự động tạo cầu nối cục bộ IPv4 → IPv6 cho client) và lưu danh sách server thường chơi.
   - Tự động đọc thông tin file `.wld` (tên thế giới, kích thước, độ khó, special seeds, `.twld`), hỗ trợ sao lưu và khôi phục bằng `.zip`.
 - **Server Game**:
-  - Quản lý nhiều hồ sơ server độc lập, chỉnh sửa đầy đủ `serverconfig.txt` (bao gồm các tùy chọn `seed_*`, `worldrollbackstokeep`, `slowliquids` của 1.4.5).
-  - Bật server nền không mở cửa sổ CMD rời, theo dõi RAM/CPU, xem console log theo thời gian thực và gửi lệnh trực tiếp (`playing`, `save`, `dawn`, `noon`, `dusk`, `midnight`, `settle`, `kick`, `ban`).
-  - Hỗ trợ **Lưu & Tắt** an toàn (`save` + `exit`) và tự khởi động lại khi crash.
+  - **Cấu hình**: quản lý nhiều hồ sơ server độc lập, chỉnh sửa đầy đủ `serverconfig.txt` (bao gồm các tùy chọn `seed_*`, `worldrollbackstokeep`, `slowliquids` của 1.4.5), bật server nền không mở cửa sổ CMD rời, theo dõi RAM/CPU, hỗ trợ **Lưu & Tắt** an toàn (`save` + `exit`) và tự khởi động lại khi crash.
+  - **Mở Port & IP**: tự động nhận diện **Mạng LAN** và **VPN chơi game** (`Radmin VPN`, `Tailscale`, `ZeroTier`), cấp quyền **Windows Firewall**, mở cổng tự động **UPnP** trên Modem/Router (phát hiện **CGNAT** và hướng dẫn **Port Forwarding** thủ công), lắng nghe **Global IPv6** (`[IPv6]:port` để bạn bè tham gia trực tiếp qua **Tham gia nhanh**) và kiểm tra kết nối TCP thực tế theo `host:port`.
+  - **Console & Người chơi**: xem console log theo thời gian thực, gửi lệnh trực tiếp (`playing`, `save`, `dawn`, `noon`, `dusk`, `midnight`, `settle`, `kick`, `ban`), **Kick / Ban** người chơi đang online và quản lý `banlist.txt`.
 - **Cài Mod**:
   - **Đã cài**: hiển thị icon trích xuất từ `.tmod`, phiên bản, tác giả, `ModSide`, cảnh báo thiếu dependency, bật/tắt cập nhật `enabled.json` và hỗ trợ kéo thả file `.tmod` / `.zip` trực tiếp vào cửa sổ.
   - **GitHub & URL**: tra cứu nhanh release mới nhất từ repo phổ biến (`RecipeBrowser`, `MagicStorage`, `BossChecklist`, `AlchemistNPCLite`, `OreExcavator`, `WingSlot`), nhập repo `owner/repo` bất kỳ hoặc tải trực tiếp từ link `.tmod`.
   - **ModPack**: gom nhóm mod đang bật thành ModPack riêng và chuyển đổi nhanh.
   - **Workshop**: tự cài `SteamCMD` qua `winget` và tải ẩn danh mod từ Steam Workshop theo ID hoặc URL (hỗ trợ cấu hình Proxy HTTP/SOCKS5 ở tab **Cài đặt** nếu mạng bị chặn kết nối tới Steam).
-- **Host Online**:
-  - Hiển thị và sao chép nhanh địa chỉ **Mạng LAN**, **IP Công cộng** và **Tunnel Online**.
-  - Tự động hoặc thủ công mở **Windows Firewall TCP** (`TerrariaLauncher_TCP_<port>`), mở **UPnP Router** kèm cảnh báo nếu mạng nằm sau **CGNAT**, hoặc bật **Public TCP Tunnel** qua `bore.pub`.
-  - Kiểm tra kết nối TCP thực tế theo `host:port`, **Kick / Ban** người chơi đang online và quản lý `banlist.txt`.

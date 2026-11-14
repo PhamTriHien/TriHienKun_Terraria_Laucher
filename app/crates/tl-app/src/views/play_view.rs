@@ -13,10 +13,40 @@ fn is_edition_ready(state: &AppState, edition: GameEdition) -> bool {
     match edition {
         GameEdition::Vanilla => state.env.terraria_installed && state.env.xna_installed,
         GameEdition::TModLoader => {
-            state.env.terraria_installed
-                && state.env.tmodloader_installed
-                && state.env.dotnet8_version.is_some()
+            state.env.tmodloader_installed && state.env.dotnet8_version.is_some()
         }
+    }
+}
+
+fn clean_world_size_label(raw: &str) -> &str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("small") || raw.contains("Nhỏ") {
+        "Nhỏ"
+    } else if lower.contains("medium") || raw.contains("Vừa") || raw.contains("Trung") {
+        "Vừa"
+    } else if lower.contains("large") || raw.contains("Lớn") {
+        "Lớn"
+    } else {
+        raw
+    }
+}
+
+fn clean_world_difficulty_label(raw: &str) -> &str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("journey") || raw.contains("Hành trình") {
+        "Hành trình"
+    } else if lower.contains("master") {
+        "Master"
+    } else if lower.contains("expert") {
+        "Expert"
+    } else if lower.contains("classic")
+        || lower.contains("normal")
+        || raw.contains("Thường")
+        || raw.contains("Cổ điển")
+    {
+        "Thường"
+    } else {
+        raw
     }
 }
 
@@ -27,13 +57,13 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     page_title(ui, p, "Khởi chạy Game & Thế giới");
     ui.add_space(8.0);
 
-    anim3d::render_play_hero_showcase(
+    anim3d::render_play_hero_3d(
         ui,
         p,
         assets.hero_banner(state.config.active_edition),
         assets.edition_icon(state.config.active_edition),
         state.config.active_edition,
-        state.running_game.is_some(),
+        state.is_game_running(),
         state.installed_mods.len(),
     );
     ui.add_space(10.0);
@@ -85,7 +115,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.label(RichText::new("ModPack:").color(p.text_muted));
                 let mut selected_modpack = state.config.active_modpack.clone();
                 let selected_label = if selected_modpack.is_empty() {
-                    "Mặc định (enabled.json)".to_string()
+                    "Mặc định (Mod đang bật)".to_string()
                 } else {
                     selected_modpack.clone()
                 };
@@ -98,7 +128,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                             .selectable_value(
                                 &mut selected_modpack,
                                 String::new(),
-                                "Mặc định (enabled.json)",
+                                "Mặc định (Mod đang bật)",
                             )
                             .changed()
                         {
@@ -148,16 +178,10 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         render_missing_prereq_bar(state, ui, p);
 
         ui.horizontal_wrapped(|ui| {
-            if let Some(running) = state.running_game.clone() {
+            if let Some(running) = state.current_running_game().cloned() {
                 status_pill(
                     ui,
-                    &format!(
-                        "Đang chạy {}  •  PID {}  •  {} MB  •  {:.1}% CPU",
-                        running.edition.label(),
-                        running.pid,
-                        running.memory_mb,
-                        running.cpu_percent
-                    ),
+                    &format!("Đang chạy {}", running.edition.label()),
                     p.accent_emerald,
                 );
                 if rpg_button(
@@ -172,21 +196,29 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 {
                     state.kill_running_game();
                 }
-            } else if ui
-                .add_enabled_ui(!state.install_busy && active_edition_ready, |ui| {
-                    rpg_button(
-                        ui,
-                        assets.as_ref(),
-                        p,
-                        ButtonSkin::Emerald,
-                        UiIcon::Play,
-                        &format!("Chơi {}", state.config.active_edition.label()),
-                    )
-                })
-                .inner
-                .clicked()
-            {
-                state.launch_selected_game(Some((String::new(), 0, String::new())));
+            } else {
+                let launch_disabled_hint = if state.install_busy {
+                    "Đang cài đặt thành phần..."
+                } else {
+                    "Cài đặt thành phần còn thiếu ở thanh phía trên trước khi chơi"
+                };
+                if ui
+                    .add_enabled_ui(!state.install_busy && active_edition_ready, |ui| {
+                        rpg_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Emerald,
+                            UiIcon::Play,
+                            &format!("Chơi {}", state.config.active_edition.label()),
+                        )
+                    })
+                    .inner
+                    .on_disabled_hover_text(launch_disabled_hint)
+                    .clicked()
+                {
+                    state.launch_selected_game(Some((String::new(), 0, String::new())));
+                }
             }
         });
     });
@@ -205,29 +237,79 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Host:").color(p.text_muted));
-            ui.add(
+            let pasted = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+            let host_resp = ui.add(
                 egui::TextEdit::singleline(&mut state.config.quick_join_host)
-                    .desired_width(180.0)
-                    .hint_text("127.0.0.1 hoặc bore.pub"),
+                    .desired_width(185.0)
+                    .hint_text("IP, Domain hoặc [IPv6]:port"),
             );
-            ui.label(RichText::new("Cổng:").color(p.text_muted));
-            let mut port_str = state.config.quick_join_port.to_string();
-            if ui
-                .add(egui::TextEdit::singleline(&mut port_str).desired_width(64.0))
-                .changed()
-            {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
+            if (host_resp.changed() && pasted) || host_resp.lost_focus() {
+                if let Some((host, port)) = parse_pasted_host_port(&state.config.quick_join_host) {
+                    state.config.quick_join_host = host;
                     state.config.quick_join_port = port;
+                    state.quick_join_port_input = port.to_string();
+                    state.save_config();
+                } else if host_resp.lost_focus() {
+                    state.save_config();
                 }
             }
+
+            ui.label(RichText::new("Cổng:").color(p.text_muted));
+            let port_resp = ui.add(
+                egui::TextEdit::singleline(&mut state.quick_join_port_input)
+                    .desired_width(62.0)
+                    .hint_text("7777"),
+            );
+            let parsed_port = port_resp
+                .changed()
+                .then(|| state.quick_join_port_input.trim().parse::<u16>().ok())
+                .flatten()
+                .filter(|&port| port > 0);
+            if let Some(port) = parsed_port {
+                state.config.quick_join_port = port;
+            }
+            if port_resp.lost_focus() {
+                match state.quick_join_port_input.trim().parse::<u16>() {
+                    Ok(port) if port > 0 => {
+                        state.config.quick_join_port = port;
+                        state.quick_join_port_input = port.to_string();
+                    }
+                    _ => {
+                        let fallback = state.config.quick_join_port.max(1);
+                        state.config.quick_join_port = fallback;
+                        state.quick_join_port_input = fallback.to_string();
+                    }
+                }
+                state.save_config();
+            }
+
             ui.label(RichText::new("Mật khẩu:").color(p.text_muted));
-            ui.add(
+            let pass_resp = ui.add(
                 egui::TextEdit::singleline(&mut state.config.quick_join_password)
                     .password(true)
-                    .desired_width(110.0),
+                    .desired_width(105.0)
+                    .hint_text("Tùy chọn"),
             );
+            if pass_resp.lost_focus() {
+                state.save_config();
+            }
+
+            let host_non_empty = !state.config.quick_join_host.trim().is_empty();
+            let can_join_now = !state.install_busy
+                && active_edition_ready
+                && !state.is_game_running()
+                && host_non_empty;
+            let join_disabled_hint = if state.install_busy {
+                "Đang cài đặt thành phần..."
+            } else if state.is_game_running() {
+                "Đóng cửa sổ game đang mở trước khi tham gia server"
+            } else if !active_edition_ready {
+                "Cần cài đặt đầy đủ phiên bản game trước"
+            } else {
+                "Nhập địa chỉ Host / IP trước"
+            };
             if ui
-                .add_enabled_ui(!state.install_busy && active_edition_ready, |ui| {
+                .add_enabled_ui(can_join_now, |ui| {
                     rpg_button(
                         ui,
                         assets.as_ref(),
@@ -238,101 +320,69 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     )
                 })
                 .inner
+                .on_disabled_hover_text(join_disabled_hint)
                 .clicked()
             {
-                if state.config.quick_join_host.trim().is_empty() {
-                    state.notify_err("Nhập địa chỉ Host / IP trước khi tham gia.");
-                } else {
-                    state.launch_selected_game(None);
-                }
+                state.launch_selected_game(None);
             }
         });
 
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
+            let ext_ready =
+                state.showing_external_server() && !state.is_active_external_starting();
             let srv_running = matches!(
-                state.server_snapshot.as_ref().map(|s| &s.state),
+                state.active_server_snapshot().map(|s| &s.state),
                 Some(ServerLifecycleState::Running)
-            );
+            ) || ext_ready;
             if srv_running {
                 let port = state.active_server_port();
-                if rpg_compact_button(
-                    ui,
-                    assets.as_ref(),
-                    p,
-                    ButtonSkin::Cyan,
-                    Some(UiIcon::Server),
-                    &format!("Điền server máy này (127.0.0.1:{port})"),
-                )
-                .clicked()
+                let local_disabled_hint = if state.install_busy {
+                    "Đang cài đặt thành phần..."
+                } else {
+                    "Đóng cửa sổ game đang mở trước"
+                };
+                if ui
+                    .add_enabled_ui(!state.install_busy && !state.is_game_running(), |ui| {
+                        rpg_compact_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Cyan,
+                            Some(UiIcon::Server),
+                            &format!("Vào Server máy này (127.0.0.1:{port})"),
+                        )
+                    })
+                    .inner
+                    .on_disabled_hover_text(local_disabled_hint)
+                    .clicked()
                 {
-                    state.config.quick_join_host = "127.0.0.1".to_string();
-                    state.config.quick_join_port = port;
-                    if let Some(profile) = state.config.active_server() {
-                        state.config.quick_join_password = profile.config.password.clone();
-                    }
-                    state.save_config();
+                    state.join_own_hosted_server();
                 }
             }
-            if let Some(ep) = state.active_tunnel_endpoint() {
-                if rpg_compact_button(
-                    ui,
-                    assets.as_ref(),
-                    p,
-                    ButtonSkin::Amber,
-                    Some(UiIcon::Host),
-                    &format!("Điền Tunnel ({ep})"),
-                )
-                .clicked()
-                {
-                    if let Some((h, p_str)) = ep.rsplit_once(':') {
-                        state.config.quick_join_host = h.to_string();
-                        if let Ok(port) = p_str.parse::<u16>() {
-                            state.config.quick_join_port = port;
-                        }
-                        state.save_config();
-                    }
-                }
-            }
-        });
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.new_join_name)
-                    .desired_width(120.0)
-                    .hint_text("Tên gợi nhớ"),
+                    .desired_width(135.0)
+                    .hint_text("Tên lưu (tùy chọn)"),
             );
-            ui.add(
-                egui::TextEdit::singleline(&mut state.new_join_host)
-                    .desired_width(150.0)
-                    .hint_text("IP / Domain"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut state.new_join_port)
-                    .desired_width(60.0)
-                    .hint_text("7777"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut state.new_join_password)
-                    .password(true)
-                    .desired_width(90.0)
-                    .hint_text("Mật khẩu"),
-            );
-            if rpg_button(
-                ui,
-                assets.as_ref(),
-                p,
-                ButtonSkin::Cyan,
-                UiIcon::Pack,
-                "+ Lưu Server",
-            )
-            .clicked()
+            let can_save_fav = !state.config.quick_join_host.trim().is_empty();
+            if ui
+                .add_enabled_ui(can_save_fav, |ui| {
+                    rpg_compact_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Cyan,
+                        Some(UiIcon::Pack),
+                        "+ Lưu danh sách",
+                    )
+                })
+                .inner
+                .on_disabled_hover_text("Nhập địa chỉ Host / IP trước")
+                .clicked()
             {
-                state.add_saved_join_server();
+                state.save_quick_join_server();
             }
         });
 
@@ -341,14 +391,25 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             let mut join_target = None;
             let mut remove_idx = None;
             for (idx, srv) in state.config.saved_join_servers.iter().enumerate() {
+                let srv_ready = is_edition_ready(state, srv.edition);
+                let can_join_saved =
+                    !state.install_busy && !state.is_game_running() && srv_ready;
+                let saved_disabled_hint = if state.install_busy {
+                    "Đang cài đặt thành phần..."
+                } else if state.is_game_running() {
+                    "Đóng cửa sổ game đang mở trước"
+                } else {
+                    "Phiên bản của server này chưa cài đủ thành phần"
+                };
                 rpg_subcard(ui, assets.as_ref(), p, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&srv.name).strong());
-                        ui.label(
-                            RichText::new(format!("{}:{}", srv.host, srv.port))
-                                .monospace()
-                                .color(p.text_muted),
-                        );
+                        let ep_text = if srv.host.contains(':') {
+                            format!("[{}]:{}", srv.host, srv.port)
+                        } else {
+                            format!("{}:{}", srv.host, srv.port)
+                        };
+                        ui.label(RichText::new(ep_text).monospace().color(p.text_muted));
                         status_pill(ui, srv.edition.label(), p.accent_cyan);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if rpg_compact_button(
@@ -363,15 +424,20 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                             {
                                 remove_idx = Some(idx);
                             }
-                            if rpg_compact_button(
-                                ui,
-                                assets.as_ref(),
-                                p,
-                                ButtonSkin::Emerald,
-                                Some(UiIcon::Play),
-                                "Vào",
-                            )
-                            .clicked()
+                            if ui
+                                .add_enabled_ui(can_join_saved, |ui| {
+                                    rpg_compact_button(
+                                        ui,
+                                        assets.as_ref(),
+                                        p,
+                                        ButtonSkin::Emerald,
+                                        Some(UiIcon::Play),
+                                        "Vào",
+                                    )
+                                })
+                                .inner
+                                .on_disabled_hover_text(saved_disabled_hint)
+                                .clicked()
                             {
                                 join_target = Some((
                                     srv.edition,
@@ -390,7 +456,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 state.save_config();
             }
             if let Some((edition, host, port, pass)) = join_target {
-                if state.active_game.is_none() {
+                if !state.is_game_running() {
                     state.config.active_edition = edition;
                     state.refresh_worlds_and_backups();
                 }
@@ -402,39 +468,28 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     ui.add_space(12.0);
 
     rpg_card(ui, assets.as_ref(), p, |ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 46.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                anim3d::render_worlds_island_3d(ui, p, assets.nav_worlds.as_ref());
-                rpg_section_heading(
+        ui.horizontal(|ui| {
+            rpg_section_heading(ui, assets.as_ref(), p, UiIcon::Worlds, "Thế giới đã lưu");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if rpg_compact_button(
                     ui,
                     assets.as_ref(),
                     p,
-                    UiIcon::Worlds,
-                    &format!("Thế giới ({})", state.config.active_edition.label()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if rpg_compact_button(
-                        ui,
-                        assets.as_ref(),
-                        p,
-                        ButtonSkin::Slate,
-                        Some(UiIcon::Refresh),
-                        "Quét lại",
-                    )
-                    .clicked()
-                    {
-                        state.refresh_worlds_and_backups();
-                    }
-                });
-            },
-        );
+                    ButtonSkin::Slate,
+                    Some(UiIcon::Refresh),
+                    "Quét lại",
+                )
+                .clicked()
+                {
+                    state.refresh_worlds_and_backups();
+                }
+            });
+        });
         ui.add_space(6.0);
 
         if state.worlds.is_empty() {
             ui.label(
-                RichText::new("Chưa có file thế giới (.wld) trong thư mục lưu.")
+                RichText::new("Chưa có thế giới nào cho phiên bản đang chọn.")
                     .color(p.text_muted),
             );
         } else {
@@ -443,11 +498,12 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 rpg_subcard(ui, assets.as_ref(), p, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&world.world_name).strong().size(14.5));
-                        status_pill(ui, world.size_label(), p.accent_cyan);
-                        status_pill(ui, world.difficulty_label(), p.accent_amber);
-                        if world.has_twld {
-                            status_pill(ui, ".twld", p.accent_emerald);
-                        }
+                        status_pill(ui, clean_world_size_label(world.size_label()), p.accent_cyan);
+                        status_pill(
+                            ui,
+                            clean_world_difficulty_label(world.difficulty_label()),
+                            p.accent_amber,
+                        );
                         if !world.special_seeds.is_empty() {
                             status_pill(ui, &world.special_seeds.join(", "), p.accent_cyan);
                         }
@@ -478,39 +534,94 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
         if !state.world_backups.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new("Bản sao lưu gần đây").strong());
-            ui.add_space(4.0);
             let backups = state.world_backups.clone();
-            for bak in backups.iter().take(6) {
-                rpg_subcard(ui, assets.as_ref(), p, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&bak.file_name).monospace().size(12.5));
-                        ui.label(
-                            RichText::new(format!(
-                                "{}  •  {}",
-                                format_bytes(bak.file_size),
-                                bak.modified_display
-                            ))
-                            .size(11.5)
-                            .color(p.text_muted),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if rpg_compact_button(
-                                ui,
-                                assets.as_ref(),
-                                p,
-                                ButtonSkin::Amber,
-                                Some(UiIcon::Refresh),
-                                "Khôi phục",
-                            )
-                            .clicked()
-                            {
-                                state.restore_backup(bak);
-                            }
-                        });
+            let mut ask_confirm = None;
+            let mut cancel_confirm = false;
+            let mut restore_target = None;
+
+            egui::CollapsingHeader::new(
+                RichText::new(format!("Bản sao lưu ({})", backups.len())).strong(),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("play_world_backups_scroll")
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        for bak in &backups {
+                            let is_confirming =
+                                state.confirm_restore_backup.as_ref() == Some(&bak.file_path);
+                            rpg_subcard(ui, assets.as_ref(), p, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&bak.file_name).monospace().size(12.5));
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}  •  {}",
+                                            format_bytes(bak.file_size),
+                                            bak.modified_display
+                                        ))
+                                        .size(11.5)
+                                        .color(p.text_muted),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if is_confirming {
+                                                if rpg_compact_button(
+                                                    ui,
+                                                    assets.as_ref(),
+                                                    p,
+                                                    ButtonSkin::Slate,
+                                                    None,
+                                                    "Hủy",
+                                                )
+                                                .clicked()
+                                                {
+                                                    cancel_confirm = true;
+                                                }
+                                                if rpg_compact_button(
+                                                    ui,
+                                                    assets.as_ref(),
+                                                    p,
+                                                    ButtonSkin::Amber,
+                                                    Some(UiIcon::Refresh),
+                                                    "Ghi đè",
+                                                )
+                                                .clicked()
+                                                {
+                                                    restore_target = Some(bak.clone());
+                                                }
+                                            } else if rpg_compact_button(
+                                                ui,
+                                                assets.as_ref(),
+                                                p,
+                                                ButtonSkin::Amber,
+                                                Some(UiIcon::Refresh),
+                                                "Khôi phục",
+                                            )
+                                            .clicked()
+                                            {
+                                                ask_confirm = Some(bak.file_path.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                            ui.add_space(3.0);
+                        }
                     });
-                });
-                ui.add_space(3.0);
+            });
+
+            if cancel_confirm {
+                state.confirm_restore_backup = None;
+            }
+            if let Some(path) = ask_confirm {
+                state.confirm_restore_backup = Some(path);
+            }
+            if let Some(bak) = restore_target {
+                state.confirm_restore_backup = None;
+                state.restore_backup(&bak);
             }
         }
     });
@@ -518,20 +629,26 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
 fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
     let assets = state.assets.clone();
-    let missing_terraria = !state.env.terraria_installed;
-    let missing_xna = !state.env.xna_installed;
-    let missing_tml = !state.env.tmodloader_installed;
-    let missing_dotnet = state.env.dotnet8_version.is_none();
+    let (missing_terraria, missing_xna, missing_tml, missing_dotnet) =
+        match state.config.active_edition {
+            GameEdition::Vanilla => (!state.env.terraria_installed, !state.env.xna_installed, false, false),
+            GameEdition::TModLoader => (
+                false,
+                false,
+                !state.env.tmodloader_installed,
+                state.env.dotnet8_version.is_none(),
+            ),
+        };
 
     let mut warnings = Vec::new();
     if missing_terraria {
-        warnings.push("Thiếu Terraria.exe");
+        warnings.push("Chưa cài Terraria");
     }
     if missing_xna {
-        warnings.push("Thiếu XNA");
+        warnings.push("Thiếu XNA 4.0");
     }
     if missing_tml {
-        warnings.push("Thiếu tModLoader.dll");
+        warnings.push("Chưa cài tModLoader");
     }
     if missing_dotnet {
         warnings.push("Thiếu .NET 8");
@@ -541,66 +658,17 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePa
         return;
     }
 
-    let active_missing = !is_edition_ready(state, state.config.active_edition);
-
     rpg_subcard(ui, assets.as_ref(), p, |ui| {
         if !warnings.is_empty() {
-            let pill_color = if active_missing {
-                p.accent_red
-            } else {
-                p.accent_amber
-            };
             let mut do_tml = false;
             let mut do_dotnet = false;
             let mut do_xna = false;
             let mut do_terraria_url = false;
-            let mut do_zip = false;
             let mut open_settings = false;
-            let mut do_refresh = false;
 
             ui.horizontal_wrapped(|ui| {
-                status_pill(ui, &warnings.join(" • "), pill_color);
+                status_pill(ui, &warnings.join(" • "), p.accent_red);
                 ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if missing_tml
-                        && rpg_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            ButtonSkin::Cyan,
-                            UiIcon::Download,
-                            "Cài tModLoader + .NET 8",
-                        )
-                        .clicked()
-                    {
-                        do_tml = true;
-                    }
-                    if missing_dotnet
-                        && !missing_tml
-                        && rpg_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            ButtonSkin::Cyan,
-                            UiIcon::Download,
-                            "Cài .NET 8 Portable",
-                        )
-                        .clicked()
-                    {
-                        do_dotnet = true;
-                    }
-                    if missing_xna
-                        && rpg_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            ButtonSkin::Amber,
-                            UiIcon::Download,
-                            "Cài XNA 4.0",
-                        )
-                        .clicked()
-                    {
-                        do_xna = true;
-                    }
                     if missing_terraria
                         && rpg_button(
                             ui,
@@ -618,44 +686,62 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePa
                     {
                         do_terraria_url = true;
                     }
-                    if missing_terraria
+                    if missing_xna
+                        && rpg_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Amber,
+                            UiIcon::Download,
+                            "Cài XNA 4.0",
+                        )
+                        .clicked()
+                    {
+                        do_xna = true;
+                    }
+                    if missing_tml {
+                        let tml_btn_label = if missing_dotnet {
+                            "Cài tModLoader + .NET 8"
+                        } else {
+                            "Cài tModLoader"
+                        };
+                        if rpg_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Cyan,
+                            UiIcon::Download,
+                            tml_btn_label,
+                        )
+                        .clicked()
+                        {
+                            do_tml = true;
+                        }
+                    } else if missing_dotnet
                         && rpg_button(
                             ui,
                             assets.as_ref(),
                             p,
                             ButtonSkin::Cyan,
-                            UiIcon::Pack,
-                            "Cài từ file .zip",
+                            UiIcon::Download,
+                            "Cài .NET 8",
                         )
                         .clicked()
                     {
-                        do_zip = true;
+                        do_dotnet = true;
                     }
                 });
-                if missing_terraria
-                    && rpg_button(
-                        ui,
-                        assets.as_ref(),
-                        p,
-                        ButtonSkin::Slate,
-                        UiIcon::Settings,
-                        "Nguồn tải Terraria",
-                    )
-                    .clicked()
-                {
-                    open_settings = true;
-                }
                 if rpg_button(
                     ui,
                     assets.as_ref(),
                     p,
                     ButtonSkin::Slate,
-                    UiIcon::Refresh,
-                    "Làm mới kiểm tra",
+                    UiIcon::Settings,
+                    "Mở Cài đặt",
                 )
                 .clicked()
                 {
-                    do_refresh = true;
+                    open_settings = true;
                 }
             });
 
@@ -671,14 +757,8 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePa
             if do_terraria_url {
                 state.install_terraria_url();
             }
-            if do_zip {
-                state.pick_and_install_terraria_zip();
-            }
             if open_settings {
                 state.active_tab = NavTab::Settings;
-            }
-            if do_refresh {
-                state.refresh_environment();
             }
         }
 
@@ -718,4 +798,27 @@ pub(crate) fn render_install_progress_bar(ui: &mut egui::Ui, p: &InstallProgress
             .animate(frac.is_none())
             .desired_width(ui.available_width()),
     );
+}
+
+pub(crate) fn parse_pasted_host_port(raw: &str) -> Option<(String, u16)> {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (ipv6, port_part) = rest.split_once("]:")?;
+        let ipv6 = ipv6.split('%').next().unwrap_or(ipv6).trim();
+        if ipv6.is_empty() {
+            return None;
+        }
+        let port = port_part.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
+        return Some((ipv6.to_string(), port));
+    }
+    if trimmed.matches(':').count() != 1 {
+        return None;
+    }
+    let (host, port_str) = trimmed.split_once(':')?;
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let port = port_str.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
+    Some((host.to_string(), port))
 }

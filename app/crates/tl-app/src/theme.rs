@@ -582,7 +582,7 @@ fn draw_rpg_tex_button(
     };
 
     let base_tint = if !enabled {
-        Color32::from_rgba_unmultiplied(112, 118, 128, 232)
+        Color32::from_rgba_unmultiplied(96, 102, 112, 92)
     } else if down {
         Color32::from_rgb(206, 208, 214)
     } else if hovered || cfg.highlighted {
@@ -606,12 +606,16 @@ fn draw_rpg_tex_button(
         let mesh = build_nine_slice_mesh(bg_tex, draw_rect, BUTTON_SLICE, tint);
         painter.add(Shape::mesh(mesh));
     } else {
-        let fallback_col = match cfg.skin {
-            ButtonSkin::Emerald => p.accent_emerald,
-            ButtonSkin::Cyan => p.accent_cyan,
-            ButtonSkin::Amber => p.accent_amber,
-            ButtonSkin::Red => p.accent_red,
-            ButtonSkin::Slate => p.bg_elevated,
+        let fallback_col = if !enabled {
+            Color32::from_rgba_unmultiplied(96, 102, 112, 92)
+        } else {
+            match cfg.skin {
+                ButtonSkin::Emerald => p.accent_emerald,
+                ButtonSkin::Cyan => p.accent_cyan,
+                ButtonSkin::Amber => p.accent_amber,
+                ButtonSkin::Red => p.accent_red,
+                ButtonSkin::Slate => p.bg_elevated,
+            }
         };
         painter.rect_filled(draw_rect, CornerRadius::same(7), fallback_col);
     }
@@ -642,7 +646,7 @@ fn draw_rpg_tex_button(
         let ico_tint = if enabled {
             Color32::WHITE
         } else {
-            Color32::from_white_alpha(190)
+            Color32::from_white_alpha(85)
         };
         painter.image(
             ico.id(),
@@ -659,9 +663,9 @@ fn draw_rpg_tex_button(
     let final_text_col = if enabled {
         label_color
     } else {
-        Color32::from_rgba_unmultiplied(228, 234, 242, 220)
+        Color32::from_rgba_unmultiplied(p.text_muted.r(), p.text_muted.g(), p.text_muted.b(), 135)
     };
-    let shadow_alpha = if enabled { 205 } else { 155 };
+    let shadow_alpha = if enabled { 205 } else { 35 };
     painter.galley(
         text_pos + Vec2::new(0.0, 1.1),
         galley.clone(),
@@ -672,6 +676,9 @@ fn draw_rpg_tex_button(
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
+        if ui.rect_contains_pointer(rect) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+        }
         resp
     }
 }

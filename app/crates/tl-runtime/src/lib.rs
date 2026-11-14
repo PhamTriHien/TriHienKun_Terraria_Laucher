@@ -18,9 +18,9 @@ pub use game_installer::{
 };
 
 pub use game_runner::{
-    apply_dotnet_std_env, apply_dotnet_tokio_env, install_xna_framework_elevated, launch_game,
-    resolve_dotnet_launch, ActiveGameProcess, DotnetLaunchSpec, GameLaunchOptions,
-    RunningGameSnapshot, RuntimeTuning,
+    apply_dotnet_std_env, apply_dotnet_tokio_env, detect_existing_game_process,
+    install_xna_framework_elevated, launch_game, resolve_dotnet_launch, ActiveGameProcess,
+    DotnetLaunchSpec, GameLaunchOptions, RunningGameSnapshot, RuntimeTuning,
 };
 pub use modpack_sync::{
     build_modpack_share_preview, inspect_share_key_against_local, load_mod_sources,
@@ -41,11 +41,17 @@ pub use mods_manager::{
     WorkshopManifestRecord, WorkshopQueryResult, WorkshopSort, CURATED_GITHUB_MODS,
 };
 pub use network_host::{
-    check_firewall_rule_exists, close_upnp_port, ensure_firewall_rule, open_upnp_port,
-    probe_network_snapshot, probe_tcp_endpoint, remove_firewall_rule, start_bore_tunnel,
-    BoreTunnelHandle, LocalInterfaceInfo, NetworkSnapshot, TunnelStatus, UpnpLeaseInfo,
+    check_firewall_rule_exists, close_upnp_port, detect_primary_global_ipv6, ensure_firewall_rule,
+    is_global_unicast_ipv6, is_local_probe_host, open_upnp_port, probe_local_endpoint_listening,
+    probe_local_tcp_listening, probe_network_snapshot, probe_tcp_endpoint, remove_firewall_rule,
+    resolve_ipv6_bridge_target, split_endpoint_host_port, start_direct_port_host,
+    start_ipv4_to_ipv6_client_bridge, DirectHostActiveInfo, DirectHostConfig, DirectHostStatus,
+    DirectPortHostHandle, LocalClientBridgeHandle, LocalInterfaceInfo, NetworkSnapshot,
+    UpnpLeaseInfo, UpnpPortStatus,
 };
 pub use server_manager::{
-    egui_repaint::RepaintHandle, load_banlist, save_banlist, start_server, BanEntry,
-    ConnectedPlayer, ConsoleLogLine, ServerLifecycleState, ServerRuntimeSnapshot, ServerSupervisor,
+    detect_existing_server_processes, egui_repaint::RepaintHandle, load_banlist,
+    read_server_log_summary, save_banlist, start_server, summarize_server_log_lines,
+    terminate_process_by_pid, BanEntry, ConnectedPlayer, ConsoleLogLine, DetectedExternalServer,
+    ExternalServerLogSummary, ServerLifecycleState, ServerRuntimeSnapshot, ServerSupervisor,
 };

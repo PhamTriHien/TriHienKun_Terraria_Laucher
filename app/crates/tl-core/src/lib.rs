@@ -11,9 +11,9 @@ pub use binary_parsers::{
     write_modpack_install_txt, ModPackInfo, ModSide, TmodMetadata, WorldBackupInfo, WorldMetadata,
 };
 pub use config::{
-    GameEdition, GraphicsBackend, LauncherConfig, ProcessPriority, SavedJoinServer,
-    ServerConfigData, ServerProfile, ThemeMode, WorldDifficultyOption, WorldSizeOption,
-    DEFAULT_TERRARIA_INSTALL_SOURCE,
+    decode_terraria_safe_arg, encode_terraria_safe_arg, GameEdition, GraphicsBackend,
+    LauncherConfig, ProcessPriority, SavedJoinServer, ServerConfigData, ServerProfile, ThemeMode,
+    WorldDifficultyOption, WorldSizeOption, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 pub use error::{LauncherError, LauncherResult};
 pub use modpack_share::{
