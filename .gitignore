@@ -1,0 +1,14 @@
+# Compiled binaries & Cargo build cache
+/app/target/
+app/target/
+*.exe
+*.pdb
+*.msi
+*.zip
+
+# Runtime user data, configs, credentials, worlds, backups, logs & downloads
+/data/
+
+# Local game installations (too large for git / third-party binaries & assets)
+/Terraria/
+/tModLoader/

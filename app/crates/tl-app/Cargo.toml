@@ -1,0 +1,32 @@
+[package]
+name = "tl-app"
+version.workspace = true
+edition.workspace = true
+default-run = "TerrariaLauncher"
+
+[[bin]]
+name = "TerrariaLauncher"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tl-core.workspace = true
+tl-runtime.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+open.workspace = true
+rfd.workspace = true
+image.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+sysinfo.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

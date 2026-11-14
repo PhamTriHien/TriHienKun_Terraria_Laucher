@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tl-core",
+    "crates/tl-runtime",
+    "crates/tl-app",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+[workspace.dependencies]
+tl-core = { path = "crates/tl-core" }
+tl-runtime = { path = "crates/tl-runtime" }
+
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+futures-util = "0.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream", "gzip", "form", "query", "http2", "socks", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+flate2 = "1.1.10"
+zip = { version = "9.4.0", default-features = false, features = ["deflate", "bzip2"] }
+sha1 = "0.11.0"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+quick-xml = "0.42.0"
+sysinfo = "0.40.1"
+bore-cli = "0.6.0"
+socket2 = "0.6"
+open = "5.4.5"
+rfd = "0.17.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico", "webp", "gif"] }
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "system_fonts", "wgpu", "links", "persistence"] }
+egui = "0.37.0"
+egui_extras = { version = "0.37.0", features = ["all_loaders", "image"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
