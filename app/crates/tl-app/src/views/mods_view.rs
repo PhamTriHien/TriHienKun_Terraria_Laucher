@@ -683,36 +683,49 @@ fn render_workshop_detail_card(
     });
 }
 
+fn render_workshop_pagination_controls(
+    ui: &mut egui::Ui,
+    page: u32,
+    has_next: bool,
+    busy: bool,
+) -> Option<u32> {
+    let mut target_page = None;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui
+            .add_enabled(has_next && !busy, egui::Button::new("Sau →"))
+            .clicked()
+        {
+            target_page = Some(page + 1);
+        }
+        status_pill(ui, &format!("Trang {page}"), ACCENT_CYAN);
+        if ui
+            .add_enabled(page > 1 && !busy, egui::Button::new("← Trang trước"))
+            .clicked()
+        {
+            target_page = Some(page - 1);
+        }
+    });
+    target_page
+}
+
 fn render_workshop_catalog_card(state: &mut AppState, ui: &mut egui::Ui) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         let page = state.workshop_page.max(1);
+        let has_next = state.workshop_has_next;
+        let browse_busy = state.workshop_browse_busy;
         let mut nav_page: Option<u32> = None;
 
-        ui.horizontal_wrapped(|ui| {
-            section_heading(ui, "Danh sách Mod Workshop");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        state.workshop_has_next && !state.workshop_browse_busy,
-                        egui::Button::new("Sau →"),
-                    )
-                    .clicked()
+        let header_resp = ui
+            .horizontal_wrapped(|ui| {
+                section_heading(ui, "Danh sách Mod Workshop");
+                if let Some(target) =
+                    render_workshop_pagination_controls(ui, page, has_next, browse_busy)
                 {
-                    nav_page = Some(page + 1);
+                    nav_page = Some(target);
                 }
-                status_pill(ui, &format!("Trang {page}"), ACCENT_CYAN);
-                if ui
-                    .add_enabled(
-                        page > 1 && !state.workshop_browse_busy,
-                        egui::Button::new("← Trang trước"),
-                    )
-                    .clicked()
-                {
-                    nav_page = Some(page - 1);
-                }
-            });
-        });
+            })
+            .response;
 
         if let Some(target_page) = nav_page {
             state.browse_workshop(target_page);
@@ -774,6 +787,24 @@ fn render_workshop_catalog_card(state: &mut AppState, ui: &mut egui::Ui) {
                     ));
                 }
             }
+        }
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+        let mut bottom_nav_page: Option<u32> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!("Hiển thị {} mod trên trang {page}", items.len()))
+                    .size(12.0)
+                    .color(TEXT_MUTED),
+            );
+            bottom_nav_page =
+                render_workshop_pagination_controls(ui, page, has_next, state.workshop_browse_busy);
+        });
+        if let Some(target_page) = bottom_nav_page {
+            header_resp.scroll_to_me(Some(egui::Align::TOP));
+            state.browse_workshop(target_page);
         }
     });
 }
