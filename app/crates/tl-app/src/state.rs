@@ -1,4 +1,5 @@
-use crate::theme::{format_bytes, ACCENT_EMERALD};
+use crate::assets::LauncherAssets;
+use crate::theme::{format_bytes, palette, ThemePalette};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,8 +11,8 @@ use tl_core::{
     decode_modpack_share_key, delete_modpack, detect_environment, list_modpacks,
     list_world_backups, parse_world_file, restore_world_backup, sanitize_modpack_name,
     write_modpack_install_txt, EnvironmentStatus, GameEdition, LauncherConfig, LauncherPaths,
-    ModPackInfo, SavedJoinServer, ServerConfigData, ServerProfile, SharedModSource, TmodMetadata,
-    WorldBackupInfo, WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
+    ModPackInfo, SavedJoinServer, ServerConfigData, ServerProfile, SharedModSource, ThemeMode,
+    TmodMetadata, WorldBackupInfo, WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 use tl_runtime::{
     browse_workshop_mods, build_modpack_share_preview, check_firewall_rule_exists, close_upnp_port,
@@ -142,6 +143,7 @@ pub struct AppState {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub event_rx: mpsc::UnboundedReceiver<AppEvent>,
 
+    pub assets: LauncherAssets,
     pub paths: LauncherPaths,
     pub config: LauncherConfig,
     pub env: EnvironmentStatus,
@@ -269,6 +271,7 @@ impl AppState {
             repaint,
             event_tx,
             event_rx,
+            assets: LauncherAssets::load(ctx),
             paths,
             config,
             env,
@@ -804,14 +807,42 @@ impl AppState {
 
             if let Some(proc_handle) = &mut self.active_game {
                 if let Some(exit) = proc_handle.poll() {
-                    let msg = format!(
-                        "{} đã đóng (mã thoát {:?}).",
-                        proc_handle.edition.label(),
-                        exit.code()
-                    );
+                    let edition = proc_handle.edition;
+                    let tail = proc_handle.recent_output();
+                    let log_file = proc_handle.log_path().to_path_buf();
                     self.active_game = None;
                     self.running_game = None;
-                    self.notify_ok(msg);
+                    if exit.success() {
+                        self.notify_ok(format!("{} đã đóng bình thường.", edition.label()));
+                    } else {
+                        let snippet = tail
+                            .iter()
+                            .rev()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        let msg = if snippet.is_empty() {
+                            format!(
+                                "{} thoát bất thường (mã {:?}). Xem log: {}",
+                                edition.label(),
+                                exit.code(),
+                                log_file.display()
+                            )
+                        } else {
+                            format!(
+                                "{} thoát bất thường (mã {:?}): {} (log: {})",
+                                edition.label(),
+                                exit.code(),
+                                snippet,
+                                log_file.display()
+                            )
+                        };
+                        self.notify_err(msg);
+                    }
                     self.refresh_worlds_and_backups();
                 } else {
                     self.running_game = Some(proc_handle.snapshot());
@@ -856,19 +887,7 @@ impl AppState {
             }
         }
 
-        if self.active_game.is_some()
-            || self
-                .server_supervisor
-                .as_ref()
-                .map(|s| s.is_active())
-                .unwrap_or(false)
-            || self.bore_handle.is_some()
-            || self.install_busy
-            || self.tml_releases_busy
-            || self.terraria_check_busy
-        {
-            ctx.request_repaint_after(Duration::from_millis(800));
-        }
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -921,10 +940,40 @@ impl AppState {
         Some(handle)
     }
 
+    pub fn palette(&self) -> ThemePalette {
+        palette(self.config.theme_mode)
+    }
+
+    pub fn set_theme_mode(&mut self, ctx: &egui::Context, mode: ThemeMode) {
+        if self.config.theme_mode == mode {
+            return;
+        }
+        self.config.theme_mode = mode;
+        crate::theme::apply_theme(ctx, mode);
+        self.save_config();
+    }
+
     pub fn launch_selected_game(&mut self, join_server: Option<(String, u16, String)>) {
         if self.active_game.is_some() {
             self.notify_err("Game đang chạy. Hãy đóng phiên hiện tại trước khi mở mới.");
             return;
+        }
+        if self.config.active_edition == GameEdition::TModLoader {
+            let selected_pack = self.config.active_modpack.trim().to_string();
+            if !selected_pack.is_empty()
+                && self
+                    .paths
+                    .tml_modpacks_dir()
+                    .join(&selected_pack)
+                    .join("Mods")
+                    .is_dir()
+            {
+                let _ = activate_modpack(
+                    &self.paths.tml_modpacks_dir().join(&selected_pack),
+                    &self.paths.tml_mods_dir(),
+                    true,
+                );
+            }
         }
         self.save_config();
 
@@ -2476,12 +2525,13 @@ impl AppState {
     }
 
     pub fn badge_color_for_server(&self) -> egui::Color32 {
+        let p = self.palette();
         match self.server_snapshot.as_ref().map(|s| &s.state) {
-            Some(ServerLifecycleState::Running) => ACCENT_EMERALD,
-            Some(ServerLifecycleState::Starting) => crate::theme::ACCENT_CYAN,
-            Some(ServerLifecycleState::Stopping) => crate::theme::ACCENT_AMBER,
-            Some(ServerLifecycleState::Crashed(_)) => crate::theme::ACCENT_RED,
-            _ => crate::theme::TEXT_MUTED,
+            Some(ServerLifecycleState::Running) => p.accent_emerald,
+            Some(ServerLifecycleState::Starting) => p.accent_cyan,
+            Some(ServerLifecycleState::Stopping) => p.accent_amber,
+            Some(ServerLifecycleState::Crashed(_)) => p.accent_red,
+            _ => p.text_muted,
         }
     }
 

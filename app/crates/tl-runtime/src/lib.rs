@@ -18,7 +18,8 @@ pub use game_installer::{
 };
 
 pub use game_runner::{
-    install_xna_framework_elevated, launch_game, ActiveGameProcess, GameLaunchOptions,
+    apply_dotnet_std_env, apply_dotnet_tokio_env, install_xna_framework_elevated, launch_game,
+    resolve_dotnet_launch, ActiveGameProcess, DotnetLaunchSpec, GameLaunchOptions,
     RunningGameSnapshot,
 };
 pub use modpack_sync::{

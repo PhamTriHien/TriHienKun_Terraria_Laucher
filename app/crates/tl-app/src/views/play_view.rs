@@ -1,31 +1,70 @@
+use crate::anim3d;
 use crate::state::{AppState, NavTab};
 use crate::theme::{
     accent_button, card_frame, danger_button, format_bytes, primary_button, section_heading,
-    status_pill, subcard_frame, ACCENT_AMBER, ACCENT_CYAN, ACCENT_EMERALD, ACCENT_RED, TEXT_MUTED,
-    TEXT_PRIMARY,
+    status_pill, subcard_frame, ThemePalette, DARK_PALETTE, LIGHT_PALETTE,
 };
 use egui::RichText;
 use tl_core::GameEdition;
 use tl_runtime::{InstallProgress, ServerLifecycleState};
 
+fn is_edition_ready(state: &AppState, edition: GameEdition) -> bool {
+    match edition {
+        GameEdition::Vanilla => state.env.terraria_installed && state.env.xna_installed,
+        GameEdition::TModLoader => {
+            state.env.terraria_installed
+                && state.env.tmodloader_installed
+                && state.env.dotnet8_version.is_some()
+        }
+    }
+}
+
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
+    let p = state.palette();
+
     ui.label(
         RichText::new("Khởi chạy Game & Thế giới")
             .size(21.0)
             .strong()
-            .color(TEXT_PRIMARY),
+            .color(p.text_primary),
     );
     ui.add_space(8.0);
 
-    card_frame().show(ui, |ui| {
+    anim3d::render_play_hero_showcase(
+        ui,
+        p,
+        state.assets.hero_banner(state.config.active_edition),
+        state.assets.edition_icon(state.config.active_edition),
+        state.config.active_edition,
+        state.running_game.is_some(),
+        state.installed_mods.len(),
+    );
+    ui.add_space(10.0);
+
+    let active_edition_ready = is_edition_ready(state, state.config.active_edition);
+
+    card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Phiên bản & Khởi động");
+        section_heading(ui, p, "Phiên bản & Khởi động");
         ui.add_space(6.0);
 
         ui.horizontal_wrapped(|ui| {
             for edition in [GameEdition::TModLoader, GameEdition::Vanilla] {
                 let active = state.config.active_edition == edition;
-                if ui.selectable_label(active, edition.label()).clicked() && !active {
+                let label = if active {
+                    RichText::new(edition.label()).strong()
+                } else {
+                    RichText::new(edition.label())
+                };
+                let resp = if let Some(icon) = state.assets.edition_icon(edition) {
+                    let icon_img = egui::Image::new((icon.id(), egui::vec2(18.0, 18.0)))
+                        .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                        .corner_radius(4.0);
+                    ui.add(egui::Button::selectable(active, (icon_img, label)).gap(6.0))
+                } else {
+                    ui.selectable_label(active, label)
+                };
+                if resp.clicked() && !active {
                     state.config.active_edition = edition;
                     state.save_config();
                     state.refresh_worlds_and_backups();
@@ -37,11 +76,12 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
         if state.config.active_edition == GameEdition::TModLoader {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ModPack:").color(TEXT_MUTED));
-                let selected_label = if state.config.active_modpack.is_empty() {
+                ui.label(RichText::new("ModPack:").color(p.text_muted));
+                let mut selected_modpack = state.config.active_modpack.clone();
+                let selected_label = if selected_modpack.is_empty() {
                     "Mặc định (enabled.json)".to_string()
                 } else {
-                    state.config.active_modpack.clone()
+                    selected_modpack.clone()
                 };
                 let mut modpack_changed = false;
                 egui::ComboBox::from_id_salt("play_modpack_combo")
@@ -50,7 +90,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     .show_ui(ui, |ui| {
                         if ui
                             .selectable_value(
-                                &mut state.config.active_modpack,
+                                &mut selected_modpack,
                                 String::new(),
                                 "Mặc định (enabled.json)",
                             )
@@ -61,7 +101,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         for pack in &state.modpacks {
                             if ui
                                 .selectable_value(
-                                    &mut state.config.active_modpack,
+                                    &mut selected_modpack,
                                     pack.name.clone(),
                                     format!("{} ({} mod)", pack.name, pack.enabled_mods.len()),
                                 )
@@ -72,19 +112,34 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         }
                     });
                 if modpack_changed {
-                    state.save_config();
+                    let trimmed = selected_modpack.trim();
+                    let pack_to_activate = (!trimmed.is_empty()
+                        && state
+                            .paths
+                            .tml_modpacks_dir()
+                            .join(trimmed)
+                            .join("Mods")
+                            .is_dir())
+                    .then(|| state.modpacks.iter().find(|pack| pack.name == trimmed).cloned())
+                    .flatten();
+                    if let Some(pack) = pack_to_activate {
+                        state.activate_selected_modpack(&pack);
+                    } else {
+                        state.config.active_modpack = selected_modpack;
+                        state.save_config();
+                    }
                 }
                 let enabled_cnt = state.installed_mods.iter().filter(|m| m.enabled).count();
                 status_pill(
                     ui,
                     &format!("{enabled_cnt}/{} mod đang bật", state.installed_mods.len()),
-                    ACCENT_CYAN,
+                    p.accent_cyan,
                 );
             });
             ui.add_space(8.0);
         }
 
-        render_missing_prereq_bar(state, ui);
+        render_missing_prereq_bar(state, ui, p);
 
         ui.horizontal_wrapped(|ui| {
             if let Some(running) = state.running_game.clone() {
@@ -97,16 +152,21 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         running.memory_mb,
                         running.cpu_percent
                     ),
-                    ACCENT_EMERALD,
+                    p.accent_emerald,
                 );
-                if danger_button(ui, "Đóng Game").clicked() {
+                if danger_button(ui, p, "Đóng Game").clicked() {
                     state.kill_running_game();
                 }
-            } else if primary_button(
-                ui,
-                &format!("Chơi {}", state.config.active_edition.label()),
-            )
-            .clicked()
+            } else if ui
+                .add_enabled_ui(!state.install_busy && active_edition_ready, |ui| {
+                    primary_button(
+                        ui,
+                        p,
+                        &format!("Chơi {}", state.config.active_edition.label()),
+                    )
+                })
+                .inner
+                .clicked()
             {
                 state.launch_selected_game(Some((String::new(), 0, String::new())));
             }
@@ -115,35 +175,41 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
-    card_frame().show(ui, |ui| {
+    card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Tham gia Server nhanh");
+        section_heading(ui, p, "Tham gia Server nhanh");
         ui.add_space(6.0);
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Host:").color(TEXT_MUTED));
+            ui.label(RichText::new("Host:").color(p.text_muted));
             ui.add(
                 egui::TextEdit::singleline(&mut state.config.quick_join_host)
                     .desired_width(180.0)
                     .hint_text("127.0.0.1 hoặc bore.pub"),
             );
-            ui.label(RichText::new("Cổng:").color(TEXT_MUTED));
+            ui.label(RichText::new("Cổng:").color(p.text_muted));
             let mut port_str = state.config.quick_join_port.to_string();
             if ui
                 .add(egui::TextEdit::singleline(&mut port_str).desired_width(64.0))
                 .changed()
             {
-                if let Ok(p) = port_str.trim().parse::<u16>() {
-                    state.config.quick_join_port = p;
+                if let Ok(port) = port_str.trim().parse::<u16>() {
+                    state.config.quick_join_port = port;
                 }
             }
-            ui.label(RichText::new("Mật khẩu:").color(TEXT_MUTED));
+            ui.label(RichText::new("Mật khẩu:").color(p.text_muted));
             ui.add(
                 egui::TextEdit::singleline(&mut state.config.quick_join_password)
                     .password(true)
                     .desired_width(110.0),
             );
-            if primary_button(ui, "Tham gia ngay").clicked() {
+            if ui
+                .add_enabled_ui(!state.install_busy && active_edition_ready, |ui| {
+                    primary_button(ui, p, "Tham gia ngay")
+                })
+                .inner
+                .clicked()
+            {
                 if state.config.quick_join_host.trim().is_empty() {
                     state.notify_err("Nhập địa chỉ Host / IP trước khi tham gia.");
                 } else {
@@ -163,24 +229,24 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 if accent_button(
                     ui,
                     &format!("Điền server máy này (127.0.0.1:{port})"),
-                    ACCENT_CYAN,
+                    p.accent_cyan,
                 )
                 .clicked()
                 {
                     state.config.quick_join_host = "127.0.0.1".to_string();
                     state.config.quick_join_port = port;
-                    if let Some(p) = state.config.active_server() {
-                        state.config.quick_join_password = p.config.password.clone();
+                    if let Some(profile) = state.config.active_server() {
+                        state.config.quick_join_password = profile.config.password.clone();
                     }
                     state.save_config();
                 }
             }
             if let Some(ep) = state.active_tunnel_endpoint() {
-                if accent_button(ui, &format!("Điền Tunnel ({ep})"), ACCENT_AMBER).clicked() {
+                if accent_button(ui, &format!("Điền Tunnel ({ep})"), p.accent_amber).clicked() {
                     if let Some((h, p_str)) = ep.rsplit_once(':') {
                         state.config.quick_join_host = h.to_string();
-                        if let Ok(p) = p_str.parse::<u16>() {
-                            state.config.quick_join_port = p;
+                        if let Ok(port) = p_str.parse::<u16>() {
+                            state.config.quick_join_port = port;
                         }
                         state.save_config();
                     }
@@ -214,7 +280,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     .desired_width(90.0)
                     .hint_text("Mật khẩu"),
             );
-            if accent_button(ui, "+ Lưu Server", ACCENT_EMERALD).clicked() {
+            if accent_button(ui, "+ Lưu Server", p.accent_emerald).clicked() {
                 state.add_saved_join_server();
             }
         });
@@ -224,21 +290,21 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             let mut join_target = None;
             let mut remove_idx = None;
             for (idx, srv) in state.config.saved_join_servers.iter().enumerate() {
-                subcard_frame().show(ui, |ui| {
+                subcard_frame(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&srv.name).strong());
                         ui.label(
                             RichText::new(format!("{}:{}", srv.host, srv.port))
                                 .monospace()
-                                .color(TEXT_MUTED),
+                                .color(p.text_muted),
                         );
-                        status_pill(ui, srv.edition.label(), ACCENT_CYAN);
+                        status_pill(ui, srv.edition.label(), p.accent_cyan);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if danger_button(ui, "Xóa").clicked() {
+                            if danger_button(ui, p, "Xóa").clicked() {
                                 remove_idx = Some(idx);
                             }
-                            if primary_button(ui, "Vào").clicked() {
+                            if primary_button(ui, p, "Vào").clicked() {
                                 join_target = Some((
                                     srv.edition,
                                     srv.host.clone(),
@@ -256,7 +322,10 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 state.save_config();
             }
             if let Some((edition, host, port, pass)) = join_target {
-                state.config.active_edition = edition;
+                if state.active_game.is_none() {
+                    state.config.active_edition = edition;
+                    state.refresh_worlds_and_backups();
+                }
                 state.launch_selected_game(Some((host, port, pass)));
             }
         }
@@ -264,48 +333,54 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
-    card_frame().show(ui, |ui| {
+    card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            section_heading(
-                ui,
-                &format!("Thế giới ({})", state.config.active_edition.label()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Quét lại").clicked() {
-                    state.refresh_worlds_and_backups();
-                }
-            });
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 46.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                anim3d::render_worlds_island_3d(ui, p, state.assets.nav_worlds.as_ref());
+                section_heading(
+                    ui,
+                    p,
+                    &format!("Thế giới ({})", state.config.active_edition.label()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Quét lại").clicked() {
+                        state.refresh_worlds_and_backups();
+                    }
+                });
+            },
+        );
         ui.add_space(6.0);
 
         if state.worlds.is_empty() {
             ui.label(
                 RichText::new("Chưa có file thế giới (.wld) trong thư mục lưu.")
-                    .color(TEXT_MUTED),
+                    .color(p.text_muted),
             );
         } else {
             let worlds = state.worlds.clone();
             for world in &worlds {
-                subcard_frame().show(ui, |ui| {
+                subcard_frame(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&world.world_name).strong().size(14.5));
-                        status_pill(ui, world.size_label(), ACCENT_CYAN);
-                        status_pill(ui, world.difficulty_label(), ACCENT_AMBER);
+                        status_pill(ui, world.size_label(), p.accent_cyan);
+                        status_pill(ui, world.difficulty_label(), p.accent_amber);
                         if world.has_twld {
-                            status_pill(ui, ".twld", ACCENT_EMERALD);
+                            status_pill(ui, ".twld", p.accent_emerald);
                         }
                         if !world.special_seeds.is_empty() {
-                            status_pill(ui, &world.special_seeds.join(", "), ACCENT_CYAN);
+                            status_pill(ui, &world.special_seeds.join(", "), p.accent_cyan);
                         }
                         ui.label(
                             RichText::new(format_bytes(world.file_size))
                                 .size(12.0)
-                                .color(TEXT_MUTED),
+                                .color(p.text_muted),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if accent_button(ui, "Sao lưu ZIP", ACCENT_EMERALD).clicked() {
+                            if accent_button(ui, "Sao lưu ZIP", p.accent_emerald).clicked() {
                                 state.backup_world_file(world);
                             }
                         });
@@ -321,7 +396,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             ui.add_space(4.0);
             let backups = state.world_backups.clone();
             for bak in backups.iter().take(6) {
-                subcard_frame().show(ui, |ui| {
+                subcard_frame(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&bak.file_name).monospace().size(12.5));
@@ -332,10 +407,10 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                                 bak.modified_display
                             ))
                             .size(11.5)
-                            .color(TEXT_MUTED),
+                            .color(p.text_muted),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if accent_button(ui, "Khôi phục", ACCENT_AMBER).clicked() {
+                            if accent_button(ui, "Khôi phục", p.accent_amber).clicked() {
                                 state.restore_backup(bak);
                             }
                         });
@@ -347,7 +422,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     });
 }
 
-fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
+fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
     let missing_terraria = !state.env.terraria_installed;
     let missing_xna = !state.env.xna_installed;
     let missing_tml = !state.env.tmodloader_installed;
@@ -371,18 +446,15 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
         return;
     }
 
-    let active_missing = match state.config.active_edition {
-        GameEdition::Vanilla => missing_terraria || missing_xna,
-        GameEdition::TModLoader => missing_terraria || missing_tml || missing_dotnet,
-    };
+    let active_missing = !is_edition_ready(state, state.config.active_edition);
 
-    subcard_frame().show(ui, |ui| {
+    subcard_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
         if !warnings.is_empty() {
             let pill_color = if active_missing {
-                ACCENT_RED
+                p.accent_red
             } else {
-                ACCENT_AMBER
+                p.accent_amber
             };
             let mut do_tml = false;
             let mut do_dotnet = false;
@@ -395,20 +467,20 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
             ui.horizontal_wrapped(|ui| {
                 status_pill(ui, &warnings.join(" • "), pill_color);
                 ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if missing_tml && primary_button(ui, "Cài tModLoader + .NET 8").clicked() {
+                    if missing_tml && primary_button(ui, p, "Cài tModLoader + .NET 8").clicked() {
                         do_tml = true;
                     }
                     if missing_dotnet
                         && !missing_tml
-                        && accent_button(ui, "Cài .NET 8 Portable", ACCENT_CYAN).clicked()
+                        && accent_button(ui, "Cài .NET 8 Portable", p.accent_cyan).clicked()
                     {
                         do_dotnet = true;
                     }
-                    if missing_xna && accent_button(ui, "Cài XNA 4.0", ACCENT_AMBER).clicked() {
+                    if missing_xna && accent_button(ui, "Cài XNA 4.0", p.accent_amber).clicked() {
                         do_xna = true;
                     }
                     if missing_terraria
-                        && primary_button(ui, "Tải & Cài Terraria")
+                        && primary_button(ui, p, "Tải & Cài Terraria")
                             .on_hover_text(format!(
                                 "Tải trực tiếp từ nguồn: {}",
                                 state.effective_terraria_source()
@@ -417,7 +489,8 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
                     {
                         do_terraria_url = true;
                     }
-                    if missing_terraria && accent_button(ui, "Cài từ file .zip", ACCENT_CYAN).clicked()
+                    if missing_terraria
+                        && accent_button(ui, "Cài từ file .zip", p.accent_cyan).clicked()
                     {
                         do_zip = true;
                     }
@@ -464,6 +537,11 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn render_install_progress_bar(ui: &mut egui::Ui, p: &InstallProgress) {
+    let accent = if ui.visuals().dark_mode {
+        DARK_PALETTE.accent_emerald
+    } else {
+        LIGHT_PALETTE.accent_emerald
+    };
     let stage_lower = p.stage.to_lowercase();
     let is_extraction = stage_lower.contains("giải nén") || stage_lower.contains("extract");
     let detail = match (is_extraction, p.total) {
@@ -480,7 +558,7 @@ pub(crate) fn render_install_progress_bar(ui: &mut egui::Ui, p: &InstallProgress
     ui.add(
         egui::ProgressBar::new(frac.unwrap_or(0.0))
             .text(label)
-            .fill(ACCENT_EMERALD)
+            .fill(accent)
             .animate(frac.is_none())
             .desired_width(ui.available_width()),
     );

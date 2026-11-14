@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="obeliskBody" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E2B3B"/>
+      <stop offset="100%" stop-color="#0D141D"/>
+    </linearGradient>
+    <linearGradient id="obeliskCore" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6EF9B2"/>
+      <stop offset="100%" stop-color="#128A4E"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="32" cy="56" rx="16" ry="3.5" fill="#18BC6C" opacity="0.28">
+    <animate attributeName="rx" values="16;22;16" dur="2.2s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.32;0.08;0.32" dur="2.2s" repeatCount="indefinite"/>
+  </ellipse>
+  <g>
+    <animateTransform attributeName="transform" type="translate" values="0,0;0,-3;0,0" dur="3s" repeatCount="indefinite"/>
+    <polygon points="32,7 45,18 42,50 32,54 22,50 19,18" fill="url(#obeliskBody)" stroke="#D4AF37" stroke-width="1.5"/>
+    <polygon points="32,14 38,24 35,44 32,47 29,44 26,24" fill="url(#obeliskCore)">
+      <animate attributeName="opacity" values="0.7;1;0.7" dur="1.8s" repeatCount="indefinite"/>
+    </polygon>
+    <ellipse cx="32" cy="30" rx="18" ry="6" fill="none" stroke="#26B2EE" stroke-width="1.4" opacity="0.75">
+      <animateTransform attributeName="transform" type="rotate" from="0 32 30" to="360 32 30" dur="6s" repeatCount="indefinite"/>
+    </ellipse>
+  </g>
+</svg>

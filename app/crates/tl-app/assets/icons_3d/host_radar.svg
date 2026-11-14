@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <circle cx="32" cy="32" r="24" fill="none" stroke="#26B2EE" stroke-width="1.5" opacity="0.45">
+    <animate attributeName="r" values="14;27" dur="2s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.7;0" dur="2s" repeatCount="indefinite"/>
+  </circle>
+  <ellipse cx="32" cy="32" rx="21" ry="9" fill="none" stroke="#D4AF37" stroke-width="1.8">
+    <animateTransform attributeName="transform" type="rotate" from="0 32 32" to="360 32 32" dur="5s" repeatCount="indefinite"/>
+  </ellipse>
+  <ellipse cx="32" cy="32" rx="9" ry="21" fill="none" stroke="#26B2EE" stroke-width="1.6">
+    <animateTransform attributeName="transform" type="rotate" from="360 32 32" to="0 32 32" dur="4s" repeatCount="indefinite"/>
+  </ellipse>
+  <circle cx="32" cy="32" r="6" fill="#48E094">
+    <animate attributeName="r" values="5;7.2;5" dur="1.6s" repeatCount="indefinite"/>
+  </circle>
+</svg>

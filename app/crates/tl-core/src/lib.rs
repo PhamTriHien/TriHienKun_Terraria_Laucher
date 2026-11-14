@@ -11,7 +11,7 @@ pub use binary_parsers::{
     write_modpack_install_txt, ModPackInfo, ModSide, TmodMetadata, WorldBackupInfo, WorldMetadata,
 };
 pub use config::{
-    GameEdition, LauncherConfig, SavedJoinServer, ServerConfigData, ServerProfile,
+    GameEdition, LauncherConfig, SavedJoinServer, ServerConfigData, ServerProfile, ThemeMode,
     WorldDifficultyOption, WorldSizeOption, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 pub use error::{LauncherError, LauncherResult};
@@ -589,5 +589,44 @@ mod tests {
         assert_eq!(second.local_tmod_count, 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn launcher_config_legacy_json_defaults_theme_mode_to_dark() {
+        let legacy_json = r#"{
+            "active_edition": "Vanilla",
+            "active_modpack": "LegacyPack",
+            "quick_join_host": "127.0.0.1",
+            "quick_join_port": 7777
+        }"#;
+
+        let parsed: LauncherConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.active_edition, GameEdition::Vanilla);
+        assert_eq!(parsed.active_modpack, "LegacyPack");
+        assert_eq!(parsed.quick_join_host, "127.0.0.1");
+        assert_eq!(parsed.theme_mode, ThemeMode::Dark);
+        assert_eq!(LauncherConfig::default().theme_mode, ThemeMode::Dark);
+    }
+
+    #[test]
+    fn launcher_config_theme_mode_light_roundtrips() {
+        let cfg = LauncherConfig {
+            theme_mode: ThemeMode::Light,
+            ..LauncherConfig::default()
+        };
+
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(json.contains(r#""theme_mode": "Light""#));
+        let reparsed: LauncherConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.theme_mode, ThemeMode::Light);
+    }
+
+    #[test]
+    fn theme_mode_toggle_flips_between_dark_and_light() {
+        assert_eq!(ThemeMode::default(), ThemeMode::Dark);
+        assert!(ThemeMode::Dark.is_dark());
+        assert!(!ThemeMode::Light.is_dark());
+        assert_eq!(ThemeMode::Dark.toggle(), ThemeMode::Light);
+        assert_eq!(ThemeMode::Light.toggle(), ThemeMode::Dark);
     }
 }

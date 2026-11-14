@@ -1,12 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim3d;
+mod assets;
 mod state;
 mod theme;
 mod views;
 
 use state::AppState;
 use std::path::PathBuf;
-use tl_core::LauncherPaths;
 
 struct TerrariaLauncherApp {
     state: AppState,
@@ -26,7 +27,7 @@ impl eframe::App for TerrariaLauncherApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::BG_VOID.to_normalized_gamma_f32()
+        self.state.palette().bg_void.to_normalized_gamma_f32()
     }
 }
 
@@ -51,14 +52,13 @@ fn main() -> eframe::Result<()> {
         .with_env_filter("info,wgpu_core=warn,wgpu_hal=warn,naga=warn")
         .try_init();
 
-    let paths = LauncherPaths::resolve(None, None);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Terraria Launcher")
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([860.0, 580.0])
         .with_drag_and_drop(true);
 
-    if let Some(icon) = theme::load_window_icon(&paths.terraria_ico_path()) {
+    if let Some(icon) = assets::load_embedded_window_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
 
@@ -72,7 +72,6 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             theme::install_unicode_fonts(&cc.egui_ctx);
-            theme::apply_theme(&cc.egui_ctx);
             egui_extras::install_image_loaders(&cc.egui_ctx);
 
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -81,6 +80,7 @@ fn main() -> eframe::Result<()> {
                 .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
 
             let state = AppState::initialize(&cc.egui_ctx, rt);
+            theme::apply_theme(&cc.egui_ctx, state.config.theme_mode);
             Ok(Box::new(TerrariaLauncherApp { state }))
         }),
     )

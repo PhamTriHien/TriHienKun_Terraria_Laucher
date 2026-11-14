@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tl_core::{is_xna_framework_installed, GameEdition, LauncherError, LauncherPaths, LauncherResult};
 
@@ -9,6 +16,15 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const MAX_RECENT_OUTPUT_LINES: usize = 80;
+const DOTNET_ROLL_FORWARD_ENV: &str = "DOTNET_ROLL_FORWARD";
+const LAST_LAUNCH_LOG_NAME: &str = "last-game-launch.log";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DotnetLaunchSpec {
+    pub executable: PathBuf,
+    pub using_bundled: bool,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct GameLaunchOptions {
@@ -32,6 +48,9 @@ pub struct ActiveGameProcess {
     pub edition: GameEdition,
     child: Child,
     sys: System,
+    recent_output: Arc<Mutex<VecDeque<String>>>,
+    log_path: PathBuf,
+    collectors: Vec<JoinHandle<()>>,
 }
 
 impl ActiveGameProcess {
@@ -40,7 +59,9 @@ impl ActiveGameProcess {
     }
 
     pub fn poll(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().unwrap_or_default()
+        let status = self.child.try_wait().ok().flatten()?;
+        self.drain_collectors_briefly();
+        Some(status)
     }
 
     pub fn snapshot(&mut self) -> RunningGameSnapshot {
@@ -67,7 +88,43 @@ impl ActiveGameProcess {
     pub fn kill(&mut self) -> LauncherResult<()> {
         self.child.kill()?;
         let _ = self.child.wait();
+        self.drain_collectors_briefly();
         Ok(())
+    }
+
+    pub fn recent_output(&self) -> Vec<String> {
+        self.recent_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    fn drain_collectors_briefly(&mut self) {
+        if self.collectors.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let mut idx = 0;
+            while idx < self.collectors.len() {
+                if self.collectors[idx].is_finished() {
+                    let handle = self.collectors.swap_remove(idx);
+                    let _ = handle.join();
+                } else {
+                    idx += 1;
+                }
+            }
+            if self.collectors.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
@@ -105,26 +162,34 @@ fn launch_vanilla(
     cmd.arg("-savedirectory").arg(&paths.vanilla_saves_dir);
     append_join_args(&mut cmd, opts);
     append_extra_args(&mut cmd, &opts.extra_args);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| LauncherError::Process(format!("Không thể chạy Terraria.exe: {e}")))?;
-
-    Ok(ActiveGameProcess {
-        edition: GameEdition::Vanilla,
-        child,
-        sys: System::new()
-            .map_err(|e| LauncherError::Process(format!("Không thể khởi tạo sysinfo: {e}")))?,
-    })
+    spawn_tracked_game(
+        GameEdition::Vanilla,
+        cmd,
+        paths,
+        None,
+        "Không thể chạy Terraria.exe",
+    )
 }
 
 fn launch_tmodloader(
     paths: &LauncherPaths,
     opts: &GameLaunchOptions,
 ) -> LauncherResult<ActiveGameProcess> {
+    let (cmd, dotnet_spec) = build_tmodloader_command(paths, opts)?;
+    spawn_tracked_game(
+        GameEdition::TModLoader,
+        cmd,
+        paths,
+        Some(&dotnet_spec),
+        "Không thể khởi chạy tModLoader",
+    )
+}
+
+fn build_tmodloader_command(
+    paths: &LauncherPaths,
+    opts: &GameLaunchOptions,
+) -> LauncherResult<(Command, DotnetLaunchSpec)> {
     let dll = paths.tmodloader_dll();
     if !dll.is_file() {
         return Err(LauncherError::NotFound(format!(
@@ -133,10 +198,19 @@ fn launch_tmodloader(
         )));
     }
 
-    let dotnet = resolve_dotnet_executable(paths);
-    let mut cmd = Command::new(&dotnet);
+    let terraria_content = paths.terraria_dir.join("Content");
+    let tml_content = paths.tmodloader_dir.join("Content");
+    if !terraria_content.is_dir() && !tml_content.is_dir() {
+        return Err(LauncherError::NotFound(format!(
+            "Không tìm thấy thư mục tài nguyên Terraria (Content) tại {}. Hãy cài đặt Terraria hoặc chọn đúng thư mục Terraria trong Cài đặt.",
+            terraria_content.display()
+        )));
+    }
+
+    let dotnet_spec = resolve_dotnet_launch(paths);
+    let mut cmd = Command::new(&dotnet_spec.executable);
     cmd.current_dir(&paths.tmodloader_dir);
-    cmd.env("DOTNET_ROLL_FORWARD", "Disable");
+    apply_dotnet_std_env(&dotnet_spec, &mut cmd);
     prepend_native_lib_path(&mut cmd, &paths.tmodloader_dir);
 
     cmd.arg(&dll)
@@ -144,8 +218,9 @@ fn launch_tmodloader(
         .arg("-tmlsavedirectory")
         .arg(&paths.tml_saves_dir);
 
-    if !opts.modpack.trim().is_empty() {
-        cmd.arg("-modpack").arg(opts.modpack.trim());
+    let modpack = opts.modpack.trim();
+    if should_pass_legacy_modpack_arg(paths, modpack) {
+        cmd.arg("-modpack").arg(modpack);
     }
 
     append_join_args(&mut cmd, opts);
@@ -154,35 +229,198 @@ fn launch_tmodloader(
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    Ok((cmd, dotnet_spec))
+}
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| LauncherError::Process(format!("Không thể khởi chạy tModLoader: {e}")))?;
+fn should_pass_legacy_modpack_arg(paths: &LauncherPaths, modpack: &str) -> bool {
+    !modpack.is_empty()
+        && !modpack.contains(['/', '\\'])
+        && modpack != "."
+        && modpack != ".."
+        && paths
+            .tml_modpacks_dir()
+            .join(format!("{modpack}.json"))
+            .is_file()
+}
+
+fn spawn_tracked_game(
+    edition: GameEdition,
+    mut cmd: Command,
+    paths: &LauncherPaths,
+    dotnet_spec: Option<&DotnetLaunchSpec>,
+    spawn_err_context: &str,
+) -> LauncherResult<ActiveGameProcess> {
+    let sys = System::new()
+        .map_err(|e| LauncherError::Process(format!("Không thể khởi tạo sysinfo: {e}")))?;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| match dotnet_spec {
+        Some(spec) => map_dotnet_spawn_error(e, spec, spawn_err_context),
+        None => LauncherError::Process(format!("{spawn_err_context}: {e}")),
+    })?;
+
+    let logs_dir = paths.data_dir.join("Logs");
+    let _ = fs::create_dir_all(&logs_dir);
+    let log_path = logs_dir.join(LAST_LAUNCH_LOG_NAME);
+    let log_file = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .ok(),
+    ));
+
+    let recent_output = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_OUTPUT_LINES)));
+    let mut collectors = Vec::with_capacity(2);
+
+    if let Some(stdout) = child.stdout.take() {
+        collectors.push(spawn_output_collector(
+            stdout,
+            "stdout",
+            Arc::clone(&recent_output),
+            Arc::clone(&log_file),
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        collectors.push(spawn_output_collector(
+            stderr,
+            "stderr",
+            Arc::clone(&recent_output),
+            Arc::clone(&log_file),
+        ));
+    }
 
     Ok(ActiveGameProcess {
-        edition: GameEdition::TModLoader,
+        edition,
         child,
-        sys: System::new()
-            .map_err(|e| LauncherError::Process(format!("Không thể khởi tạo sysinfo: {e}")))?,
+        sys,
+        recent_output,
+        log_path,
+        collectors,
     })
 }
 
-pub fn resolve_dotnet_executable(paths: &LauncherPaths) -> std::path::PathBuf {
+fn spawn_output_collector<R: Read + Send + 'static>(
+    stream: R,
+    stream_label: &'static str,
+    recent_output: Arc<Mutex<VecDeque<String>>>,
+    log_file: Arc<Mutex<Option<File>>>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        let mut raw_buf = Vec::new();
+        loop {
+            raw_buf.clear();
+            match reader.read_until(b'\n', &mut raw_buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let decoded = String::from_utf8_lossy(&raw_buf);
+                    let trimmed = decoded.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    {
+                        let mut guard = recent_output.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.len() >= MAX_RECENT_OUTPUT_LINES {
+                            guard.pop_front();
+                        }
+                        guard.push_back(trimmed.to_string());
+                    }
+                    if let Ok(mut file_guard) = log_file.lock() {
+                        if let Some(file) = file_guard.as_mut() {
+                            let _ = writeln!(file, "[{stream_label}] {trimmed}");
+                            let _ = file.flush();
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+pub fn resolve_dotnet_launch(paths: &LauncherPaths) -> DotnetLaunchSpec {
     let local = paths.tmodloader_dir.join("dotnet").join("dotnet.exe");
     if local.is_file() {
-        local
+        DotnetLaunchSpec {
+            executable: local,
+            using_bundled: true,
+        }
     } else {
-        std::path::PathBuf::from("dotnet")
+        DotnetLaunchSpec {
+            executable: PathBuf::from("dotnet"),
+            using_bundled: false,
+        }
     }
 }
 
-pub fn prepend_native_lib_path(cmd: &mut Command, tml_dir: &Path) {
+trait ProcessCommandEnv {
+    fn set_env_var(&mut self, key: &str, value: &OsStr);
+    fn remove_env_var(&mut self, key: &str);
+}
+
+impl ProcessCommandEnv for Command {
+    fn set_env_var(&mut self, key: &str, value: &OsStr) {
+        self.env(key, value);
+    }
+
+    fn remove_env_var(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+impl ProcessCommandEnv for tokio::process::Command {
+    fn set_env_var(&mut self, key: &str, value: &OsStr) {
+        self.env(key, value);
+    }
+
+    fn remove_env_var(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+fn apply_dotnet_env<C: ProcessCommandEnv>(spec: &DotnetLaunchSpec, cmd: &mut C) {
+    if spec.using_bundled {
+        cmd.set_env_var(DOTNET_ROLL_FORWARD_ENV, OsStr::new("Disable"));
+    } else {
+        cmd.remove_env_var(DOTNET_ROLL_FORWARD_ENV);
+    }
+}
+
+pub fn apply_dotnet_std_env(spec: &DotnetLaunchSpec, cmd: &mut Command) {
+    apply_dotnet_env(spec, cmd);
+}
+
+pub fn apply_dotnet_tokio_env(spec: &DotnetLaunchSpec, cmd: &mut tokio::process::Command) {
+    apply_dotnet_env(spec, cmd);
+}
+
+pub(crate) fn map_dotnet_spawn_error(
+    err: std::io::Error,
+    spec: &DotnetLaunchSpec,
+    context: &str,
+) -> LauncherError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        if spec.using_bundled {
+            return LauncherError::NotFound(format!(
+                "Không tìm thấy .NET 8 Runtime portable tại {}. Hãy nhấn 'Cài đặt .NET 8 Portable' trong tab Chơi Game hoặc Cài đặt.",
+                spec.executable.display()
+            ));
+        }
+        return LauncherError::NotFound(
+            "Không tìm thấy .NET 8 Runtime (dotnet) trên máy. Hãy nhấn 'Cài đặt .NET 8 Portable' trong tab Chơi Game hoặc Cài đặt.".to_string(),
+        );
+    }
+    LauncherError::Process(format!("{context}: {err}"))
+}
+
+pub(crate) fn native_lib_path_env(tml_dir: &Path) -> Option<OsString> {
     let native_dir = tml_dir.join("Libraries").join("Native").join("Windows");
     if !native_dir.is_dir() {
-        return;
+        return None;
     }
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let mut combined = native_dir.into_os_string();
@@ -190,7 +428,13 @@ pub fn prepend_native_lib_path(cmd: &mut Command, tml_dir: &Path) {
         combined.push(";");
         combined.push(existing);
     }
-    cmd.env("PATH", combined);
+    Some(combined)
+}
+
+pub fn prepend_native_lib_path(cmd: &mut Command, tml_dir: &Path) {
+    if let Some(combined) = native_lib_path_env(tml_dir) {
+        cmd.env("PATH", combined);
+    }
 }
 
 fn append_join_args(cmd: &mut Command, opts: &GameLaunchOptions) {
@@ -280,4 +524,371 @@ pub fn run_elevated_windows(file: &str, params: &str) -> LauncherResult<()> {
 #[cfg(not(windows))]
 pub fn run_elevated_windows(_file: &str, _params: &str) -> LauncherResult<()> {
     Err(LauncherError::Process("Chỉ hỗ trợ Windows".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct TempDirGuard(PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct EnvRestoreGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvRestoreGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn make_temp_paths(prefix: &str) -> (TempDirGuard, LauncherPaths) {
+        let base = std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4()));
+        let terraria_dir = base.join("Terraria");
+        let tmodloader_dir = base.join("tModLoader");
+        let data_dir = base.join("data");
+        let saves_dir = data_dir.join("Saves");
+        let paths = LauncherPaths {
+            base_dir: base.clone(),
+            terraria_dir,
+            tmodloader_dir,
+            vanilla_saves_dir: saves_dir.join("Vanilla"),
+            tml_saves_dir: saves_dir.join("tModLoader"),
+            servers_dir: data_dir.join("Servers"),
+            backups_dir: data_dir.join("Backups"),
+            steamcmd_dir: data_dir.join("SteamCMD"),
+            config_path: data_dir.join("config.json"),
+            data_dir,
+        };
+        paths.ensure_dirs().unwrap();
+        fs::create_dir_all(&paths.terraria_dir).unwrap();
+        fs::create_dir_all(&paths.tmodloader_dir).unwrap();
+        (TempDirGuard(base), paths)
+    }
+
+    #[test]
+    fn resolve_dotnet_launch_prefers_bundled_and_falls_back_to_system() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_dotnet_spec");
+
+        let sys_spec = resolve_dotnet_launch(&paths);
+        assert!(!sys_spec.using_bundled);
+        assert_eq!(sys_spec.executable, PathBuf::from("dotnet"));
+
+        let local_dotnet = paths.tmodloader_dir.join("dotnet").join("dotnet.exe");
+        fs::create_dir_all(local_dotnet.parent().unwrap()).unwrap();
+        fs::write(&local_dotnet, b"MZ").unwrap();
+
+        let bundled_spec = resolve_dotnet_launch(&paths);
+        assert!(bundled_spec.using_bundled);
+        assert_eq!(bundled_spec.executable, local_dotnet);
+    }
+
+    #[test]
+    fn apply_dotnet_std_env_clears_or_disables_roll_forward() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvRestoreGuard::set(DOTNET_ROLL_FORWARD_ENV, "Disable");
+
+        let system_spec = DotnetLaunchSpec {
+            executable: PathBuf::from("dotnet"),
+            using_bundled: false,
+        };
+        let mut std_cmd = Command::new("dotnet");
+        std_cmd.env(DOTNET_ROLL_FORWARD_ENV, "Disable");
+        apply_dotnet_std_env(&system_spec, &mut std_cmd);
+        let std_envs: HashMap<_, _> = std_cmd.get_envs().collect();
+        assert_eq!(
+            std_envs.get(OsStr::new(DOTNET_ROLL_FORWARD_ENV)),
+            Some(&None)
+        );
+
+        let mut tokio_cmd = tokio::process::Command::new("dotnet");
+        tokio_cmd.env(DOTNET_ROLL_FORWARD_ENV, "Disable");
+        apply_dotnet_tokio_env(&system_spec, &mut tokio_cmd);
+        let tokio_envs: HashMap<_, _> = tokio_cmd.as_std().get_envs().collect();
+        assert_eq!(
+            tokio_envs.get(OsStr::new(DOTNET_ROLL_FORWARD_ENV)),
+            Some(&None)
+        );
+
+        #[cfg(windows)]
+        {
+            let mut probe = Command::new("cmd");
+            probe.args([
+                "/C",
+                "if defined DOTNET_ROLL_FORWARD (exit 1) else (exit 0)",
+            ]);
+            apply_dotnet_std_env(&system_spec, &mut probe);
+            let status = probe.status().unwrap();
+            assert!(
+                status.success(),
+                "inherited DOTNET_ROLL_FORWARD must be cleared for child process"
+            );
+        }
+
+        let bundled_spec = DotnetLaunchSpec {
+            executable: PathBuf::from(r"C:\tModLoader\dotnet\dotnet.exe"),
+            using_bundled: true,
+        };
+        let mut bundled_std = Command::new(&bundled_spec.executable);
+        apply_dotnet_std_env(&bundled_spec, &mut bundled_std);
+        let bundled_envs: HashMap<_, _> = bundled_std.get_envs().collect();
+        assert_eq!(
+            bundled_envs.get(OsStr::new(DOTNET_ROLL_FORWARD_ENV)),
+            Some(&Some(OsStr::new("Disable")))
+        );
+
+        let mut bundled_tokio = tokio::process::Command::new(&bundled_spec.executable);
+        apply_dotnet_tokio_env(&bundled_spec, &mut bundled_tokio);
+        let bundled_tokio_envs: HashMap<_, _> = bundled_tokio.as_std().get_envs().collect();
+        assert_eq!(
+            bundled_tokio_envs.get(OsStr::new(DOTNET_ROLL_FORWARD_ENV)),
+            Some(&Some(OsStr::new("Disable")))
+        );
+    }
+
+    #[test]
+    fn split_shell_args_and_append_join_args_handle_edge_cases() {
+        assert!(split_shell_args("").is_empty());
+        assert!(split_shell_args("   \t\r\n  ").is_empty());
+        assert_eq!(
+            split_shell_args(r#"-host 127.0.0.1 -password "my secret pass"   -extra"#),
+            vec!["-host", "127.0.0.1", "-password", "my secret pass", "-extra"]
+        );
+        assert_eq!(
+            split_shell_args(r#"-path "C:\Games\Terraria" -unclosed "tail arg"#),
+            vec!["-path", r"C:\Games\Terraria", "-unclosed", "tail arg"]
+        );
+
+        let mut empty_host_cmd = Command::new("Terraria.exe");
+        append_join_args(
+            &mut empty_host_cmd,
+            &GameLaunchOptions {
+                join_host: "   ".to_string(),
+                join_port: 7788,
+                join_password: "secret".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(empty_host_cmd.get_args().count(), 0);
+
+        let mut default_port_cmd = Command::new("Terraria.exe");
+        append_join_args(
+            &mut default_port_cmd,
+            &GameLaunchOptions {
+                join_host: "  play.example.com  ".to_string(),
+                join_port: 0,
+                join_password: String::new(),
+                ..Default::default()
+            },
+        );
+        let args_default: Vec<_> = default_port_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args_default, vec!["-join", "play.example.com", "-port", "7777"]);
+
+        let mut full_join_cmd = Command::new("Terraria.exe");
+        append_join_args(
+            &mut full_join_cmd,
+            &GameLaunchOptions {
+                join_host: "10.0.0.5".to_string(),
+                join_port: 7788,
+                join_password: "pass word".to_string(),
+                ..Default::default()
+            },
+        );
+        let args_full: Vec<_> = full_join_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args_full,
+            vec!["-join", "10.0.0.5", "-port", "7788", "-password", "pass word"]
+        );
+    }
+
+    #[test]
+    fn build_tmodloader_command_handles_modpacks_and_content_checks() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_tml_cmd");
+
+        let missing_dll = build_tmodloader_command(&paths, &GameLaunchOptions::default());
+        assert!(matches!(missing_dll, Err(LauncherError::NotFound(_))));
+
+        fs::write(paths.tmodloader_dll(), b"DLL").unwrap();
+        let missing_content = build_tmodloader_command(&paths, &GameLaunchOptions::default());
+        assert!(matches!(missing_content, Err(LauncherError::NotFound(_))));
+
+        fs::create_dir_all(paths.terraria_dir.join("Content")).unwrap();
+
+        let folder_pack_mods = paths.tml_modpacks_dir().join("FolderPack").join("Mods");
+        fs::create_dir_all(&folder_pack_mods).unwrap();
+        fs::write(folder_pack_mods.join("enabled.json"), b"[]").unwrap();
+
+        let (folder_cmd, _) = build_tmodloader_command(
+            &paths,
+            &GameLaunchOptions {
+                edition: GameEdition::TModLoader,
+                modpack: "FolderPack".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let folder_args: Vec<_> = folder_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !folder_args.iter().any(|a| a == "-modpack"),
+            "folder-based modpacks must not pass -modpack"
+        );
+
+        fs::write(paths.tml_modpacks_dir().join("LegacyPack.json"), b"{}").unwrap();
+        let (legacy_cmd, _) = build_tmodloader_command(
+            &paths,
+            &GameLaunchOptions {
+                edition: GameEdition::TModLoader,
+                modpack: " LegacyPack ".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let legacy_args: Vec<_> = legacy_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let modpack_pos = legacy_args
+            .iter()
+            .position(|a| a == "-modpack")
+            .expect("legacy .json modpack must pass -modpack");
+        assert_eq!(legacy_args.get(modpack_pos + 1).map(String::as_str), Some("LegacyPack"));
+
+        let (traversal_cmd, _) = build_tmodloader_command(
+            &paths,
+            &GameLaunchOptions {
+                edition: GameEdition::TModLoader,
+                modpack: "../LegacyPack".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!traversal_cmd.get_args().any(|a| a == "-modpack"));
+    }
+
+    #[test]
+    fn spawn_tracked_game_captures_streams_caps_lines_and_truncates_log() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_pipe_capture");
+
+        let mut cmd1 = {
+            #[cfg(windows)]
+            {
+                let mut c = Command::new("cmd");
+                c.args([
+                    "/C",
+                    "for /L %i in (1,1,90) do @echo out-line-%i & echo err-line-last 1>&2",
+                ]);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                let mut c = Command::new("sh");
+                c.args([
+                    "-c",
+                    "i=1; while [ $i -le 90 ]; do echo out-line-$i; i=$((i+1)); done; echo err-line-last >&2",
+                ]);
+                c
+            }
+        };
+        #[cfg(windows)]
+        cmd1.creation_flags(CREATE_NO_WINDOW);
+
+        let mut proc1 =
+            spawn_tracked_game(GameEdition::TModLoader, cmd1, &paths, None, "test spawn").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while proc1.poll().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(proc1.poll().is_some());
+
+        let lines1 = proc1.recent_output();
+        assert_eq!(lines1.len(), MAX_RECENT_OUTPUT_LINES);
+        assert!(lines1.iter().any(|l| l == "err-line-last"));
+        assert!(lines1.iter().any(|l| l == "out-line-90"));
+
+        let expected_log = paths.data_dir.join("Logs").join(LAST_LAUNCH_LOG_NAME);
+        assert_eq!(proc1.log_path(), expected_log);
+        let log_txt1 = fs::read_to_string(proc1.log_path()).unwrap();
+        assert!(log_txt1.contains("out-line-90"));
+        assert!(log_txt1.contains("err-line-last"));
+
+        let mut cmd2 = {
+            #[cfg(windows)]
+            {
+                let mut c = Command::new("cmd");
+                c.args(["/C", "echo second-launch-only"]);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                let mut c = Command::new("sh");
+                c.args(["-c", "echo second-launch-only"]);
+                c
+            }
+        };
+        #[cfg(windows)]
+        cmd2.creation_flags(CREATE_NO_WINDOW);
+
+        let mut proc2 =
+            spawn_tracked_game(GameEdition::Vanilla, cmd2, &paths, None, "test spawn 2").unwrap();
+        let deadline2 = Instant::now() + Duration::from_secs(5);
+        while proc2.poll().is_none() && Instant::now() < deadline2 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(proc2.poll().is_some());
+
+        let log_txt2 = fs::read_to_string(proc2.log_path()).unwrap();
+        assert!(log_txt2.contains("second-launch-only"));
+        assert!(!log_txt2.contains("out-line-90"));
+    }
+
+    #[test]
+    fn map_dotnet_spawn_error_reports_actionable_not_found() {
+        let spec = DotnetLaunchSpec {
+            executable: PathBuf::from("dotnet"),
+            using_bundled: false,
+        };
+        let err = map_dotnet_spawn_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            &spec,
+            "Không thể khởi chạy tModLoader",
+        );
+        match err {
+            LauncherError::NotFound(msg) => {
+                assert!(msg.contains(".NET 8 Runtime"));
+                assert!(msg.contains("Cài đặt .NET 8 Portable"));
+            }
+            other => panic!("expected LauncherError::NotFound, got {other:?}"),
+        }
+    }
 }

@@ -1,24 +1,48 @@
+use crate::anim3d;
 use crate::state::AppState;
 use crate::theme::{
     accent_button, card_frame, console_frame, danger_button, primary_button, section_heading,
-    status_pill, ACCENT_AMBER, ACCENT_CYAN, ACCENT_EMERALD, ACCENT_RED, TEXT_MUTED, TEXT_PRIMARY,
+    status_pill, ThemePalette,
 };
-use egui::{Color32, RichText};
+use egui::RichText;
 use tl_core::{GameEdition, WorldDifficultyOption, WorldSizeOption};
+use tl_runtime::ServerLifecycleState;
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
-    ui.label(
-        RichText::new("Quản lý Server Game")
-            .size(21.0)
-            .strong()
-            .color(TEXT_PRIMARY),
+    let p = state.palette();
+    let server_running = matches!(
+        state.server_snapshot.as_ref().map(|s| &s.state),
+        Some(ServerLifecycleState::Running)
     );
+    let server_starting = matches!(
+        state.server_snapshot.as_ref().map(|s| &s.state),
+        Some(ServerLifecycleState::Starting)
+    );
+
+    ui.horizontal(|ui| {
+        anim3d::render_server_beacon_3d(
+            ui,
+            p,
+            state.assets.nav_server.as_ref(),
+            server_running,
+            server_starting,
+        );
+        ui.vertical(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("Quản lý Server Game")
+                    .size(21.0)
+                    .strong()
+                    .color(p.text_primary),
+            );
+        });
+    });
     ui.add_space(8.0);
 
-    card_frame().show(ui, |ui| {
+    card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Hồ sơ Server:").color(TEXT_MUTED));
+            ui.label(RichText::new("Hồ sơ Server:").color(p.text_muted));
             let active_label = state
                 .config
                 .active_server()
@@ -66,10 +90,10 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         GameEdition::Vanilla.label(),
                     );
                 });
-            if accent_button(ui, "+ Thêm", ACCENT_CYAN).clicked() {
+            if accent_button(ui, "+ Thêm", p.accent_cyan).clicked() {
                 state.add_server_profile();
             }
-            if state.config.servers.len() > 1 && danger_button(ui, "Xóa hồ sơ").clicked() {
+            if state.config.servers.len() > 1 && danger_button(ui, p, "Xóa hồ sơ").clicked() {
                 state.delete_active_server_profile();
             }
         });
@@ -92,7 +116,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.label(
                     RichText::new(&snap.status_detail)
                         .size(12.5)
-                        .color(TEXT_MUTED),
+                        .color(p.text_muted),
                 );
                 if let Some(pid) = snap.pid {
                     status_pill(
@@ -109,17 +133,17 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                                 .map(|s| s.config.maxplayers)
                                 .unwrap_or(8)
                         ),
-                        ACCENT_CYAN,
+                        p.accent_cyan,
                     );
                 }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if is_active {
-                    if danger_button(ui, "Dừng gấp").clicked() {
+                    if danger_button(ui, p, "Dừng gấp").clicked() {
                         state.force_kill_server();
                     }
-                    if accent_button(ui, "Lưu & Tắt", ACCENT_AMBER).clicked() {
+                    if accent_button(ui, "Lưu & Tắt", p.accent_amber).clicked() {
                         state.stop_selected_server();
                     }
                 } else {
@@ -127,7 +151,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         state.save_config();
                         state.notify_ok("Đã lưu cấu hình server.");
                     }
-                    if primary_button(ui, "Khởi chạy Server").clicked() {
+                    if primary_button(ui, p, "Khởi chạy Server").clicked() {
                         state.start_selected_server();
                     }
                 }
@@ -140,17 +164,17 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     let wide = ui.available_width() >= 900.0;
     if wide {
         ui.columns(2, |cols| {
-            render_config_editor(state, &mut cols[0]);
-            render_console_panel(state, &mut cols[1]);
+            render_config_editor(state, &mut cols[0], p);
+            render_console_panel(state, &mut cols[1], p);
         });
     } else {
-        render_config_editor(state, ui);
+        render_config_editor(state, ui, p);
         ui.add_space(12.0);
-        render_console_panel(state, ui);
+        render_console_panel(state, ui, p);
     }
 }
 
-fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
+fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
     let modpacks = state.modpacks.clone();
     let tml_worlds_dir = state.paths.tml_worlds_dir();
     let vanilla_worlds_dir = state.paths.vanilla_worlds_dir();
@@ -159,18 +183,18 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
         return;
     };
 
-    card_frame().show(ui, |ui| {
+    card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Cấu hình Server (serverconfig.txt)");
+        section_heading(ui, p, "Cấu hình Server (serverconfig.txt)");
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Tên hồ sơ:").color(TEXT_MUTED));
+            ui.label(RichText::new("Tên hồ sơ:").color(p.text_muted));
             ui.add(egui::TextEdit::singleline(&mut profile.name).desired_width(200.0));
         });
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Tên thế giới:").color(TEXT_MUTED));
+            ui.label(RichText::new("Tên thế giới:").color(p.text_muted));
             ui.add(egui::TextEdit::singleline(&mut profile.config.worldname).desired_width(180.0));
         });
 
@@ -184,17 +208,17 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
             .flatten()
             .flatten()
             .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
+            .filter(|path| {
+                path.extension()
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("wld"))
                     .unwrap_or(false)
             })
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|path| path.to_string_lossy().into_owned())
             .collect();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("File .wld:").color(TEXT_MUTED));
+            ui.label(RichText::new("File .wld:").color(p.text_muted));
             ui.add(egui::TextEdit::singleline(&mut profile.config.world).desired_width(240.0));
             if !available_wlds.is_empty() {
                 egui::ComboBox::from_id_salt("srv_pick_wld")
@@ -218,7 +242,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Tạo mới nếu thiếu:").color(TEXT_MUTED));
+            ui.label(RichText::new("Tạo mới nếu thiếu:").color(p.text_muted));
             let autocreate_label = match profile.config.autocreate {
                 Some(1) => WorldSizeOption::Small.label(),
                 Some(2) => WorldSizeOption::Medium.label(),
@@ -247,7 +271,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
                     );
                 });
 
-            ui.label(RichText::new("Độ khó:").color(TEXT_MUTED));
+            ui.label(RichText::new("Độ khó:").color(p.text_muted));
             let diff = WorldDifficultyOption::from_u8(profile.config.difficulty);
             egui::ComboBox::from_id_salt("srv_difficulty")
                 .selected_text(diff.label())
@@ -269,18 +293,18 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Cổng TCP:").color(TEXT_MUTED));
+            ui.label(RichText::new("Cổng TCP:").color(p.text_muted));
             let mut port_str = profile.config.port.to_string();
             if ui
                 .add(egui::TextEdit::singleline(&mut port_str).desired_width(68.0))
                 .changed()
             {
-                if let Ok(p) = port_str.trim().parse::<u16>() {
-                    profile.config.port = p;
+                if let Ok(port) = port_str.trim().parse::<u16>() {
+                    profile.config.port = port;
                 }
             }
 
-            ui.label(RichText::new("Số người tối đa:").color(TEXT_MUTED));
+            ui.label(RichText::new("Số người tối đa:").color(p.text_muted));
             let mut mp = profile.config.maxplayers as i32;
             if ui
                 .add(egui::DragValue::new(&mut mp).range(1..=255))
@@ -291,7 +315,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Mật khẩu:").color(TEXT_MUTED));
+            ui.label(RichText::new("Mật khẩu:").color(p.text_muted));
             ui.add(
                 egui::TextEdit::singleline(&mut profile.config.password)
                     .desired_width(170.0)
@@ -300,12 +324,12 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("MOTD:").color(TEXT_MUTED));
+            ui.label(RichText::new("MOTD:").color(p.text_muted));
             ui.add(egui::TextEdit::singleline(&mut profile.config.motd).desired_width(250.0));
         });
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Seed:").color(TEXT_MUTED));
+            ui.label(RichText::new("Seed:").color(p.text_muted));
             ui.add(
                 egui::TextEdit::singleline(&mut profile.config.seed)
                     .desired_width(190.0)
@@ -315,7 +339,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
 
         if profile.edition == GameEdition::TModLoader {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ModPack:").color(TEXT_MUTED));
+                ui.label(RichText::new("ModPack:").color(p.text_muted));
                 let mp_label = if profile.config.modpack.is_empty() {
                     "Theo enabled.json chung".to_string()
                 } else {
@@ -366,17 +390,17 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Tham số thêm:").color(TEXT_MUTED));
+            ui.label(RichText::new("Tham số thêm:").color(p.text_muted));
             ui.add(egui::TextEdit::singleline(&mut profile.extra_args).desired_width(220.0));
         });
     });
 }
 
-fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui) {
-    card_frame().show(ui, |ui| {
+fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
+    card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            section_heading(ui, "Console trực tiếp");
+            section_heading(ui, p, "Console trực tiếp");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Xóa log").clicked() {
                     if let Some(sup) = &state.server_supervisor {
@@ -405,7 +429,7 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.add_space(6.0);
-        console_frame().show(ui, |ui| {
+        console_frame(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
                 .id_salt("srv_console_scroll")
@@ -420,20 +444,20 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui) {
                             ui.label(
                                 RichText::new("Chưa có dữ liệu log.")
                                     .monospace()
-                                    .color(TEXT_MUTED),
+                                    .color(p.text_muted),
                             );
                         } else {
                             for line in logs {
                                 let color = if line.is_error {
-                                    ACCENT_RED
+                                    p.accent_red
                                 } else if line.text.starts_with('>') {
-                                    ACCENT_CYAN
+                                    p.accent_cyan
                                 } else if line.text.contains("Listening on port")
                                     || line.text.contains("Server started")
                                 {
-                                    ACCENT_EMERALD
+                                    p.accent_emerald
                                 } else {
-                                    Color32::from_rgb(214, 224, 236)
+                                    p.console_text
                                 };
                                 ui.label(
                                     RichText::new(format!("[{}] {}", line.timestamp, line.text))
@@ -447,7 +471,7 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui) {
                         ui.label(
                             RichText::new("Nhấn 'Khởi chạy Server' để xem log thực tế tại đây.")
                                 .monospace()
-                                .color(TEXT_MUTED),
+                                .color(p.text_muted),
                         );
                     }
                 });
@@ -461,7 +485,7 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui) {
                     .hint_text("Nhập lệnh server (vd: say Xin chao!, save, kick Ten)..."),
             );
             let submit =
-                primary_button(ui, "Gửi lệnh").clicked()
+                primary_button(ui, p, "Gửi lệnh").clicked()
                     || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if submit && !state.console_input.trim().is_empty() {
                 let cmd = std::mem::take(&mut state.console_input);

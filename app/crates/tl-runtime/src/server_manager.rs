@@ -1,4 +1,7 @@
-use crate::game_runner::{prepend_native_lib_path, resolve_dotnet_executable, split_shell_args};
+use crate::game_runner::{
+    apply_dotnet_tokio_env, map_dotnet_spawn_error, native_lib_path_env, resolve_dotnet_launch,
+    split_shell_args, DotnetLaunchSpec,
+};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -418,6 +421,7 @@ fn spawn_server_process(
     profile: &ServerProfile,
     config_file: &Path,
 ) -> LauncherResult<Child> {
+    let mut dotnet_spec: Option<DotnetLaunchSpec> = None;
     let mut cmd = match profile.edition {
         GameEdition::Vanilla => {
             let mut c = Command::new(paths.terraria_server_exe());
@@ -426,22 +430,19 @@ fn spawn_server_process(
             c
         }
         GameEdition::TModLoader => {
-            let dotnet = resolve_dotnet_executable(paths);
-            let mut c = Command::new(&dotnet);
+            let spec = resolve_dotnet_launch(paths);
+            let mut c = Command::new(&spec.executable);
             c.current_dir(&paths.tmodloader_dir);
-            c.env("DOTNET_ROLL_FORWARD", "Disable");
-            let mut std_cmd = std::process::Command::new("dummy");
-            prepend_native_lib_path(&mut std_cmd, &paths.tmodloader_dir);
-            for (k, v) in std_cmd.get_envs() {
-                if let Some(val) = v {
-                    c.env(k, val);
-                }
+            apply_dotnet_tokio_env(&spec, &mut c);
+            if let Some(path_env) = native_lib_path_env(&paths.tmodloader_dir) {
+                c.env("PATH", path_env);
             }
             c.arg(paths.tmodloader_dll())
                 .arg("-server")
                 .arg("-nosteam")
                 .arg("-tmlsavedirectory")
                 .arg(&paths.tml_saves_dir);
+            dotnet_spec = Some(spec);
             c
         }
     };
@@ -461,8 +462,10 @@ fn spawn_server_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    cmd.spawn()
-        .map_err(|e| LauncherError::Process(format!("Không thể tạo tiến trình server: {e}")))
+    cmd.spawn().map_err(|e| match &dotnet_spec {
+        Some(spec) => map_dotnet_spawn_error(e, spec, "Không thể tạo tiến trình server"),
+        None => LauncherError::Process(format!("Không thể tạo tiến trình server: {e}")),
+    })
 }
 
 async fn stdin_writer_task(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {

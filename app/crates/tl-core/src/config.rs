@@ -24,6 +24,40 @@ impl GameEdition {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Tối (Dark)",
+            Self::Light => "Sáng (Light)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Dark => "Tối",
+            Self::Light => "Sáng",
+        }
+    }
+
+    pub fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WorldSizeOption {
     Small = 1,
@@ -349,6 +383,7 @@ pub struct SavedJoinServer {
 #[serde(default)]
 pub struct LauncherConfig {
     pub active_edition: GameEdition,
+    pub theme_mode: ThemeMode,
     pub active_modpack: String,
     pub quick_join_host: String,
     pub quick_join_port: u16,
@@ -420,6 +455,7 @@ impl Default for LauncherConfig {
 
         Self {
             active_edition: GameEdition::TModLoader,
+            theme_mode: ThemeMode::Dark,
             active_modpack: String::new(),
             quick_join_host: String::new(),
             quick_join_port: 7777,

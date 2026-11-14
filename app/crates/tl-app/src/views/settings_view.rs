@@ -1,29 +1,80 @@
 use crate::state::AppState;
-use crate::theme::{
-    accent_button, card_frame, format_bytes, primary_button, section_heading, status_pill,
-    subcard_frame, ACCENT_AMBER, ACCENT_CYAN, ACCENT_EMERALD, ACCENT_RED, TEXT_MUTED,
-    TEXT_PRIMARY,
-};
+use crate::theme::ThemePalette;
 use crate::views::play_view::render_install_progress_bar;
+use crate::{anim3d, theme};
 use egui::RichText;
+use tl_core::ThemeMode;
 use tl_runtime::TmodLoaderReleaseInfo;
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
-    ui.label(
-        RichText::new("Cài đặt & Môi trường")
-            .size(21.0)
-            .strong()
-            .color(TEXT_PRIMARY),
-    );
+    let p = state.palette();
+    let busy = state.install_busy || state.tml_releases_busy || state.terraria_check_busy;
+
+    ui.horizontal(|ui| {
+        anim3d::render_settings_gears_3d(ui, p, state.assets.nav_settings.as_ref(), busy);
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new("Cài đặt & Môi trường")
+                    .size(21.0)
+                    .strong()
+                    .color(p.text_primary),
+            );
+            if busy {
+                ui.label(
+                    RichText::new("Đang kiểm tra / cài đặt...")
+                        .size(12.0)
+                        .color(p.accent_cyan),
+                );
+            }
+        });
+    });
     ui.add_space(8.0);
 
-    card_frame().show(ui, |ui| {
+    theme::card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Trạng thái Thành phần");
+        let current_mode = state.config.theme_mode;
+        ui.horizontal_wrapped(|ui| {
+            theme::section_heading(ui, p, "Giao diện Launcher (Dark / Light)");
+            theme::status_pill(
+                ui,
+                &format!("Đang dùng: {}", current_mode.label()),
+                if current_mode.is_dark() {
+                    p.accent_cyan
+                } else {
+                    p.accent_amber
+                },
+            );
+        });
+        ui.add_space(8.0);
+
+        let mut next_mode = None;
+        ui.horizontal_wrapped(|ui| {
+            for mode in [ThemeMode::Dark, ThemeMode::Light] {
+                let active = current_mode == mode;
+                let clicked = if active {
+                    theme::primary_button(ui, p, mode.label()).clicked()
+                } else {
+                    ui.button(mode.label()).clicked()
+                };
+                if clicked && !active {
+                    next_mode = Some(mode);
+                }
+            }
+        });
+        if let Some(mode) = next_mode {
+            state.set_theme_mode(ui.ctx(), mode);
+        }
+    });
+
+    ui.add_space(12.0);
+
+    theme::card_frame(p).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        theme::section_heading(ui, p, "Trạng thái Thành phần");
         ui.add_space(8.0);
 
         ui.horizontal_wrapped(|ui| {
-            status_pill(
+            theme::status_pill(
                 ui,
                 if state.env.terraria_installed {
                     "Terraria.exe: Sẵn sàng"
@@ -31,12 +82,12 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     "Terraria.exe: Chưa thấy"
                 },
                 if state.env.terraria_installed {
-                    ACCENT_EMERALD
+                    p.accent_emerald
                 } else {
-                    ACCENT_RED
+                    p.accent_red
                 },
             );
-            status_pill(
+            theme::status_pill(
                 ui,
                 if state.env.terraria_server_installed {
                     "TerrariaServer.exe: Sẵn sàng"
@@ -44,12 +95,12 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     "TerrariaServer.exe: Chưa thấy"
                 },
                 if state.env.terraria_server_installed {
-                    ACCENT_EMERALD
+                    p.accent_emerald
                 } else {
-                    ACCENT_RED
+                    p.accent_red
                 },
             );
-            status_pill(
+            theme::status_pill(
                 ui,
                 if state.env.tmodloader_installed {
                     "tModLoader.dll: Sẵn sàng"
@@ -57,24 +108,24 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     "tModLoader.dll: Chưa thấy"
                 },
                 if state.env.tmodloader_installed {
-                    ACCENT_EMERALD
+                    p.accent_emerald
                 } else {
-                    ACCENT_RED
+                    p.accent_red
                 },
             );
-            status_pill(
+            theme::status_pill(
                 ui,
                 &match &state.env.dotnet8_version {
                     Some(v) => format!(".NET {v}: Sẵn sàng"),
                     None => ".NET 8: Chưa cài".to_string(),
                 },
                 if state.env.dotnet8_version.is_some() {
-                    ACCENT_EMERALD
+                    p.accent_emerald
                 } else {
-                    ACCENT_RED
+                    p.accent_red
                 },
             );
-            status_pill(
+            theme::status_pill(
                 ui,
                 if state.env.xna_installed {
                     "XNA Framework 4.0: Đã cài"
@@ -82,9 +133,9 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     "XNA Framework 4.0: Chưa cài"
                 },
                 if state.env.xna_installed {
-                    ACCENT_EMERALD
+                    p.accent_emerald
                 } else {
-                    ACCENT_AMBER
+                    p.accent_amber
                 },
             );
         });
@@ -95,7 +146,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             if !state.env.xna_installed
                 && ui
                     .add_enabled_ui(!state.install_busy, |ui| {
-                        accent_button(ui, "Cài XNA Framework 4.0", ACCENT_AMBER)
+                        theme::accent_button(ui, "Cài XNA Framework 4.0", p.accent_amber)
                     })
                     .inner
                     .clicked()
@@ -117,19 +168,19 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
-    render_game_installer_card(state, ui);
+    render_game_installer_card(state, ui, p);
 
     ui.add_space(12.0);
 
-    card_frame().show(ui, |ui| {
+    theme::card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Thư mục Game & Công cụ (để trống = dùng mặc định)");
+        theme::section_heading(ui, p, "Thư mục Game & Công cụ (để trống = dùng mặc định)");
         ui.add_space(8.0);
 
-        subcard_frame().show(ui, |ui| {
+        theme::subcard_frame(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Thư mục Terraria:").color(TEXT_MUTED));
+                ui.label(RichText::new("Thư mục Terraria:").color(p.text_muted));
                 ui.add(
                     egui::TextEdit::singleline(&mut state.config.custom_terraria_dir)
                         .desired_width(300.0)
@@ -143,7 +194,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             });
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Thư mục tModLoader:").color(TEXT_MUTED));
+                ui.label(RichText::new("Thư mục tModLoader:").color(p.text_muted));
                 ui.add(
                     egui::TextEdit::singleline(&mut state.config.custom_tmodloader_dir)
                         .desired_width(284.0)
@@ -157,7 +208,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             });
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("File steamcmd.exe:").color(TEXT_MUTED));
+                ui.label(RichText::new("File steamcmd.exe:").color(p.text_muted));
                 ui.add(
                     egui::TextEdit::singleline(&mut state.config.custom_steamcmd_path)
                         .desired_width(296.0)
@@ -177,19 +228,19 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
-    card_frame().show(ui, |ui| {
+    theme::card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Cấu hình Tunnel & Proxy");
+        theme::section_heading(ui, p, "Cấu hình Tunnel & Proxy");
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Bore Server:").color(TEXT_MUTED));
+            ui.label(RichText::new("Bore Server:").color(p.text_muted));
             ui.add(
                 egui::TextEdit::singleline(&mut state.config.bore_server)
                     .desired_width(200.0)
                     .hint_text("bore.pub"),
             );
-            ui.label(RichText::new("Secret (tùy chọn):").color(TEXT_MUTED));
+            ui.label(RichText::new("Secret (tùy chọn):").color(p.text_muted));
             ui.add(
                 egui::TextEdit::singleline(&mut state.config.bore_secret)
                     .password(true)
@@ -198,7 +249,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Proxy URL (tùy chọn):").color(TEXT_MUTED));
+            ui.label(RichText::new("Proxy URL (tùy chọn):").color(p.text_muted));
             ui.add(
                 egui::TextEdit::singleline(&mut state.config.proxy_url)
                     .desired_width(280.0)
@@ -207,7 +258,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.add_space(8.0);
-        if primary_button(ui, "Lưu & Áp dụng").clicked() {
+        if theme::primary_button(ui, p, "Lưu & Áp dụng").clicked() {
             state.save_config();
             state.refresh_environment();
             state.notify_ok("Đã lưu cài đặt và làm mới cấu hình.");
@@ -215,18 +266,18 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     });
 }
 
-fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
-    card_frame().show(ui, |ui| {
+fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
+    theme::card_frame(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Cài đặt & Cập nhật Game");
+        theme::section_heading(ui, p, "Cài đặt & Cập nhật Game");
         ui.add_space(8.0);
 
-        subcard_frame().show(ui, |ui| {
+        theme::subcard_frame(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new("tModLoader (GitHub Releases)")
                     .strong()
-                    .color(TEXT_PRIMARY),
+                    .color(p.text_primary),
             );
             ui.add_space(4.0);
 
@@ -247,7 +298,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
 
             let mut do_refresh_releases = false;
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Phiên bản:").color(TEXT_MUTED));
+                ui.label(RichText::new("Phiên bản:").color(p.text_muted));
                 egui::ComboBox::from_id_salt("settings_tml_release_combo")
                     .selected_text(selected_text)
                     .width(290.0)
@@ -255,7 +306,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
                         if state.tml_releases.is_empty() {
                             ui.label(
                                 RichText::new("Nhấn 'Kiểm tra bản mới' để tải danh sách.")
-                                    .color(TEXT_MUTED),
+                                    .color(p.text_muted),
                             );
                         } else {
                             for rel in &state.tml_releases {
@@ -288,7 +339,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
             let mut do_install_dotnet = false;
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if primary_button(ui, "Cài đặt / Cập nhật tModLoader").clicked() {
+                    if theme::primary_button(ui, p, "Cài đặt / Cập nhật tModLoader").clicked() {
                         do_install_tml = true;
                     }
                     let dotnet_label = if dotnet_missing {
@@ -296,7 +347,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
                     } else {
                         "Cài lại .NET 8 Portable"
                     };
-                    if accent_button(ui, dotnet_label, ACCENT_CYAN).clicked() {
+                    if theme::accent_button(ui, dotnet_label, p.accent_cyan).clicked() {
                         do_install_dotnet = true;
                     }
                 });
@@ -311,7 +362,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
 
         ui.add_space(8.0);
 
-        subcard_frame().show(ui, |ui| {
+        theme::subcard_frame(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             let is_synced = state.env.terraria_installed
                 && state
@@ -324,31 +375,31 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
 
             let terraria_status_pill = if let Some(m) = &state.terraria_remote_manifest {
                 let size_part = if m.total_size > 0 {
-                    format!(" ({})", format_bytes(m.total_size))
+                    format!(" ({})", theme::format_bytes(m.total_size))
                 } else {
                     String::new()
                 };
                 if !state.env.terraria_installed {
                     Some((
                         format!("Có sẵn bản {}{}", m.version, size_part),
-                        ACCENT_AMBER,
+                        p.accent_amber,
                     ))
                 } else if is_synced {
                     Some((
                         format!("Đã đồng bộ bản {}{}", m.version, size_part),
-                        ACCENT_EMERALD,
+                        p.accent_emerald,
                     ))
                 } else {
                     Some((
                         format!("Bản trên nguồn: {}{}", m.version, size_part),
-                        ACCENT_CYAN,
+                        p.accent_cyan,
                     ))
                 }
             } else if state.env.terraria_installed {
                 state
                     .terraria_installed_receipt
                     .as_ref()
-                    .map(|rec| (format!("Đã cài bản {}", rec.version), TEXT_MUTED))
+                    .map(|rec| (format!("Đã cài bản {}", rec.version), p.text_muted))
             } else {
                 None
             };
@@ -370,10 +421,10 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.label(
                     RichText::new("Terraria (Nhánh GitHub, Release hoặc URL .zip)")
                         .strong()
-                        .color(TEXT_PRIMARY),
+                        .color(p.text_primary),
                 );
                 if let Some((text, color)) = terraria_status_pill {
-                    status_pill(ui, &text, color);
+                    theme::status_pill(ui, &text, color);
                 }
             });
             ui.add_space(4.0);
@@ -382,7 +433,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
             let mut clear_remote_manifest = false;
             let mut do_check_update = false;
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Nguồn tải:").color(TEXT_MUTED));
+                ui.label(RichText::new("Nguồn tải:").color(p.text_muted));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut state.config.terraria_install_source)
                         .desired_width(360.0)
@@ -406,7 +457,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
             });
 
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("GitHub Token (tùy chọn):").color(TEXT_MUTED));
+                ui.label(RichText::new("GitHub Token (tùy chọn):").color(p.text_muted));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut state.config.github_release_token)
                         .password(true)
@@ -434,10 +485,12 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
             let mut do_save = false;
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if primary_button(ui, &install_btn_label).clicked() {
+                    if theme::primary_button(ui, p, &install_btn_label).clicked() {
                         do_url = true;
                     }
-                    if accent_button(ui, "Chọn file .zip trên máy...", ACCENT_CYAN).clicked() {
+                    if theme::accent_button(ui, "Chọn file .zip trên máy...", p.accent_cyan)
+                        .clicked()
+                    {
                         do_zip = true;
                     }
                 });
@@ -464,10 +517,10 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
 
         if let Some(err) = state.install_last_error.clone() {
             ui.add_space(8.0);
-            subcard_frame().show(ui, |ui| {
+            theme::subcard_frame(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("Lỗi cài đặt: {err}")).color(ACCENT_RED));
+                    ui.label(RichText::new(format!("Lỗi cài đặt: {err}")).color(p.accent_red));
                     if ui.button("Đóng").clicked() {
                         state.install_last_error = None;
                     }
@@ -484,7 +537,12 @@ fn format_release_option(rel: &TmodLoaderReleaseInfo) -> String {
         "Ổn định"
     };
     if rel.size > 0 {
-        format!("{} [{}] • {}", rel.tag_name, kind, format_bytes(rel.size))
+        format!(
+            "{} [{}] • {}",
+            rel.tag_name,
+            kind,
+            theme::format_bytes(rel.size)
+        )
     } else {
         format!("{} [{}]", rel.tag_name, kind)
     }

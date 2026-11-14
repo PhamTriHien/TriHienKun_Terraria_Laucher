@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <ellipse cx="32" cy="56" rx="18" ry="3.2" fill="#18BC6C" opacity="0.22"/>
+  <circle cx="32" cy="32" r="25" fill="none" stroke="#D4AF37" stroke-width="1.8"/>
+  <g>
+    <animateTransform attributeName="transform" type="translate" values="0,0;0,-2.8;0,0" dur="3.2s" repeatCount="indefinite"/>
+    <polygon points="15,34 49,34 40,46 24,46" fill="#5D442B" stroke="#2F2114" stroke-width="1"/>
+    <path d="M14 34 Q32 30 50 34 L48 37 Q32 34 16 37 Z" fill="#22C55E"/>
+    <circle cx="32" cy="23" r="8" fill="#18A34A"/>
+    <circle cx="27" cy="25" r="5" fill="#22C55E"/>
+    <rect x="30.5" y="27" width="3" height="7" fill="#7C5329"/>
+    <rect x="39" y="35" width="3" height="19" rx="1.5" fill="#38BDF8" opacity="0.78">
+      <animate attributeName="opacity" values="0.5;0.95;0.5" dur="1.4s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+</svg>
