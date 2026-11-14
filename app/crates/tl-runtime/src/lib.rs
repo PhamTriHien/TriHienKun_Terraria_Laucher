@@ -1,6 +1,7 @@
 pub mod game_installer;
 pub mod game_runner;
 pub mod http_client;
+pub mod modpack_sync;
 pub mod mods_manager;
 pub mod network_host;
 pub mod server_manager;
@@ -20,16 +21,23 @@ pub use game_runner::{
     install_xna_framework_elevated, launch_game, ActiveGameProcess, GameLaunchOptions,
     RunningGameSnapshot,
 };
+pub use modpack_sync::{
+    build_modpack_share_preview, inspect_share_key_against_local, load_mod_sources,
+    mod_sources_path, parse_mod_source_input, remove_mod_source, resolve_mod_source_for_meta,
+    search_workshop_candidates_for_mod, sync_modpack_from_share_key, upsert_mod_source,
+    ModPackExportEntry, ModPackImportPreview, ModPackSharePreview, ModPackSyncProgress,
+    ModPackSyncReport, ModSourceRecord,
+};
 pub use mods_manager::{
     browse_workshop_mods, delete_installed_mod, delete_staged_workshop_mod,
-    download_and_install_tmod_url, download_workshop_mod_via_steamcmd, fetch_github_latest_tmod,
-    fetch_workshop_details, fetch_workshop_image_bytes, format_unix_timestamp,
-    import_local_mod_files, install_steamcmd_via_winget, load_workshop_manifest,
-    parse_workshop_browse_html, parse_workshop_id, pick_best_workshop_tmod,
-    record_workshop_install, scan_installed_mods, scan_staged_workshop_mods, set_mod_enabled,
-    strip_steam_bbcode, workshop_manifest_path, CuratedModSource, InstalledModEntry,
-    RemoteTmodAsset, StagedWorkshopMod, WorkshopItemDetails, WorkshopManifestRecord,
-    WorkshopQueryResult, WorkshopSort, CURATED_GITHUB_MODS,
+    download_and_install_tmod_url, download_and_install_tmod_url_with_source,
+    download_workshop_mod_via_steamcmd, fetch_github_latest_tmod, fetch_workshop_details,
+    fetch_workshop_image_bytes, format_unix_timestamp, import_local_mod_files,
+    install_steamcmd_via_winget, load_workshop_manifest, parse_workshop_browse_html,
+    parse_workshop_id, pick_best_workshop_tmod, record_workshop_install, scan_installed_mods,
+    scan_staged_workshop_mods, set_mod_enabled, strip_steam_bbcode, workshop_manifest_path,
+    CuratedModSource, InstalledModEntry, RemoteTmodAsset, StagedWorkshopMod, WorkshopItemDetails,
+    WorkshopManifestRecord, WorkshopQueryResult, WorkshopSort, CURATED_GITHUB_MODS,
 };
 pub use network_host::{
     check_firewall_rule_exists, close_upnp_port, ensure_firewall_rule, open_upnp_port,

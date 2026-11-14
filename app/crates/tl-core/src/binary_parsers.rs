@@ -1,5 +1,8 @@
 use crate::config::write_atomic;
 use crate::error::{LauncherError, LauncherResult};
+use crate::modpack_share::{
+    is_safe_modpack_component, resolve_unique_modpack_name, sanitize_modpack_name,
+};
 use chrono::{DateTime, Utc};
 use flate2::read::DeflateDecoder;
 use serde::{Deserialize, Serialize};
@@ -577,16 +580,9 @@ pub fn create_modpack(
     enabled_mods: &[String],
     installed_tmods: &[TmodMetadata],
 ) -> LauncherResult<ModPackInfo> {
-    let trimmed = pack_name.trim();
-    if trimmed.is_empty()
-        || trimmed.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
-    {
-        return Err(LauncherError::InvalidInput(
-            "Tên ModPack không hợp lệ".to_string(),
-        ));
-    }
+    let clean_name = sanitize_modpack_name(pack_name)?;
 
-    let pack_dir = modpacks_dir.join(trimmed);
+    let pack_dir = modpacks_dir.join(&clean_name);
     let pack_mods_dir = pack_dir.join("Mods");
     fs::create_dir_all(&pack_mods_dir)?;
 
@@ -606,12 +602,79 @@ pub fn create_modpack(
     }
 
     Ok(ModPackInfo {
-        name: trimmed.to_string(),
+        name: clean_name,
         path: pack_dir,
         enabled_mods: enabled_mods.to_vec(),
         local_tmod_count: copied_count,
         install_workshop_ids: Vec::new(),
     })
+}
+
+pub fn write_modpack_install_txt(modpack_dir: &Path, workshop_ids: &[String]) -> LauncherResult<()> {
+    let pack_mods_dir = modpack_dir.join("Mods");
+    fs::create_dir_all(&pack_mods_dir)?;
+
+    let mut seen = HashSet::new();
+    let mut clean_ids = Vec::new();
+    for raw in workshop_ids {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty()
+            && trimmed.chars().all(|c| c.is_ascii_digit())
+            && seen.insert(trimmed)
+        {
+            clean_ids.push(trimmed);
+        }
+    }
+
+    let mut content = clean_ids.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    write_atomic(&pack_mods_dir.join("install.txt"), content.as_bytes())?;
+    Ok(())
+}
+
+pub fn backup_unsaved_enabled_mods_as_modpack(
+    modpacks_dir: &Path,
+    mods_dir: &Path,
+    active_modpack: &str,
+    installed_tmods: &[TmodMetadata],
+    preferred_name: &str,
+) -> LauncherResult<Option<ModPackInfo>> {
+    let enabled = load_enabled_mods(&mods_dir.join("enabled.json"))?;
+    if enabled.is_empty() {
+        return Ok(None);
+    }
+
+    let active_trimmed = active_modpack.trim();
+    if is_safe_modpack_component(active_trimmed)
+        && modpacks_dir
+            .join(active_trimmed)
+            .join("Mods")
+            .join("enabled.json")
+            .is_file()
+    {
+        return Ok(None);
+    }
+
+    let current_set: HashSet<&str> = enabled.iter().map(String::as_str).collect();
+    let existing_packs = list_modpacks(modpacks_dir)?;
+    if existing_packs.iter().any(|pack| {
+        let pack_set: HashSet<&str> = pack.enabled_mods.iter().map(String::as_str).collect();
+        pack_set == current_set
+    }) {
+        return Ok(None);
+    }
+
+    let backup_name = resolve_unique_modpack_name(modpacks_dir, preferred_name)?;
+    let pack = create_modpack(
+        modpacks_dir,
+        mods_dir,
+        &backup_name,
+        &enabled,
+        installed_tmods,
+    )?;
+    Ok(Some(pack))
 }
 
 pub fn activate_modpack(

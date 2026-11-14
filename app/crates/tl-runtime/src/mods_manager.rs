@@ -20,8 +20,8 @@ use tokio::process::Command;
 use zip::ZipArchive;
 
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const TMODLOADER_STEAM_APP_ID: u64 = 1281930;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const TMODLOADER_STEAM_APP_ID: u64 = 1281930;
 const MAX_WORKSHOP_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const STEAM_GET_PUBLISHED_FILE_DETAILS_URL: &str =
     "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/";
@@ -389,6 +389,18 @@ pub async fn download_and_install_tmod_url(
     proxy_url: Option<&str>,
     auto_enable: bool,
 ) -> LauncherResult<TmodMetadata> {
+    download_and_install_tmod_url_with_source(url, suggested_name, None, paths, proxy_url, auto_enable)
+        .await
+}
+
+pub async fn download_and_install_tmod_url_with_source(
+    url: &str,
+    suggested_name: Option<&str>,
+    github_repo_hint: Option<&str>,
+    paths: &LauncherPaths,
+    proxy_url: Option<&str>,
+    auto_enable: bool,
+) -> LauncherResult<TmodMetadata> {
     let trimmed = url.trim();
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err(LauncherError::InvalidInput(
@@ -466,7 +478,38 @@ pub async fn download_and_install_tmod_url(
         set_mod_enabled(paths, &parsed.internal_name, true)?;
     }
 
-    parse_tmod_file(&final_path)
+    let meta = parse_tmod_file(&final_path)?;
+    let source = if let Some(repo) = github_repo_hint
+        .map(str::trim)
+        .filter(|r| crate::modpack_sync::is_valid_github_repo(r))
+    {
+        tl_core::SharedModSource::Github {
+            repo: repo.to_string(),
+            url: trimmed.to_string(),
+        }
+    } else if let Some(repo) = crate::modpack_sync::parse_github_release_url(trimmed) {
+        tl_core::SharedModSource::Github {
+            repo,
+            url: trimmed.to_string(),
+        }
+    } else {
+        tl_core::SharedModSource::Url {
+            url: trimmed.to_string(),
+        }
+    };
+
+    if !meta.internal_name.trim().is_empty() {
+        crate::modpack_sync::upsert_mod_source(
+            paths,
+            &meta.internal_name,
+            &meta.display_name,
+            &meta.version,
+            &meta.sha1_hex,
+            source,
+        )?;
+    }
+
+    Ok(meta)
 }
 
 pub fn parse_workshop_id(input: &str) -> Option<String> {
@@ -1198,6 +1241,22 @@ pub fn record_workshop_install(
 
     let json = serde_json::to_string_pretty(&records)?;
     write_atomic(&workshop_manifest_path(paths), json.as_bytes())?;
+
+    for meta in installed_mods {
+        if !meta.internal_name.trim().is_empty() {
+            crate::modpack_sync::upsert_mod_source(
+                paths,
+                &meta.internal_name,
+                &meta.display_name,
+                &meta.version,
+                &meta.sha1_hex,
+                tl_core::SharedModSource::Workshop {
+                    id: workshop_id.to_string(),
+                },
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1451,7 +1510,7 @@ pub async fn download_workshop_mod_via_steamcmd(
     import_local_mod_files(&[best_tmod], paths, auto_enable)
 }
 
-fn validate_workshop_id(workshop_id: &str) -> LauncherResult<&str> {
+pub(crate) fn validate_workshop_id(workshop_id: &str) -> LauncherResult<&str> {
     let trimmed = workshop_id.trim();
     if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
         return Err(LauncherError::InvalidInput(
@@ -1461,7 +1520,7 @@ fn validate_workshop_id(workshop_id: &str) -> LauncherResult<&str> {
     Ok(trimmed)
 }
 
-fn workshop_staging_content_dir(paths: &LauncherPaths) -> PathBuf {
+pub(crate) fn workshop_staging_content_dir(paths: &LauncherPaths) -> PathBuf {
     paths
         .steamcmd_dir
         .join("staging")
@@ -1471,7 +1530,7 @@ fn workshop_staging_content_dir(paths: &LauncherPaths) -> PathBuf {
         .join("1281930")
 }
 
-fn collect_tmods_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_tmods_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -1533,6 +1592,15 @@ fn apply_api_details(
     item: &serde_json::Value,
     overwrite_existing: bool,
 ) {
+    if let Some(title) = item["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if overwrite_existing || target.title.is_empty() {
+            target.title = title.to_string();
+        }
+    }
     if let Some(size) = json_u64(&item["file_size"]) {
         if overwrite_existing || size > 0 {
             target.file_size = size;
@@ -1616,63 +1684,69 @@ fn apply_api_details(
     }
 }
 
-async fn enrich_workshop_items_batch(client: &reqwest::Client, items: &mut [WorkshopItemDetails]) {
+pub(crate) async fn enrich_workshop_items_batch(
+    client: &reqwest::Client,
+    items: &mut [WorkshopItemDetails],
+) {
     if items.is_empty() {
         return;
     }
 
-    let mut params: Vec<(String, String)> = Vec::with_capacity(items.len() + 2);
-    params.push(("itemcount".to_string(), items.len().to_string()));
-    params.push(("includechildren".to_string(), "true".to_string()));
-    for (idx, item) in items.iter().enumerate() {
-        params.push((
-            format!("publishedfileids[{idx}]"),
-            item.published_file_id.clone(),
-        ));
-    }
-
-    let fut = async {
-        let resp = client
-            .post(STEAM_GET_PUBLISHED_FILE_DETAILS_URL)
-            .form(&params)
-            .timeout(Duration::from_secs(12))
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
+    for chunk in items.chunks_mut(100) {
+        let mut params: Vec<(String, String)> = Vec::with_capacity(chunk.len() + 2);
+        params.push(("itemcount".to_string(), chunk.len().to_string()));
+        params.push(("includechildren".to_string(), "true".to_string()));
+        for (idx, item) in chunk.iter().enumerate() {
+            params.push((
+                format!("publishedfileids[{idx}]"),
+                item.published_file_id.clone(),
+            ));
         }
-        resp.json::<serde_json::Value>().await.ok()
-    };
 
-    let Ok(Some(json)) = tokio::time::timeout(Duration::from_secs(12), fut).await else {
-        return;
-    };
+        let fut = async {
+            let resp = client
+                .post(STEAM_GET_PUBLISHED_FILE_DETAILS_URL)
+                .form(&params)
+                .timeout(Duration::from_secs(12))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.json::<serde_json::Value>().await.ok()
+        };
 
-    let Some(details_arr) = json["response"]["publishedfiledetails"].as_array() else {
-        return;
-    };
+        let Ok(Some(json)) = tokio::time::timeout(Duration::from_secs(12), fut).await else {
+            continue;
+        };
 
-    let mut by_id: HashMap<String, &serde_json::Value> = HashMap::with_capacity(details_arr.len());
-    for entry in details_arr {
-        if let Some(res_code) = entry["result"].as_i64() {
-            if res_code != 1 {
-                continue;
+        let Some(details_arr) = json["response"]["publishedfiledetails"].as_array() else {
+            continue;
+        };
+
+        let mut by_id: HashMap<String, &serde_json::Value> =
+            HashMap::with_capacity(details_arr.len());
+        for entry in details_arr {
+            if let Some(res_code) = entry["result"].as_i64() {
+                if res_code != 1 {
+                    continue;
+                }
+            }
+            let id_opt = entry["publishedfileid"]
+                .as_str()
+                .map(str::trim)
+                .map(ToString::to_string)
+                .or_else(|| entry["publishedfileid"].as_u64().map(|n| n.to_string()));
+            if let Some(id) = id_opt.filter(|s| !s.is_empty()) {
+                by_id.insert(id, entry);
             }
         }
-        let id_opt = entry["publishedfileid"]
-            .as_str()
-            .map(str::trim)
-            .map(ToString::to_string)
-            .or_else(|| entry["publishedfileid"].as_u64().map(|n| n.to_string()));
-        if let Some(id) = id_opt.filter(|s| !s.is_empty()) {
-            by_id.insert(id, entry);
-        }
-    }
 
-    for item in items.iter_mut() {
-        if let Some(api_item) = by_id.get(&item.published_file_id) {
-            apply_api_details(item, api_item, false);
+        for item in chunk.iter_mut() {
+            if let Some(api_item) = by_id.get(&item.published_file_id) {
+                apply_api_details(item, api_item, false);
+            }
         }
     }
 }
@@ -2779,6 +2853,17 @@ mod tests {
         apply_api_details(&mut item, &payload, false);
         assert_eq!(item.title, "Keep Browse Title");
         assert_eq!(item.author, "Keep Browse Author");
+
+        let mut empty_title_item = WorkshopItemDetails {
+            published_file_id: "2824688072".to_string(),
+            ..Default::default()
+        };
+        apply_api_details(
+            &mut empty_title_item,
+            &serde_json::json!({ "title": "  Calamity Mod  " }),
+            false,
+        );
+        assert_eq!(empty_title_item.title, "Calamity Mod");
         assert_eq!(item.file_size, 52_428_800);
         assert_eq!(item.time_updated, 1_760_000_000);
         assert_eq!(item.subscriptions, 123_456);

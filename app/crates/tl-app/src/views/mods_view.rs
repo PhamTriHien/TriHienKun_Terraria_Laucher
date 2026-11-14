@@ -5,9 +5,11 @@ use crate::theme::{
     ACCENT_RED, BG_ELEVATED, TEXT_MUTED, TEXT_PRIMARY,
 };
 use egui::RichText;
+use tl_core::{ModPackInfo, SharedModSource};
 use tl_runtime::{
-    format_unix_timestamp, parse_workshop_id, strip_steam_bbcode, StagedWorkshopMod,
-    WorkshopItemDetails, WorkshopSort, CURATED_GITHUB_MODS,
+    format_unix_timestamp, parse_workshop_id, strip_steam_bbcode, ModPackExportEntry,
+    ModPackImportPreview, ModPackSharePreview, ModPackSyncProgress, ModPackSyncReport,
+    StagedWorkshopMod, WorkshopItemDetails, WorkshopSort, CURATED_GITHUB_MODS,
 };
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
@@ -234,6 +236,7 @@ fn render_github_tab(state: &mut AppState, ui: &mut egui::Ui) {
                                 state.download_mod_url(
                                     &asset.download_url,
                                     Some(asset.asset_name.clone()),
+                                    Some(asset.repo.clone()),
                                 );
                             }
                         });
@@ -261,18 +264,282 @@ fn render_github_tab(state: &mut AppState, ui: &mut egui::Ui) {
                 .clicked()
             {
                 let url = state.direct_mod_url.clone();
-                state.download_mod_url(&url, None);
+                state.download_mod_url(&url, None, None);
             }
         });
     });
 }
 
 fn render_modpacks_tab(state: &mut AppState, ui: &mut egui::Ui) {
+    render_modpack_share_import_card(state, ui);
+    ui.add_space(12.0);
+    render_modpack_create_card(state, ui);
+
+    if let Some(preview) = state.share_export_preview.clone() {
+        ui.add_space(12.0);
+        render_modpack_share_export_card(state, ui, &preview);
+    }
+
+    ui.add_space(12.0);
+    render_modpack_list_card(state, ui);
+
+    if state.modpack_sync_busy || state.modpack_sync_report.is_some() || state.steamcmd_busy {
+        ui.add_space(12.0);
+        render_workshop_logs_card(state, ui);
+    }
+}
+
+fn render_modpack_share_import_card(state: &mut AppState, ui: &mut egui::Ui) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_heading(ui, "Tạo ModPack từ danh sách mod đang bật");
+        section_heading(ui, "Đồng bộ ModPack từ Share Key");
         ui.add_space(6.0);
+
+        let mut trigger_check = false;
+        let mut trigger_clear = false;
+        let has_key_input = !state.share_key_input.trim().is_empty();
+
+        ui.horizontal_wrapped(|ui| {
+            let key_resp = ui.add(
+                egui::TextEdit::singleline(&mut state.share_key_input)
+                    .desired_width((ui.available_width() - 180.0).max(220.0))
+                    .hint_text("Dán Share Key (TLPACK1:...) từ bạn bè..."),
+            );
+            if key_resp.changed() {
+                trigger_check = true;
+            }
+            if ui.button("Kiểm tra Key").clicked() {
+                trigger_check = true;
+            }
+            if has_key_input && ui.button("Xóa").clicked() {
+                trigger_clear = true;
+            }
+        });
+
+        if trigger_clear {
+            state.clear_share_key_import();
+        } else if trigger_check {
+            state.update_share_key_input();
+        }
+
+        if let Some(preview_res) = state.share_import_preview.clone() {
+            ui.add_space(8.0);
+            match preview_res {
+                Err(err) => {
+                    ui.label(RichText::new(err).color(ACCENT_RED));
+                }
+                Ok(preview) => {
+                    render_share_import_preview(state, ui, &preview);
+                }
+            }
+        }
+
+        if let Some(prog) = state.modpack_sync_progress.clone() {
+            ui.add_space(8.0);
+            render_share_sync_progress(ui, &prog);
+        }
+
+        if let Some(report) = state.modpack_sync_report.clone() {
+            ui.add_space(8.0);
+            render_share_sync_report(ui, &report);
+        }
+    });
+}
+
+fn render_share_import_preview(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    preview: &ModPackImportPreview,
+) {
+    subcard_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Tên ModPack mới:").color(TEXT_MUTED));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.share_import_pack_name)
+                    .desired_width(220.0)
+                    .hint_text("Tên ModPack riêng..."),
+            );
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            status_pill(
+                ui,
+                &format!("{} mod", preview.payload.mods.len()),
+                ACCENT_CYAN,
+            );
+            if preview.already_present_count > 0 {
+                status_pill(
+                    ui,
+                    &format!("Có sẵn {}", preview.already_present_count),
+                    ACCENT_EMERALD,
+                );
+            }
+            if preview.workshop_download_count > 0 {
+                status_pill(
+                    ui,
+                    &format!("Tải Workshop {}", preview.workshop_download_count),
+                    ACCENT_CYAN,
+                );
+            }
+            if preview.url_download_count > 0 {
+                status_pill(
+                    ui,
+                    &format!("Tải URL {}", preview.url_download_count),
+                    ACCENT_CYAN,
+                );
+            }
+            if preview.manual_only_count > 0 {
+                status_pill(
+                    ui,
+                    &format!("Cài tay {}", preview.manual_only_count),
+                    ACCENT_AMBER,
+                );
+            }
+        });
+
+        if preview.workshop_download_count > 0 && state.env.steamcmd_path.is_none() {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Cần SteamCMD để tải mod Workshop.").color(ACCENT_AMBER));
+                if ui
+                    .add_enabled(
+                        !state.steamcmd_busy,
+                        egui::Button::new("Cài SteamCMD tự động"),
+                    )
+                    .clicked()
+                {
+                    state.install_steamcmd();
+                }
+                if state.steamcmd_busy {
+                    ui.spinner();
+                }
+            });
+            if let Some(prog) = &state.steamcmd_progress {
+                ui.add_space(4.0);
+                crate::views::play_view::render_install_progress_bar(ui, prog);
+            }
+        }
+
+        ui.add_space(8.0);
+        let can_sync = !state.modpack_sync_busy
+            && !state.share_import_pack_name.trim().is_empty()
+            && (preview.workshop_download_count == 0 || state.env.steamcmd_path.is_some());
+        if ui
+            .add_enabled_ui(can_sync, |ui| primary_button(ui, "Tải đồng bộ & Kích hoạt"))
+            .inner
+            .clicked()
+        {
+            state.sync_modpack_from_key();
+        }
+
+        if !preview.payload.mods.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new("Chi tiết mod trong Share Key").show(ui, |ui| {
+                for entry in &preview.payload.mods {
+                    let installed = preview.installed_matches.contains(&entry.internal_name);
+                    let display = if entry.display_name.is_empty() {
+                        &entry.internal_name
+                    } else {
+                        &entry.display_name
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(display).strong().size(13.0));
+                        if !entry.version.is_empty() {
+                            ui.label(
+                                RichText::new(format!("v{}", entry.version))
+                                    .size(12.0)
+                                    .color(TEXT_MUTED),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(format_shared_source_label(&entry.source))
+                                .size(12.0)
+                                .color(TEXT_MUTED),
+                        );
+                        if installed {
+                            status_pill(ui, "Đã có", ACCENT_EMERALD);
+                        } else {
+                            let color = if matches!(entry.source, SharedModSource::ManualOnly) {
+                                ACCENT_AMBER
+                            } else {
+                                ACCENT_CYAN
+                            };
+                            status_pill(ui, "Cần tải", color);
+                        }
+                    });
+                }
+            });
+        }
+    });
+}
+
+fn render_share_sync_progress(ui: &mut egui::Ui, prog: &ModPackSyncProgress) {
+    let frac = if prog.total == 0 {
+        0.0
+    } else {
+        (prog.completed as f32 / prog.total as f32).clamp(0.0, 1.0)
+    };
+    ui.add(egui::ProgressBar::new(frac).text(format!(
+        "{}/{}  —  {}",
+        prog.completed, prog.total, prog.stage
+    )));
+    if !prog.current_mod.is_empty() {
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(
+                RichText::new(format!("Đang xử lý: {}", prog.current_mod))
+                    .size(12.0)
+                    .color(TEXT_MUTED),
+            );
+        });
+    }
+}
+
+fn render_share_sync_report(ui: &mut egui::Ui, report: &ModPackSyncReport) {
+    subcard_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(format!(
+                "Đã tạo và kích hoạt ModPack '{}' ({} mod).",
+                report.pack_name, report.enabled_count
+            ))
+            .strong()
+            .color(ACCENT_EMERALD),
+        );
+        if let Some(backup) = &report.backup_pack_name {
+            ui.label(
+                RichText::new(format!(
+                    "Đã sao lưu danh sách mod cũ thành ModPack '{backup}'."
+                ))
+                .color(ACCENT_CYAN),
+            );
+        }
+        if !report.missing_manual.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "Mod thiếu file .tmod cần chép thủ công: {}",
+                    report.missing_manual.join(", ")
+                ))
+                .color(ACCENT_AMBER),
+            );
+        }
+        if !report.failed_mods.is_empty() {
+            for (name, reason) in &report.failed_mods {
+                ui.label(RichText::new(format!("Lỗi tải {name}: {reason}")).color(ACCENT_RED));
+            }
+        }
+    });
+}
+
+fn render_modpack_create_card(state: &mut AppState, ui: &mut egui::Ui) {
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_heading(ui, "Tạo & Chia sẻ ModPack từ danh sách mod đang bật");
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.new_modpack_name)
                     .desired_width(220.0)
@@ -281,11 +548,216 @@ fn render_modpacks_tab(state: &mut AppState, ui: &mut egui::Ui) {
             if primary_button(ui, "Tạo ModPack").clicked() {
                 state.create_new_modpack();
             }
+            if accent_button(ui, "Tạo & Lấy Share Key", ACCENT_CYAN).clicked() {
+                state.create_modpack_and_share();
+            }
+            if ui.button("Lấy Share Key (mod đang bật)").clicked() {
+                state.prepare_share_key_from_enabled();
+            }
         });
     });
+}
 
-    ui.add_space(12.0);
+fn render_modpack_share_export_card(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    preview: &ModPackSharePreview,
+) {
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            section_heading(ui, &format!("Share Key — {}", preview.pack_name));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Đóng").clicked() {
+                    state.close_share_export();
+                }
+                if accent_button(ui, "Copy Share Key", ACCENT_EMERALD).clicked() {
+                    ui.ctx().copy_text(preview.share_key.clone());
+                    state.notify_ok("Đã sao chép Share Key vào clipboard.");
+                }
+            });
+        });
 
+        ui.add_space(6.0);
+        let mut key_buf = preview.share_key.clone();
+        ui.add(
+            egui::TextEdit::multiline(&mut key_buf)
+                .desired_rows(3)
+                .desired_width(ui.available_width())
+                .font(egui::TextStyle::Monospace),
+        );
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            status_pill(
+                ui,
+                &format!("{} Workshop", preview.workshop_count),
+                ACCENT_EMERALD,
+            );
+            status_pill(
+                ui,
+                &format!("{} GitHub/URL", preview.url_count),
+                ACCENT_CYAN,
+            );
+            if preview.manual_count > 0 {
+                status_pill(
+                    ui,
+                    &format!("{} chưa có nguồn", preview.manual_count),
+                    ACCENT_AMBER,
+                );
+            }
+        });
+
+        let manual_entries: Vec<&ModPackExportEntry> = preview
+            .entries
+            .iter()
+            .filter(|e| matches!(e.source, SharedModSource::ManualOnly))
+            .collect();
+        if !manual_entries.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Mod chưa có ID / nguồn tải (gắn thêm để tích hợp vào Share Key)")
+                    .strong()
+                    .color(ACCENT_AMBER),
+            );
+            ui.add_space(4.0);
+            for entry in manual_entries {
+                ui.push_id(("manual_src", &entry.internal_name), |ui| {
+                    render_modpack_source_editor_row(state, ui, entry);
+                });
+                ui.add_space(4.0);
+            }
+        }
+
+        if !preview.entries.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new("Danh sách nguồn mod trong gói").show(ui, |ui| {
+                for entry in &preview.entries {
+                    ui.push_id(("all_src", &entry.internal_name), |ui| {
+                        render_modpack_source_editor_row(state, ui, entry);
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+        }
+    });
+}
+
+fn render_modpack_source_editor_row(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    entry: &ModPackExportEntry,
+) {
+    let display = if entry.display_name.is_empty() {
+        entry.internal_name.as_str()
+    } else {
+        entry.display_name.as_str()
+    };
+    let mut save_raw: Option<String> = None;
+    let mut search_clicked = false;
+    let mut chosen_candidate_id: Option<String> = None;
+
+    subcard_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(display).strong());
+            if !entry.display_name.is_empty() && entry.display_name != entry.internal_name {
+                ui.label(
+                    RichText::new(format!("({})", entry.internal_name))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+            }
+            if !entry.version.is_empty() {
+                ui.label(
+                    RichText::new(format!("v{}", entry.version))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+            }
+            let (pill_text, pill_color) = match &entry.source {
+                SharedModSource::ManualOnly => ("Chưa có nguồn".to_string(), ACCENT_AMBER),
+                other => (format_shared_source_label(other), ACCENT_CYAN),
+            };
+            status_pill(ui, &pill_text, pill_color);
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let input_width = (ui.available_width() - 250.0).max(200.0);
+            let buf = state
+                .unlinked_source_inputs
+                .entry(entry.internal_name.clone())
+                .or_default();
+            let edit_resp = ui.add(
+                egui::TextEdit::singleline(buf)
+                    .desired_width(input_width)
+                    .hint_text("Workshop ID, link Steam, owner/repo GitHub hoặc link .tmod..."),
+            );
+            let current_input = buf.clone();
+            let submit_enter =
+                edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if primary_button(ui, "Lưu nguồn").clicked() || submit_enter {
+                save_raw = Some(current_input);
+            }
+            if ui
+                .add_enabled(
+                    !state.workshop_candidates_busy,
+                    egui::Button::new("Tìm Workshop"),
+                )
+                .clicked()
+            {
+                search_clicked = true;
+            }
+        });
+
+        if state.workshop_candidate_target.as_deref() == Some(entry.internal_name.as_str()) {
+            ui.add_space(6.0);
+            if state.workshop_candidates_busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Đang tìm trên Steam Workshop...").color(TEXT_MUTED));
+                });
+            } else if state.workshop_candidates.is_empty() {
+                ui.label(
+                    RichText::new("Không tìm thấy kết quả phù hợp trên Steam Workshop.")
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+            } else {
+                let candidates: Vec<WorkshopItemDetails> =
+                    state.workshop_candidates.iter().take(8).cloned().collect();
+                for cand in &candidates {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&cand.title).strong().size(12.5));
+                        if !cand.author.is_empty() {
+                            ui.label(
+                                RichText::new(format!("— {}", cand.author))
+                                    .size(12.0)
+                                    .color(TEXT_MUTED),
+                            );
+                        }
+                        status_pill(ui, &format!("ID {}", cand.published_file_id), ACCENT_CYAN);
+                        if accent_button(ui, "Chọn", ACCENT_EMERALD).clicked() {
+                            chosen_candidate_id = Some(cand.published_file_id.clone());
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    if let Some(id) = chosen_candidate_id {
+        state.save_manual_mod_source(&entry.internal_name, display, &entry.version, &id);
+    } else if let Some(raw) = save_raw {
+        state.save_manual_mod_source(&entry.internal_name, display, &entry.version, &raw);
+    } else if search_clicked {
+        state.search_mod_workshop_candidates(&entry.internal_name, display);
+    }
+}
+
+fn render_modpack_list_card(state: &mut AppState, ui: &mut egui::Ui) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_heading(ui, "Danh sách ModPack");
@@ -301,39 +773,57 @@ fn render_modpacks_tab(state: &mut AppState, ui: &mut egui::Ui) {
 
         let packs = state.modpacks.clone();
         for pack in &packs {
-            let is_active = state.config.active_modpack == pack.name;
-            subcard_frame().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(&pack.name).strong().size(14.5));
-                    status_pill(
-                        ui,
-                        &format!("{} mod", pack.enabled_mods.len()),
-                        ACCENT_CYAN,
-                    );
-                    if pack.local_tmod_count > 0 {
-                        status_pill(
-                            ui,
-                            &format!("{} file .tmod", pack.local_tmod_count),
-                            ACCENT_EMERALD,
-                        );
-                    }
-                    if is_active {
-                        status_pill(ui, "Đang chọn", ACCENT_EMERALD);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if danger_button(ui, "Xóa").clicked() {
-                            state.remove_modpack(pack);
-                        }
-                        if primary_button(ui, "Kích hoạt").clicked() {
-                            state.activate_selected_modpack(pack);
-                        }
-                    });
-                });
-            });
+            render_modpack_row(state, ui, pack);
             ui.add_space(4.0);
         }
     });
+}
+
+fn render_modpack_row(state: &mut AppState, ui: &mut egui::Ui, pack: &ModPackInfo) {
+    let is_active = state.config.active_modpack == pack.name;
+    subcard_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(&pack.name).strong().size(14.5));
+            status_pill(ui, &format!("{} mod", pack.enabled_mods.len()), ACCENT_CYAN);
+            if pack.local_tmod_count > 0 {
+                status_pill(
+                    ui,
+                    &format!("{} file .tmod", pack.local_tmod_count),
+                    ACCENT_EMERALD,
+                );
+            }
+            if is_active {
+                status_pill(ui, "Đang chọn", ACCENT_EMERALD);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if danger_button(ui, "Xóa").clicked() {
+                    state.remove_modpack(pack);
+                }
+                if primary_button(ui, "Kích hoạt").clicked() {
+                    state.activate_selected_modpack(pack);
+                }
+                if accent_button(ui, "Share Key", ACCENT_CYAN).clicked() {
+                    state.prepare_share_key_for_pack(pack);
+                }
+            });
+        });
+    });
+}
+
+fn format_shared_source_label(source: &SharedModSource) -> String {
+    match source {
+        SharedModSource::Workshop { id } => format!("Workshop ID {id}"),
+        SharedModSource::Github { repo, url } => {
+            if !repo.is_empty() {
+                format!("GitHub: {repo}")
+            } else {
+                format!("URL: {url}")
+            }
+        }
+        SharedModSource::Url { url } => format!("URL: {url}"),
+        SharedModSource::ManualOnly => "Chưa có nguồn tải".to_string(),
+    }
 }
 
 enum CatalogAction {
@@ -1064,6 +1554,8 @@ fn render_workshop_logs_card(state: &mut AppState, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let heading = if state.steamcmd_busy {
                 "Nhật ký cài đặt SteamCMD"
+            } else if state.modpack_sync_busy || state.mods_tab == ModsSubTab::ModPacks {
+                "Nhật ký đồng bộ ModPack"
             } else {
                 "Nhật ký SteamCMD"
             };
@@ -1089,8 +1581,12 @@ fn render_workshop_logs_card(state: &mut AppState, ui: &mut egui::Ui) {
                     if state.workshop_logs.is_empty() {
                         let wait_msg = if state.steamcmd_busy {
                             "Đang tải và cài đặt SteamCMD..."
+                        } else if state.modpack_sync_busy {
+                            "Đang đồng bộ ModPack từ Share Key..."
                         } else if state.workshop_downloading_id.is_some() {
                             "Đang khởi chạy SteamCMD để tải mod..."
+                        } else if state.mods_tab == ModsSubTab::ModPacks {
+                            "Chưa có nhật ký tải thêm."
                         } else {
                             "Đang truy vấn thông tin Workshop..."
                         };

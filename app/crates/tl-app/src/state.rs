@@ -6,28 +6,34 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use tl_core::{
-    activate_modpack, backup_world, create_modpack, delete_modpack, detect_environment,
-    list_modpacks, list_world_backups, parse_world_file, restore_world_backup, EnvironmentStatus,
-    GameEdition, LauncherConfig, LauncherPaths, ModPackInfo, SavedJoinServer, ServerConfigData,
-    ServerProfile, TmodMetadata, WorldBackupInfo, WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
+    activate_modpack, backup_unsaved_enabled_mods_as_modpack, backup_world, create_modpack,
+    decode_modpack_share_key, delete_modpack, detect_environment, list_modpacks,
+    list_world_backups, parse_world_file, restore_world_backup, sanitize_modpack_name,
+    write_modpack_install_txt, EnvironmentStatus, GameEdition, LauncherConfig, LauncherPaths,
+    ModPackInfo, SavedJoinServer, ServerConfigData, ServerProfile, SharedModSource, TmodMetadata,
+    WorldBackupInfo, WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 use tl_runtime::{
-    browse_workshop_mods, check_firewall_rule_exists, close_upnp_port, delete_installed_mod,
-    delete_staged_workshop_mod, download_and_install_tmod_url, download_and_install_xna,
-    download_workshop_mod_via_steamcmd, ensure_firewall_rule, fetch_github_latest_tmod,
-    fetch_terraria_branch_manifest, fetch_tmodloader_releases, fetch_workshop_details,
-    fetch_workshop_image_bytes, import_local_mod_files, install_dotnet8_portable,
-    install_steamcmd_with_progress, install_terraria_from_local_zip, install_terraria_from_source,
-    install_tmodloader_release, install_xna_framework_elevated, launch_game, load_banlist,
-    load_installed_terraria_receipt, load_workshop_manifest, open_upnp_port, parse_workshop_id,
-    probe_network_snapshot, probe_tcp_endpoint, record_workshop_install, remove_firewall_rule,
-    save_banlist, scan_installed_mods, scan_staged_workshop_mods, set_mod_enabled,
-    start_bore_tunnel, start_server, ActiveGameProcess, BanEntry, BoreTunnelHandle,
+    browse_workshop_mods, build_modpack_share_preview, check_firewall_rule_exists, close_upnp_port,
+    delete_installed_mod, delete_staged_workshop_mod, download_and_install_tmod_url_with_source,
+    download_and_install_xna, download_workshop_mod_via_steamcmd, ensure_firewall_rule,
+    fetch_github_latest_tmod, fetch_terraria_branch_manifest, fetch_tmodloader_releases,
+    fetch_workshop_details, fetch_workshop_image_bytes, import_local_mod_files,
+    inspect_share_key_against_local, install_dotnet8_portable, install_steamcmd_with_progress,
+    install_terraria_from_local_zip, install_terraria_from_source, install_tmodloader_release,
+    install_xna_framework_elevated, launch_game, load_banlist, load_installed_terraria_receipt,
+    load_mod_sources, load_workshop_manifest, open_upnp_port, parse_mod_source_input,
+    parse_workshop_id, probe_network_snapshot, probe_tcp_endpoint, record_workshop_install,
+    remove_firewall_rule, save_banlist, scan_installed_mods, scan_staged_workshop_mods,
+    search_workshop_candidates_for_mod, set_mod_enabled, start_bore_tunnel, start_server,
+    sync_modpack_from_share_key, upsert_mod_source, ActiveGameProcess, BanEntry, BoreTunnelHandle,
     GameLaunchOptions, InstallProgress, InstallTarget, InstalledModEntry,
-    InstalledTerrariaReceipt, NetworkSnapshot, ProgressCallback, RemoteTmodAsset, RepaintHandle,
-    RunningGameSnapshot, ServerLifecycleState, ServerRuntimeSnapshot, ServerSupervisor,
-    StagedWorkshopMod, TerrariaBranchManifest, TmodLoaderReleaseInfo, TunnelStatus, UpnpLeaseInfo,
-    WorkshopItemDetails, WorkshopManifestRecord, WorkshopQueryResult, WorkshopSort,
+    InstalledTerrariaReceipt, ModPackImportPreview, ModPackSharePreview, ModPackSyncProgress,
+    ModPackSyncReport, ModSourceRecord, NetworkSnapshot, ProgressCallback, RemoteTmodAsset,
+    RepaintHandle, RunningGameSnapshot, ServerLifecycleState, ServerRuntimeSnapshot,
+    ServerSupervisor, StagedWorkshopMod, TerrariaBranchManifest, TmodLoaderReleaseInfo,
+    TunnelStatus, UpnpLeaseInfo, WorkshopItemDetails, WorkshopManifestRecord, WorkshopQueryResult,
+    WorkshopSort,
 };
 use tokio::sync::mpsc;
 
@@ -122,6 +128,12 @@ pub enum AppEvent {
         target: InstallTarget,
         result: Result<String, String>,
     },
+    ModPackSyncProgress(ModPackSyncProgress),
+    ModPackSynced(Box<Result<ModPackSyncReport, String>>),
+    WorkshopCandidatesLoaded {
+        internal_name: String,
+        result: Result<Vec<WorkshopItemDetails>, String>,
+    },
 }
 
 pub struct AppState {
@@ -165,6 +177,19 @@ pub struct AppState {
     pub modpacks: Vec<ModPackInfo>,
     pub new_modpack_name: String,
     pub mod_search: String,
+    pub mod_sources: Vec<ModSourceRecord>,
+    pub share_key_input: String,
+    pub share_import_preview: Option<Result<ModPackImportPreview, String>>,
+    pub share_import_pack_name: String,
+    pub modpack_sync_busy: bool,
+    pub modpack_sync_progress: Option<ModPackSyncProgress>,
+    pub modpack_sync_report: Option<ModPackSyncReport>,
+    pub share_export_preview: Option<ModPackSharePreview>,
+    pub share_export_target_pack: Option<String>,
+    pub unlinked_source_inputs: HashMap<String, String>,
+    pub workshop_candidate_target: Option<String>,
+    pub workshop_candidates: Vec<WorkshopItemDetails>,
+    pub workshop_candidates_busy: bool,
 
     pub github_repo_input: String,
     pub github_assets: Vec<RemoteTmodAsset>,
@@ -274,6 +299,19 @@ impl AppState {
             modpacks: Vec::new(),
             new_modpack_name: String::new(),
             mod_search: String::new(),
+            mod_sources: Vec::new(),
+            share_key_input: String::new(),
+            share_import_preview: None,
+            share_import_pack_name: String::new(),
+            modpack_sync_busy: false,
+            modpack_sync_progress: None,
+            modpack_sync_report: None,
+            share_export_preview: None,
+            share_export_target_pack: None,
+            unlinked_source_inputs: HashMap::new(),
+            workshop_candidate_target: None,
+            workshop_candidates: Vec::new(),
+            workshop_candidates_busy: false,
             github_repo_input: "JavidPack/RecipeBrowser".to_string(),
             github_assets: Vec::new(),
             github_busy: false,
@@ -404,6 +442,25 @@ impl AppState {
         self.modpacks = list_modpacks(&self.paths.tml_modpacks_dir()).unwrap_or_default();
         self.workshop_records = load_workshop_manifest(&self.paths);
         self.staged_workshop_mods = scan_staged_workshop_mods(&self.paths).unwrap_or_default();
+        self.mod_sources = load_mod_sources(&self.paths);
+        if self.share_export_preview.is_some() {
+            self.refresh_active_share_export_preview(false);
+        }
+        if !self.share_key_input.trim().is_empty() {
+            let preview_res = inspect_share_key_against_local(
+                &self.paths,
+                &self.share_key_input,
+                &self.installed_mods,
+                &self.staged_workshop_mods,
+            )
+            .map_err(|e| e.to_string());
+            if let Ok(ref preview) = preview_res {
+                if self.share_import_pack_name.trim().is_empty() {
+                    self.share_import_pack_name = preview.suggested_pack_name.clone();
+                }
+            }
+            self.share_import_preview = Some(preview_res);
+        }
     }
 
     pub fn refresh_banlist(&mut self) {
@@ -551,10 +608,7 @@ impl AppState {
                     }
                 }
                 AppEvent::WorkshopLog(line) => {
-                    if self.workshop_logs.len() >= 250 {
-                        self.workshop_logs.remove(0);
-                    }
-                    self.workshop_logs.push(line);
+                    self.push_workshop_log(line);
                 }
                 AppEvent::WorkshopFinished {
                     workshop_id,
@@ -684,6 +738,51 @@ impl AppState {
                         Err(e) => {
                             self.install_last_error = Some(e.clone());
                             self.notify_err(format!("Cài đặt {} thất bại: {e}", target.label()));
+                        }
+                    }
+                }
+                AppEvent::ModPackSyncProgress(prog) => {
+                    self.modpack_sync_progress = Some(prog);
+                }
+                AppEvent::ModPackSynced(boxed_res) => {
+                    self.modpack_sync_busy = false;
+                    self.modpack_sync_progress = None;
+                    match *boxed_res {
+                        Ok(report) => {
+                            self.config.active_modpack = report.pack_name.clone();
+                            self.save_config();
+                            self.refresh_mods_and_packs();
+                            self.notify_ok(format_modpack_sync_summary(&report));
+                            self.modpack_sync_report = Some(report);
+                        }
+                        Err(e) => {
+                            self.refresh_mods_and_packs();
+                            self.notify_err(e);
+                        }
+                    }
+                }
+                AppEvent::WorkshopCandidatesLoaded {
+                    internal_name,
+                    result,
+                } => {
+                    if self.workshop_candidate_target.as_deref() != Some(internal_name.as_str()) {
+                        continue;
+                    }
+                    self.workshop_candidates_busy = false;
+                    match result {
+                        Ok(items) => {
+                            if items.is_empty() {
+                                self.workshop_candidates.clear();
+                                self.notify_err(format!(
+                                    "Không tìm thấy mod '{internal_name}' trên Steam Workshop."
+                                ));
+                            } else {
+                                self.workshop_candidates = items;
+                            }
+                        }
+                        Err(e) => {
+                            self.workshop_candidates.clear();
+                            self.notify_err(e);
                         }
                     }
                 }
@@ -1423,12 +1522,17 @@ impl AppState {
     }
 
     pub fn create_new_modpack(&mut self) {
-        let enabled: Vec<String> = self
-            .installed_mods
-            .iter()
-            .filter(|m| m.enabled)
-            .map(|m| m.meta.internal_name.clone())
-            .collect();
+        let _ = self.create_modpack_internal();
+    }
+
+    pub fn create_modpack_and_share(&mut self) {
+        if let Some(pack) = self.create_modpack_internal() {
+            self.prepare_share_key_for_pack(&pack);
+        }
+    }
+
+    fn create_modpack_internal(&mut self) -> Option<ModPackInfo> {
+        let enabled = self.enabled_mod_names();
         let metas: Vec<TmodMetadata> = self
             .installed_mods
             .iter()
@@ -1443,17 +1547,40 @@ impl AppState {
             &metas,
         ) {
             Ok(pack) => {
+                self.sync_install_txt_for_pack(&pack);
                 self.new_modpack_name.clear();
                 self.config.active_modpack = pack.name.clone();
                 self.save_config();
                 self.refresh_mods_and_packs();
                 self.notify_ok(format!("Đã tạo ModPack '{}'.", pack.name));
+                let refreshed = self
+                    .modpacks
+                    .iter()
+                    .find(|p| p.name == pack.name)
+                    .cloned()
+                    .unwrap_or(pack);
+                Some(refreshed)
             }
-            Err(e) => self.notify_err(e.to_string()),
+            Err(e) => {
+                self.notify_err(e.to_string());
+                None
+            }
         }
     }
 
     pub fn activate_selected_modpack(&mut self, pack: &ModPackInfo) {
+        let metas: Vec<TmodMetadata> = self
+            .installed_mods
+            .iter()
+            .map(|m| m.meta.clone())
+            .collect();
+        let _ = backup_unsaved_enabled_mods_as_modpack(
+            &self.paths.tml_modpacks_dir(),
+            &self.paths.tml_mods_dir(),
+            &self.config.active_modpack,
+            &metas,
+            "ModCu_TruocChuyen",
+        );
         match activate_modpack(&pack.path, &self.paths.tml_mods_dir(), true) {
             Ok(enabled) => {
                 self.config.active_modpack = pack.name.clone();
@@ -1483,6 +1610,332 @@ impl AppState {
         }
     }
 
+    pub fn update_share_key_input(&mut self) {
+        if self.share_key_input.trim().is_empty() {
+            self.share_import_preview = None;
+            self.share_import_pack_name.clear();
+            self.modpack_sync_report = None;
+            return;
+        }
+        self.modpack_sync_report = None;
+        let preview_res = inspect_share_key_against_local(
+            &self.paths,
+            &self.share_key_input,
+            &self.installed_mods,
+            &self.staged_workshop_mods,
+        )
+        .map_err(|e| e.to_string());
+        let prev_payload = self
+            .share_import_preview
+            .as_ref()
+            .and_then(|res| res.as_ref().ok())
+            .map(|prev| &prev.payload);
+        if let Ok(ref new_preview) = preview_res {
+            if prev_payload != Some(&new_preview.payload)
+                || self.share_import_pack_name.trim().is_empty()
+            {
+                self.share_import_pack_name = new_preview.suggested_pack_name.clone();
+            }
+        }
+        self.share_import_preview = Some(preview_res);
+    }
+
+    pub fn clear_share_key_import(&mut self) {
+        self.share_key_input.clear();
+        self.share_import_preview = None;
+        self.share_import_pack_name.clear();
+        self.modpack_sync_report = None;
+    }
+
+    pub fn sync_modpack_from_key(&mut self) {
+        if self.modpack_sync_busy {
+            return;
+        }
+        let payload = match decode_modpack_share_key(&self.share_key_input) {
+            Ok(p) => p,
+            Err(e) => {
+                self.notify_err(e.to_string());
+                return;
+            }
+        };
+
+        self.modpack_sync_busy = true;
+        self.modpack_sync_report = None;
+        self.modpack_sync_progress = Some(ModPackSyncProgress {
+            completed: 0,
+            total: payload.mods.len(),
+            current_mod: String::new(),
+            stage: "Đang chuẩn bị đồng bộ ModPack...".to_string(),
+        });
+        self.push_workshop_log(format!("=== Đồng bộ ModPack '{}' ===", payload.name));
+
+        let steamcmd_exe = self
+            .env
+            .steamcmd_path
+            .clone()
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                let p = self.paths.steamcmd_dir.join("steamcmd.exe");
+                p.is_file().then_some(p)
+            });
+        let paths = self.paths.clone();
+        let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+        let active_modpack = self.config.active_modpack.clone();
+        let desired_pack_name = self.share_import_pack_name.trim().to_string();
+        let tx = self.event_tx.clone();
+        let wake = self.repaint.clone();
+        let prog_tx = tx.clone();
+        let prog_wake = wake.clone();
+        let log_tx = tx.clone();
+        let log_wake = wake.clone();
+
+        self.rt.spawn(async move {
+            let res = sync_modpack_from_share_key(
+                &paths,
+                steamcmd_exe.as_deref(),
+                proxy.as_deref(),
+                &active_modpack,
+                &payload,
+                &desired_pack_name,
+                move |prog| {
+                    let _ = prog_tx.send(AppEvent::ModPackSyncProgress(prog));
+                    prog_wake.wake();
+                },
+                move |line| {
+                    let _ = log_tx.send(AppEvent::WorkshopLog(line));
+                    log_wake.wake();
+                },
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ModPackSynced(Box::new(res)));
+            wake.wake();
+        });
+    }
+
+    pub fn prepare_share_key_for_pack(&mut self, pack: &ModPackInfo) {
+        self.share_export_target_pack = Some(pack.name.clone());
+        self.refresh_active_share_export_preview(true);
+    }
+
+    pub fn prepare_share_key_from_enabled(&mut self) {
+        let enabled = self.enabled_mod_names();
+        if enabled.is_empty() {
+            self.notify_err("Chưa có mod nào đang bật để tạo Share Key.");
+            return;
+        }
+        self.share_export_target_pack = None;
+        let pack_name = self.resolve_enabled_share_pack_name();
+        self.apply_share_export_preview(&pack_name, &enabled, None, true);
+    }
+
+    pub fn close_share_export(&mut self) {
+        self.share_export_preview = None;
+        self.share_export_target_pack = None;
+        self.workshop_candidate_target = None;
+        self.workshop_candidates.clear();
+        self.workshop_candidates_busy = false;
+    }
+
+    pub fn save_manual_mod_source(
+        &mut self,
+        internal_name: &str,
+        display_name: &str,
+        mod_version: &str,
+        raw_input: &str,
+    ) {
+        let source = match parse_mod_source_input(raw_input) {
+            Ok(s) => s,
+            Err(e) => {
+                self.notify_err(e.to_string());
+                return;
+            }
+        };
+        let records = match upsert_mod_source(
+            &self.paths,
+            internal_name,
+            display_name,
+            mod_version,
+            "",
+            source,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.notify_err(e.to_string());
+                return;
+            }
+        };
+        self.mod_sources = records;
+        self.unlinked_source_inputs.remove(internal_name);
+        if self.workshop_candidate_target.as_deref() == Some(internal_name) {
+            self.workshop_candidate_target = None;
+            self.workshop_candidates.clear();
+            self.workshop_candidates_busy = false;
+        }
+        if self.share_export_preview.is_some() {
+            self.refresh_active_share_export_preview(true);
+        }
+        let label = if display_name.trim().is_empty() {
+            internal_name
+        } else {
+            display_name.trim()
+        };
+        self.notify_ok(format!("Đã lưu nguồn tải cho mod '{label}'."));
+    }
+
+    pub fn search_mod_workshop_candidates(&mut self, internal_name: &str, display_name: &str) {
+        let internal_owned = internal_name.trim().to_string();
+        if internal_owned.is_empty() {
+            return;
+        }
+        let display_owned = display_name.trim().to_string();
+        let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+
+        self.workshop_candidate_target = Some(internal_owned.clone());
+        self.workshop_candidates.clear();
+        self.workshop_candidates_busy = true;
+
+        let tx = self.event_tx.clone();
+        let wake = self.repaint.clone();
+        self.rt.spawn(async move {
+            let result = search_workshop_candidates_for_mod(
+                &display_owned,
+                &internal_owned,
+                proxy.as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::WorkshopCandidatesLoaded {
+                internal_name: internal_owned,
+                result,
+            });
+            wake.wake();
+        });
+    }
+
+    fn enabled_mod_names(&self) -> Vec<String> {
+        self.installed_mods
+            .iter()
+            .filter(|m| m.enabled)
+            .map(|m| m.meta.internal_name.clone())
+            .collect()
+    }
+
+    fn sync_install_txt_for_pack(&self, pack: &ModPackInfo) {
+        if let Ok(preview) = build_modpack_share_preview(
+            &self.paths,
+            &pack.name,
+            &pack.enabled_mods,
+            Some(&pack.path),
+            &self.installed_mods,
+            &self.staged_workshop_mods,
+            &self.workshop_records,
+            &self.mod_sources,
+        ) {
+            let workshop_ids = extract_workshop_ids(&preview);
+            let _ = write_modpack_install_txt(&pack.path, &workshop_ids);
+        }
+    }
+
+    fn refresh_active_share_export_preview(&mut self, write_install_txt_if_pack: bool) {
+        let (pack_name, mod_names, pack_path) =
+            if let Some(target_name) = self.share_export_target_pack.clone() {
+                let Some(pack) = self.modpacks.iter().find(|p| p.name == target_name).cloned() else {
+                    self.close_share_export();
+                    return;
+                };
+                (pack.name, pack.enabled_mods, Some(pack.path))
+            } else {
+                if self.share_export_preview.is_none() {
+                    return;
+                }
+                let enabled = self.enabled_mod_names();
+                if enabled.is_empty() {
+                    self.close_share_export();
+                    return;
+                }
+                (self.resolve_enabled_share_pack_name(), enabled, None)
+            };
+
+        self.apply_share_export_preview(
+            &pack_name,
+            &mod_names,
+            pack_path.as_deref(),
+            write_install_txt_if_pack,
+        );
+    }
+
+    fn apply_share_export_preview(
+        &mut self,
+        pack_name: &str,
+        mod_names: &[String],
+        pack_dir: Option<&std::path::Path>,
+        write_install_txt_if_pack: bool,
+    ) {
+        match build_modpack_share_preview(
+            &self.paths,
+            pack_name,
+            mod_names,
+            pack_dir,
+            &self.installed_mods,
+            &self.staged_workshop_mods,
+            &self.workshop_records,
+            &self.mod_sources,
+        ) {
+            Ok(preview) => {
+                if write_install_txt_if_pack {
+                    if let Some(dir) = pack_dir {
+                        let workshop_ids = extract_workshop_ids(&preview);
+                        if let Err(e) = write_modpack_install_txt(dir, &workshop_ids) {
+                            self.notify_err(format!("Không ghi được install.txt cho ModPack: {e}"));
+                        } else {
+                            self.modpacks =
+                                list_modpacks(&self.paths.tml_modpacks_dir()).unwrap_or_default();
+                        }
+                    }
+                }
+                self.prune_resolved_workshop_candidate(&preview);
+                self.share_export_preview = Some(preview);
+            }
+            Err(e) => {
+                self.close_share_export();
+                if write_install_txt_if_pack {
+                    self.notify_err(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn resolve_enabled_share_pack_name(&self) -> String {
+        if let Ok(name) = sanitize_modpack_name(&self.new_modpack_name) {
+            return name;
+        }
+        if let Ok(name) = sanitize_modpack_name(&self.config.active_modpack) {
+            return name;
+        }
+        "SharedModPack".to_string()
+    }
+
+    fn prune_resolved_workshop_candidate(&mut self, preview: &ModPackSharePreview) {
+        if let Some(target) = self.workshop_candidate_target.as_deref() {
+            let still_manual = preview.entries.iter().any(|e| {
+                e.internal_name == target && matches!(e.source, SharedModSource::ManualOnly)
+            });
+            if !still_manual {
+                self.workshop_candidate_target = None;
+                self.workshop_candidates.clear();
+                self.workshop_candidates_busy = false;
+            }
+        }
+    }
+
+    fn push_workshop_log(&mut self, line: String) {
+        while self.workshop_logs.len() >= 250 {
+            self.workshop_logs.remove(0);
+        }
+        self.workshop_logs.push(line);
+    }
+
     pub fn fetch_github_repo(&mut self, repo_raw: &str) {
         if self.github_busy {
             return;
@@ -1502,7 +1955,12 @@ impl AppState {
         });
     }
 
-    pub fn download_mod_url(&mut self, url: &str, suggested_name: Option<String>) {
+    pub fn download_mod_url(
+        &mut self,
+        url: &str,
+        suggested_name: Option<String>,
+        github_repo: Option<String>,
+    ) {
         if self.github_busy {
             return;
         }
@@ -1513,9 +1971,10 @@ impl AppState {
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn(async move {
-            let res = download_and_install_tmod_url(
+            let res = download_and_install_tmod_url_with_source(
                 &url_owned,
                 suggested_name.as_deref(),
+                github_repo.as_deref(),
                 &paths,
                 proxy.as_deref(),
                 true,
@@ -2039,6 +2498,45 @@ impl AppState {
             .map(|h| h.current_status())
             .unwrap_or(TunnelStatus::Idle)
     }
+}
+
+fn extract_workshop_ids(preview: &ModPackSharePreview) -> Vec<String> {
+    preview
+        .entries
+        .iter()
+        .filter_map(|e| match &e.source {
+            SharedModSource::Workshop { id } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn format_modpack_sync_summary(report: &ModPackSyncReport) -> String {
+    let mut parts = vec![format!(
+        "Đã đồng bộ ModPack '{}' (bật {}/{} mod).",
+        report.pack_name, report.enabled_count, report.total_mods
+    )];
+    let downloaded_total = report.downloaded_workshop + report.downloaded_other;
+    if downloaded_total > 0 || report.already_present > 0 {
+        parts.push(format!(
+            "Có sẵn {}, tải mới {} (Workshop {}, nguồn khác {}).",
+            report.already_present,
+            downloaded_total,
+            report.downloaded_workshop,
+            report.downloaded_other
+        ));
+    }
+    if let Some(ref backup) = report.backup_pack_name {
+        parts.push(format!("Đã sao lưu mod cũ vào '{backup}'."));
+    }
+    if !report.missing_manual.is_empty() || !report.failed_mods.is_empty() {
+        parts.push(format!(
+            "Thiếu thủ công: {}, lỗi: {}.",
+            report.missing_manual.len(),
+            report.failed_mods.len()
+        ));
+    }
+    parts.join(" ")
 }
 
 fn pick_default_tml_release(releases: &[TmodLoaderReleaseInfo]) -> Option<&TmodLoaderReleaseInfo> {
