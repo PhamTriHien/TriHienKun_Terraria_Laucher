@@ -1,7 +1,7 @@
 use crate::theme::ThemePalette;
 use egui::{
     epaint::{Mesh, PathShape, Vertex},
-    pos2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, Vec2,
+    pos2, Color32, CornerRadius, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, Vec2,
 };
 use std::f32::consts::TAU;
 use tl_core::GameEdition;
@@ -589,7 +589,7 @@ pub fn render_play_hero_showcase(
         title_pos,
         egui::Align2::LEFT_CENTER,
         edition.label(),
-        FontId::proportional(21.0),
+        crate::theme::ui_font_strong(21.0),
         p.hero_title,
     );
 
@@ -604,8 +604,8 @@ pub fn render_play_hero_showcase(
         pos2(rect.left() + 116.0, rect.center().y + 12.0),
         egui::Align2::LEFT_CENTER,
         state_text,
-        FontId::proportional(13.0),
-        Color32::from_rgb(203, 213, 225),
+        crate::theme::ui_font(13.0),
+        p.hero_subtitle,
     );
 }
 

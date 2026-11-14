@@ -1,3 +1,4 @@
+use crate::assets::{ButtonSkin, LauncherAssets, UiIcon};
 use crate::state::AppState;
 use crate::theme::ThemePalette;
 use crate::views::play_view::render_install_progress_bar;
@@ -8,17 +9,13 @@ use tl_runtime::TmodLoaderReleaseInfo;
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
+    let assets = state.assets.clone();
     let busy = state.install_busy || state.tml_releases_busy || state.terraria_check_busy;
 
     ui.horizontal(|ui| {
-        anim3d::render_settings_gears_3d(ui, p, state.assets.nav_settings.as_ref(), busy);
+        anim3d::render_settings_gears_3d(ui, p, assets.nav_settings.as_ref(), busy);
         ui.vertical(|ui| {
-            ui.label(
-                RichText::new("Cài đặt & Môi trường")
-                    .size(21.0)
-                    .strong()
-                    .color(p.text_primary),
-            );
+            theme::page_title(ui, p, "Cài đặt & Môi trường");
             if busy {
                 ui.label(
                     RichText::new("Đang kiểm tra / cài đặt...")
@@ -30,11 +27,21 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     });
     ui.add_space(8.0);
 
-    theme::card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
+    theme::rpg_card(ui, assets.as_ref(), p, |ui| {
         let current_mode = state.config.theme_mode;
+        let theme_icon = if current_mode.is_dark() {
+            UiIcon::Moon
+        } else {
+            UiIcon::Sun
+        };
         ui.horizontal_wrapped(|ui| {
-            theme::section_heading(ui, p, "Giao diện Launcher (Dark / Light)");
+            theme::rpg_section_heading(
+                ui,
+                assets.as_ref(),
+                p,
+                theme_icon,
+                "Giao diện Launcher (Dark / Light)",
+            );
             theme::status_pill(
                 ui,
                 &format!("Đang dùng: {}", current_mode.label()),
@@ -51,12 +58,22 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             for mode in [ThemeMode::Dark, ThemeMode::Light] {
                 let active = current_mode == mode;
-                let clicked = if active {
-                    theme::primary_button(ui, p, mode.label()).clicked()
-                } else {
-                    ui.button(mode.label()).clicked()
+                let (active_skin, icon) = match mode {
+                    ThemeMode::Dark => (ButtonSkin::Cyan, UiIcon::Moon),
+                    ThemeMode::Light => (ButtonSkin::Amber, UiIcon::Sun),
                 };
-                if clicked && !active {
+                if theme::rpg_selectable_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    active,
+                    active_skin,
+                    icon,
+                    mode.label(),
+                )
+                .clicked()
+                    && !active
+                {
                     next_mode = Some(mode);
                 }
             }
@@ -68,9 +85,14 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
-    theme::card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_heading(ui, p, "Trạng thái Thành phần");
+    theme::rpg_card(ui, assets.as_ref(), p, |ui| {
+        theme::rpg_section_heading(
+            ui,
+            assets.as_ref(),
+            p,
+            UiIcon::Settings,
+            "Trạng thái Thành phần",
+        );
         ui.add_space(8.0);
 
         ui.horizontal_wrapped(|ui| {
@@ -146,17 +168,42 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             if !state.env.xna_installed
                 && ui
                     .add_enabled_ui(!state.install_busy, |ui| {
-                        theme::accent_button(ui, "Cài XNA Framework 4.0", p.accent_amber)
+                        theme::rpg_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Amber,
+                            UiIcon::Download,
+                            "Cài XNA Framework 4.0",
+                        )
                     })
                     .inner
                     .clicked()
             {
                 trigger_xna = true;
             }
-            if ui.button("Mở thư mục gốc Launcher").clicked() {
+            if theme::rpg_button(
+                ui,
+                assets.as_ref(),
+                p,
+                ButtonSkin::Slate,
+                UiIcon::Folder,
+                "Mở thư mục gốc Launcher",
+            )
+            .clicked()
+            {
                 let _ = open::that(&state.paths.base_dir);
             }
-            if ui.button("Làm mới kiểm tra").clicked() {
+            if theme::rpg_button(
+                ui,
+                assets.as_ref(),
+                p,
+                ButtonSkin::Slate,
+                UiIcon::Refresh,
+                "Làm mới kiểm tra",
+            )
+            .clicked()
+            {
                 state.refresh_environment();
                 state.notify_ok("Đã kiểm tra lại môi trường.");
             }
@@ -168,17 +215,21 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
-    render_game_installer_card(state, ui, p);
+    render_game_installer_card(state, assets.as_ref(), ui, p);
 
     ui.add_space(12.0);
 
-    theme::card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_heading(ui, p, "Thư mục Game & Công cụ (để trống = dùng mặc định)");
+    theme::rpg_card(ui, assets.as_ref(), p, |ui| {
+        theme::rpg_section_heading(
+            ui,
+            assets.as_ref(),
+            p,
+            UiIcon::Folder,
+            "Thư mục Game & Công cụ (để trống = dùng mặc định)",
+        );
         ui.add_space(8.0);
 
-        theme::subcard_frame(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        theme::rpg_subcard(ui, assets.as_ref(), p, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Thư mục Terraria:").color(p.text_muted));
                 ui.add(
@@ -186,7 +237,16 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         .desired_width(300.0)
                         .hint_text(state.paths.terraria_dir.to_string_lossy().as_ref()),
                 );
-                if ui.button("Chọn...").clicked() {
+                if theme::rpg_compact_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Slate,
+                    Some(UiIcon::Folder),
+                    "Chọn...",
+                )
+                .clicked()
+                {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         state.config.custom_terraria_dir = dir.to_string_lossy().into_owned();
                     }
@@ -200,7 +260,16 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         .desired_width(284.0)
                         .hint_text(state.paths.tmodloader_dir.to_string_lossy().as_ref()),
                 );
-                if ui.button("Chọn...").clicked() {
+                if theme::rpg_compact_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Slate,
+                    Some(UiIcon::Folder),
+                    "Chọn...",
+                )
+                .clicked()
+                {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         state.config.custom_tmodloader_dir = dir.to_string_lossy().into_owned();
                     }
@@ -214,7 +283,16 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         .desired_width(296.0)
                         .hint_text("Tự tìm trong WinGet / PATH / data\\SteamCMD"),
                 );
-                if ui.button("Chọn...").clicked() {
+                if theme::rpg_compact_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Slate,
+                    Some(UiIcon::Folder),
+                    "Chọn...",
+                )
+                .clicked()
+                {
                     if let Some(file) = rfd::FileDialog::new()
                         .add_filter("Executable", &["exe"])
                         .pick_file()
@@ -228,9 +306,14 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
-    theme::card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_heading(ui, p, "Cấu hình Tunnel & Proxy");
+    theme::rpg_card(ui, assets.as_ref(), p, |ui| {
+        theme::rpg_section_heading(
+            ui,
+            assets.as_ref(),
+            p,
+            UiIcon::Host,
+            "Cấu hình Tunnel & Proxy",
+        );
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
@@ -258,7 +341,16 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         });
 
         ui.add_space(8.0);
-        if theme::primary_button(ui, p, "Lưu & Áp dụng").clicked() {
+        if theme::rpg_button(
+            ui,
+            assets.as_ref(),
+            p,
+            ButtonSkin::Emerald,
+            UiIcon::Pack,
+            "Lưu & Áp dụng",
+        )
+        .clicked()
+        {
             state.save_config();
             state.refresh_environment();
             state.notify_ok("Đã lưu cài đặt và làm mới cấu hình.");
@@ -266,14 +358,23 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     });
 }
 
-fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
-    theme::card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_heading(ui, p, "Cài đặt & Cập nhật Game");
+fn render_game_installer_card(
+    state: &mut AppState,
+    assets: &LauncherAssets,
+    ui: &mut egui::Ui,
+    p: ThemePalette,
+) {
+    theme::rpg_card(ui, assets, p, |ui| {
+        theme::rpg_section_heading(
+            ui,
+            assets,
+            p,
+            UiIcon::Download,
+            "Cài đặt & Cập nhật Game",
+        );
         ui.add_space(8.0);
 
-        theme::subcard_frame(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        theme::rpg_subcard(ui, assets, p, |ui| {
             ui.label(
                 RichText::new("tModLoader (GitHub Releases)")
                     .strong()
@@ -320,10 +421,17 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemeP
                     });
 
                 if ui
-                    .add_enabled(
-                        !state.tml_releases_busy,
-                        egui::Button::new("Kiểm tra bản mới"),
-                    )
+                    .add_enabled_ui(!state.tml_releases_busy, |ui| {
+                        theme::rpg_compact_button(
+                            ui,
+                            assets,
+                            p,
+                            ButtonSkin::Cyan,
+                            Some(UiIcon::Refresh),
+                            "Kiểm tra bản mới",
+                        )
+                    })
+                    .inner
                     .clicked()
                 {
                     do_refresh_releases = true;
@@ -339,15 +447,33 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemeP
             let mut do_install_dotnet = false;
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if theme::primary_button(ui, p, "Cài đặt / Cập nhật tModLoader").clicked() {
+                    if theme::rpg_button(
+                        ui,
+                        assets,
+                        p,
+                        ButtonSkin::Cyan,
+                        UiIcon::Download,
+                        "Cài đặt / Cập nhật tModLoader",
+                    )
+                    .clicked()
+                    {
                         do_install_tml = true;
                     }
-                    let dotnet_label = if dotnet_missing {
-                        "Cài .NET 8 Portable"
+                    let (dotnet_label, dotnet_icon) = if dotnet_missing {
+                        ("Cài .NET 8 Portable", UiIcon::Download)
                     } else {
-                        "Cài lại .NET 8 Portable"
+                        ("Cài lại .NET 8 Portable", UiIcon::Refresh)
                     };
-                    if theme::accent_button(ui, dotnet_label, p.accent_cyan).clicked() {
+                    if theme::rpg_button(
+                        ui,
+                        assets,
+                        p,
+                        ButtonSkin::Amber,
+                        dotnet_icon,
+                        dotnet_label,
+                    )
+                    .clicked()
+                    {
                         do_install_dotnet = true;
                     }
                 });
@@ -362,8 +488,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemeP
 
         ui.add_space(8.0);
 
-        theme::subcard_frame(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        theme::rpg_subcard(ui, assets, p, |ui| {
             let is_synced = state.env.terraria_installed
                 && state
                     .terraria_remote_manifest
@@ -446,10 +571,17 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemeP
                     config_dirty = true;
                 }
                 if ui
-                    .add_enabled(
-                        !state.terraria_check_busy,
-                        egui::Button::new("Kiểm tra cập nhật"),
-                    )
+                    .add_enabled_ui(!state.terraria_check_busy, |ui| {
+                        theme::rpg_compact_button(
+                            ui,
+                            assets,
+                            p,
+                            ButtonSkin::Cyan,
+                            Some(UiIcon::Refresh),
+                            "Kiểm tra cập nhật",
+                        )
+                    })
+                    .inner
                     .clicked()
                 {
                     do_check_update = true;
@@ -480,21 +612,51 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemeP
             }
 
             ui.add_space(4.0);
+            let (install_skin, install_icon) = if state.env.terraria_installed && is_synced {
+                (ButtonSkin::Amber, UiIcon::Refresh)
+            } else {
+                (ButtonSkin::Cyan, UiIcon::Download)
+            };
             let mut do_url = false;
             let mut do_zip = false;
             let mut do_save = false;
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if theme::primary_button(ui, p, &install_btn_label).clicked() {
+                    if theme::rpg_button(
+                        ui,
+                        assets,
+                        p,
+                        install_skin,
+                        install_icon,
+                        &install_btn_label,
+                    )
+                    .clicked()
+                    {
                         do_url = true;
                     }
-                    if theme::accent_button(ui, "Chọn file .zip trên máy...", p.accent_cyan)
-                        .clicked()
+                    if theme::rpg_button(
+                        ui,
+                        assets,
+                        p,
+                        ButtonSkin::Slate,
+                        UiIcon::Folder,
+                        "Chọn file .zip trên máy...",
+                    )
+                    .clicked()
                     {
                         do_zip = true;
                     }
                 });
-                if ui.button("Lưu nguồn cài").clicked() {
+                if theme::rpg_button(
+                    ui,
+                    assets,
+                    p,
+                    ButtonSkin::Emerald,
+                    UiIcon::Pack,
+                    "Lưu nguồn cài",
+                )
+                .clicked()
+                {
                     do_save = true;
                 }
             });
@@ -517,11 +679,19 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui, p: ThemeP
 
         if let Some(err) = state.install_last_error.clone() {
             ui.add_space(8.0);
-            theme::subcard_frame(p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
+            theme::rpg_subcard(ui, assets, p, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("Lỗi cài đặt: {err}")).color(p.accent_red));
-                    if ui.button("Đóng").clicked() {
+                    if theme::rpg_compact_button(
+                        ui,
+                        assets,
+                        p,
+                        ButtonSkin::Red,
+                        Some(UiIcon::Stop),
+                        "Đóng",
+                    )
+                    .clicked()
+                    {
                         state.install_last_error = None;
                     }
                 });

@@ -5,9 +5,10 @@ pub mod server_view;
 pub mod settings_view;
 
 use crate::anim3d;
+use crate::assets::{ButtonSkin, UiIcon};
 use crate::state::{AppState, NavTab};
-use crate::theme::{accent_button, subcard_frame};
-use egui::{pos2, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke};
+use crate::theme::{rpg_compact_button, rpg_selectable_button, rpg_subcard};
+use egui::{pos2, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke};
 use tl_core::ThemeMode;
 
 pub fn render_root(state: &mut AppState, ui: &mut egui::Ui) {
@@ -53,6 +54,7 @@ pub fn render_root(state: &mut AppState, ui: &mut egui::Ui) {
 
 fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
+    let assets = state.assets.clone();
     let time = ui.input(|i| i.time) as f32;
     let server_active = state
         .server_supervisor
@@ -65,7 +67,7 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
             anim3d::draw_sidebar_brand_stage(
                 ui,
                 p,
-                state.assets.brand_emblem.as_ref(),
+                assets.brand_emblem.as_ref(),
                 state.active_game.is_some(),
                 server_active,
             );
@@ -73,8 +75,7 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("Terraria\nLauncher")
-                        .size(16.0)
-                        .strong()
+                        .font(crate::theme::ui_font_strong(16.0))
                         .color(p.text_primary),
                 );
                 ui.label(
@@ -132,7 +133,7 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 painter,
                 icon_center,
                 28.0,
-                state.assets.nav_icon(tab),
+                assets.nav_icon(tab),
                 p,
                 anim3d::NavEmblemState {
                     selected,
@@ -147,11 +148,16 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
             } else {
                 p.text_primary
             };
+            let tab_font = if selected {
+                crate::theme::ui_font_strong(14.0)
+            } else {
+                crate::theme::ui_font(14.0)
+            };
             painter.text(
                 pos2(rect.left() + 42.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 tab.label(),
-                FontId::proportional(14.0),
+                tab_font,
                 text_color,
             );
 
@@ -164,32 +170,35 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
         ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(4.0);
 
-            subcard_frame(p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Giao diện").size(12.0).color(p.text_muted));
-                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                        for mode in [ThemeMode::Light, ThemeMode::Dark] {
-                            let active = state.config.theme_mode == mode;
-                            if ui
-                                .selectable_label(
-                                    active,
-                                    RichText::new(mode.short_label()).size(11.5).strong(),
-                                )
-                                .clicked()
-                                && !active
-                            {
-                                state.set_theme_mode(ui.ctx(), mode);
-                            }
+            rpg_subcard(ui, assets.as_ref(), p, |ui| {
+                ui.label(RichText::new("Giao diện").size(12.0).color(p.text_muted));
+                ui.horizontal_wrapped(|ui| {
+                    for (mode, skin, icon) in [
+                        (ThemeMode::Light, ButtonSkin::Amber, UiIcon::Sun),
+                        (ThemeMode::Dark, ButtonSkin::Cyan, UiIcon::Moon),
+                    ] {
+                        let active = state.config.theme_mode == mode;
+                        if rpg_selectable_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            active,
+                            skin,
+                            icon,
+                            mode.short_label(),
+                        )
+                        .clicked()
+                            && !active
+                        {
+                            state.set_theme_mode(ui.ctx(), mode);
                         }
-                    });
+                    }
                 });
             });
             ui.add_space(6.0);
 
             if let Some(endpoint) = state.active_tunnel_endpoint() {
-                subcard_frame(p).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+                rpg_subcard(ui, assets.as_ref(), p, |ui| {
                     ui.label(
                         RichText::new("Tunnel Online")
                             .size(11.5)
@@ -202,7 +211,16 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             .size(12.0)
                             .color(p.text_primary),
                     );
-                    if accent_button(ui, "Sao chép địa chỉ", p.accent_cyan).clicked() {
+                    if rpg_compact_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Cyan,
+                        Some(UiIcon::Copy),
+                        "Sao chép địa chỉ",
+                    )
+                    .clicked()
+                    {
                         ui.ctx().copy_text(endpoint);
                         state.notify_ok("Đã sao chép địa chỉ Tunnel.");
                     }
@@ -210,8 +228,7 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.add_space(6.0);
             }
 
-            subcard_frame(p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
+            rpg_subcard(ui, assets.as_ref(), p, |ui| {
                 let srv_color = state.badge_color_for_server();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Server:").size(12.0).color(p.text_muted));
@@ -238,7 +255,16 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             .size(11.5)
                             .color(p.text_muted),
                         );
-                        if accent_button(ui, "Lưu & Tắt Server", p.accent_amber).clicked() {
+                        if rpg_compact_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Red,
+                            Some(UiIcon::Stop),
+                            "Lưu & Tắt Server",
+                        )
+                        .clicked()
+                        {
                             state.stop_selected_server();
                         }
                     }
@@ -247,8 +273,7 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
 
             if let Some(game) = state.running_game.clone() {
                 ui.add_space(6.0);
-                subcard_frame(p).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+                rpg_subcard(ui, assets.as_ref(), p, |ui| {
                     ui.label(
                         RichText::new(format!("Đang chạy: {}", game.edition.label()))
                             .size(12.0)
@@ -263,7 +288,16 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         .size(11.5)
                         .color(p.text_muted),
                     );
-                    if accent_button(ui, "Đóng Game", p.accent_red).clicked() {
+                    if rpg_compact_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Red,
+                        Some(UiIcon::Stop),
+                        "Đóng Game",
+                    )
+                    .clicked()
+                    {
                         state.kill_running_game();
                     }
                 });
@@ -277,6 +311,7 @@ fn render_notification_banner(state: &mut AppState, ui: &mut egui::Ui) {
         return;
     };
     let p = state.palette();
+    let assets = state.assets.clone();
     let color = if notif.is_error {
         p.accent_red
     } else {
@@ -294,7 +329,16 @@ fn render_notification_banner(state: &mut AppState, ui: &mut egui::Ui) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&notif.message).size(13.0).color(p.text_primary));
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Đóng").clicked() {
+                    if rpg_compact_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Slate,
+                        None,
+                        "Đóng",
+                    )
+                    .clicked()
+                    {
                         dismiss = true;
                     }
                 });

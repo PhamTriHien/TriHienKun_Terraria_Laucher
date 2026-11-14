@@ -143,7 +143,7 @@ pub struct AppState {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub event_rx: mpsc::UnboundedReceiver<AppEvent>,
 
-    pub assets: LauncherAssets,
+    pub assets: Arc<LauncherAssets>,
     pub paths: LauncherPaths,
     pub config: LauncherConfig,
     pub env: EnvironmentStatus,
@@ -271,7 +271,7 @@ impl AppState {
             repaint,
             event_tx,
             event_rx,
-            assets: LauncherAssets::load(ctx),
+            assets: Arc::new(LauncherAssets::load(ctx)),
             paths,
             config,
             env,

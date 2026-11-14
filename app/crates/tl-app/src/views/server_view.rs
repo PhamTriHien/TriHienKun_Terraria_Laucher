@@ -1,8 +1,9 @@
 use crate::anim3d;
+use crate::assets::{ButtonSkin, UiIcon};
 use crate::state::AppState;
 use crate::theme::{
-    accent_button, card_frame, console_frame, danger_button, primary_button, section_heading,
-    status_pill, ThemePalette,
+    console_frame, page_title, rpg_button, rpg_card, rpg_compact_button, rpg_section_heading,
+    rpg_selectable_button, status_pill, ThemePalette,
 };
 use egui::RichText;
 use tl_core::{GameEdition, WorldDifficultyOption, WorldSizeOption};
@@ -10,6 +11,7 @@ use tl_runtime::ServerLifecycleState;
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
+    let assets = state.assets.clone();
     let server_running = matches!(
         state.server_snapshot.as_ref().map(|s| &s.state),
         Some(ServerLifecycleState::Running)
@@ -23,61 +25,57 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         anim3d::render_server_beacon_3d(
             ui,
             p,
-            state.assets.nav_server.as_ref(),
+            assets.nav_server.as_ref(),
             server_running,
             server_starting,
         );
         ui.vertical(|ui| {
             ui.add_space(12.0);
-            ui.label(
-                RichText::new("Quản lý Server Game")
-                    .size(21.0)
-                    .strong()
-                    .color(p.text_primary),
-            );
+            page_title(ui, p, "Quản lý Server Game");
         });
     });
     ui.add_space(8.0);
 
-    card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
+    rpg_card(ui, assets.as_ref(), p, |ui| {
+        rpg_section_heading(ui, assets.as_ref(), p, UiIcon::Pack, "Hồ sơ Server");
+        ui.add_space(6.0);
+
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Hồ sơ Server:").color(p.text_muted));
-            let active_label = state
-                .config
-                .active_server()
-                .map(|p| format!("{} ({})", p.name, p.edition.label()))
-                .unwrap_or_else(|| "Chưa chọn".to_string());
-            let mut profile_changed = false;
-            egui::ComboBox::from_id_salt("srv_profile_combo")
-                .selected_text(active_label)
-                .width(240.0)
-                .show_ui(ui, |ui| {
-                    for profile in &state.config.servers {
-                        if ui
-                            .selectable_value(
-                                &mut state.config.active_server_id,
-                                profile.id.clone(),
-                                format!("{} ({})", profile.name, profile.edition.label()),
-                            )
-                            .changed()
-                        {
-                            profile_changed = true;
-                        }
-                    }
-                });
-            if profile_changed {
+            let mut selected_profile_id = None;
+            for profile in &state.config.servers {
+                let active = state.config.active_server_id == profile.id;
+                let label = format!("{} ({})", profile.name, profile.edition.label());
+                if rpg_selectable_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    active,
+                    ButtonSkin::Emerald,
+                    UiIcon::Server,
+                    &label,
+                )
+                .clicked()
+                    && !active
+                {
+                    selected_profile_id = Some(profile.id.clone());
+                }
+            }
+            if let Some(id) = selected_profile_id {
+                state.config.active_server_id = id;
                 state.refresh_banlist();
             }
+        });
 
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.new_profile_name)
-                    .desired_width(130.0)
+                    .desired_width(150.0)
                     .hint_text("Tên hồ sơ mới"),
             );
             egui::ComboBox::from_id_salt("srv_new_edition")
                 .selected_text(state.new_profile_edition.label())
-                .width(140.0)
+                .width(145.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut state.new_profile_edition,
@@ -90,10 +88,29 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         GameEdition::Vanilla.label(),
                     );
                 });
-            if accent_button(ui, "+ Thêm", p.accent_cyan).clicked() {
+            if rpg_button(
+                ui,
+                assets.as_ref(),
+                p,
+                ButtonSkin::Cyan,
+                UiIcon::Pack,
+                "+ Thêm",
+            )
+            .clicked()
+            {
                 state.add_server_profile();
             }
-            if state.config.servers.len() > 1 && danger_button(ui, p, "Xóa hồ sơ").clicked() {
+            if state.config.servers.len() > 1
+                && rpg_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Red,
+                    UiIcon::Trash,
+                    "Xóa hồ sơ",
+                )
+                .clicked()
+            {
                 state.delete_active_server_profile();
             }
         });
@@ -140,18 +157,54 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if is_active {
-                    if danger_button(ui, p, "Dừng gấp").clicked() {
+                    if rpg_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Red,
+                        UiIcon::Stop,
+                        "Dừng gấp",
+                    )
+                    .clicked()
+                    {
                         state.force_kill_server();
                     }
-                    if accent_button(ui, "Lưu & Tắt", p.accent_amber).clicked() {
+                    if rpg_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Amber,
+                        UiIcon::Stop,
+                        "Lưu & Tắt",
+                    )
+                    .clicked()
+                    {
                         state.stop_selected_server();
                     }
                 } else {
-                    if ui.button("Lưu cấu hình").clicked() {
+                    if rpg_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Amber,
+                        UiIcon::Download,
+                        "Lưu cấu hình",
+                    )
+                    .clicked()
+                    {
                         state.save_config();
                         state.notify_ok("Đã lưu cấu hình server.");
                     }
-                    if primary_button(ui, p, "Khởi chạy Server").clicked() {
+                    if rpg_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Emerald,
+                        UiIcon::Play,
+                        "Khởi chạy Server",
+                    )
+                    .clicked()
+                    {
                         state.start_selected_server();
                     }
                 }
@@ -175,6 +228,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 }
 
 fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
+    let assets = state.assets.clone();
     let modpacks = state.modpacks.clone();
     let tml_worlds_dir = state.paths.tml_worlds_dir();
     let vanilla_worlds_dir = state.paths.vanilla_worlds_dir();
@@ -183,9 +237,14 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
         return;
     };
 
-    card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        section_heading(ui, p, "Cấu hình Server (serverconfig.txt)");
+    rpg_card(ui, assets.as_ref(), p, |ui| {
+        rpg_section_heading(
+            ui,
+            assets.as_ref(),
+            p,
+            UiIcon::Settings,
+            "Cấu hình Server (serverconfig.txt)",
+        );
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
@@ -397,12 +456,21 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
 }
 
 fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
-    card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
+    let assets = state.assets.clone();
+    rpg_card(ui, assets.as_ref(), p, |ui| {
         ui.horizontal(|ui| {
-            section_heading(ui, p, "Console trực tiếp");
+            rpg_section_heading(ui, assets.as_ref(), p, UiIcon::Server, "Console trực tiếp");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Xóa log").clicked() {
+                if rpg_compact_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Slate,
+                    Some(UiIcon::Trash),
+                    "Xóa log",
+                )
+                .clicked()
+                {
                     if let Some(sup) = &state.server_supervisor {
                         sup.clear_logs();
                     }
@@ -413,16 +481,16 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
 
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            for (label, cmd) in [
-                ("Người chơi", "playing"),
-                ("Lưu thế giới", "save"),
-                ("Bình minh", "dawn"),
-                ("Trưa", "noon"),
-                ("Hoàng hôn", "dusk"),
-                ("Nửa đêm", "midnight"),
-                ("Settle", "settle"),
+            for (label, cmd, skin, icon) in [
+                ("Người chơi", "playing", ButtonSkin::Cyan, UiIcon::Host),
+                ("Lưu thế giới", "save", ButtonSkin::Amber, UiIcon::Download),
+                ("Bình minh", "dawn", ButtonSkin::Slate, UiIcon::Sun),
+                ("Trưa", "noon", ButtonSkin::Slate, UiIcon::Sun),
+                ("Hoàng hôn", "dusk", ButtonSkin::Slate, UiIcon::Moon),
+                ("Nửa đêm", "midnight", ButtonSkin::Slate, UiIcon::Moon),
+                ("Settle", "settle", ButtonSkin::Slate, UiIcon::Refresh),
             ] {
-                if ui.small_button(label).clicked() {
+                if rpg_compact_button(ui, assets.as_ref(), p, skin, Some(icon), label).clicked() {
                     state.send_server_command(cmd);
                 }
             }
@@ -481,12 +549,19 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
         ui.horizontal(|ui| {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut state.console_input)
-                    .desired_width((ui.available_width() - 96.0).max(120.0))
+                    .desired_width((ui.available_width() - 116.0).max(120.0))
                     .hint_text("Nhập lệnh server (vd: say Xin chao!, save, kick Ten)..."),
             );
-            let submit =
-                primary_button(ui, p, "Gửi lệnh").clicked()
-                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            let submit = rpg_button(
+                ui,
+                assets.as_ref(),
+                p,
+                ButtonSkin::Emerald,
+                UiIcon::Play,
+                "Gửi lệnh",
+            )
+            .clicked()
+                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if submit && !state.console_input.trim().is_empty() {
                 let cmd = std::mem::take(&mut state.console_input);
                 state.send_server_command(&cmd);
