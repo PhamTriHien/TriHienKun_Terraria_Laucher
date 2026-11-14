@@ -4,7 +4,9 @@ use crate::http_client::{
 };
 use futures_util::StreamExt;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -19,7 +21,9 @@ use zip::ZipArchive;
 pub const TMODLOADER_GITHUB_REPO: &str = "tModLoader/tModLoader";
 pub const XNA_40_OFFICIAL_MSI_URL: &str =
     "https://download.microsoft.com/download/a/c/2/ac2c903b-e6e8-42c2-9fd7-bebac362a930/xnafx40_redist.msi";
+pub const TERRARIA_MANIFEST_FILENAME: &str = "terraria-manifest.json";
 
+const TERRARIA_RECEIPT_FILENAME: &str = "terraria-installed.json";
 const DOWNLOAD_PROGRESS_STEP_BYTES: u64 = 64 * 1024;
 const PRESERVED_TOP_DIRS: &[&str] = &[
     "content",
@@ -85,6 +89,34 @@ pub struct TmodLoaderReleaseInfo {
     pub asset_name: String,
     pub download_url: String,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerrariaManifestPart {
+    pub file: String,
+    pub size: u64,
+    #[serde(default)]
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerrariaBranchManifest {
+    pub version: String,
+    #[serde(default)]
+    pub archive_name: String,
+    pub total_size: u64,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub chunk_size: u64,
+    pub parts: Vec<TerrariaManifestPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct InstalledTerrariaReceipt {
+    pub version: String,
+    pub sha256: String,
+    pub source: String,
 }
 
 struct TempFileGuard {
@@ -643,6 +675,180 @@ fn is_valid_github_owner_repo(owner: &str, repo: &str) -> bool {
     valid_part(owner) && valid_part(repo)
 }
 
+fn is_valid_branch_name(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.contains("//")
+        && !branch.contains("..")
+        && !branch.contains('\\')
+        && !branch.contains(':')
+        && !branch.contains(['@', '?', '#'])
+        && !branch.chars().any(char::is_whitespace)
+        && branch
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.chars().any(char::is_control))
+}
+
+fn is_valid_relative_subdir(subdir: &str) -> bool {
+    !subdir.is_empty()
+        && !subdir.contains("..")
+        && !subdir.contains('\\')
+        && !subdir.contains(':')
+        && !subdir.contains(['@', '?', '#'])
+        && !subdir.chars().any(char::is_whitespace)
+        && subdir
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.chars().any(char::is_control))
+}
+
+pub fn parse_github_branch_spec(input: &str) -> Option<(String, String, Option<String>)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.contains(['@', '?', '\\'])
+    {
+        return None;
+    }
+
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return parse_github_branch_url(trimmed);
+    }
+
+    parse_github_branch_shorthand(trimmed)
+}
+
+fn parse_github_branch_url(raw: &str) -> Option<(String, String, Option<String>)> {
+    let without_scheme = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))?;
+
+    let path_only = without_scheme.split('#').next()?;
+    let (host, rest) = path_only.split_once('/')?;
+    let host_clean = host.strip_prefix("www.").unwrap_or(host);
+    if !host_clean.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+
+    let trimmed_rest = rest.trim_matches('/');
+    if trimmed_rest.is_empty() {
+        return None;
+    }
+    let segments: Vec<&str> = trimmed_rest.split('/').collect();
+
+    match segments.as_slice() {
+        [owner, repo, tree_kw, branch_parts @ ..]
+            if tree_kw.eq_ignore_ascii_case("tree")
+                && !branch_parts.is_empty()
+                && is_valid_github_owner_repo(owner, repo) =>
+        {
+            let branch = branch_parts.join("/");
+            if is_valid_branch_name(&branch) {
+                Some((format!("{owner}/{repo}"), branch, None))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_github_branch_shorthand(raw: &str) -> Option<(String, String, Option<String>)> {
+    if raw.starts_with('/') {
+        return None;
+    }
+
+    let (repo_part, branch_and_subdir) = raw.split_once('#')?;
+    if branch_and_subdir.contains('#') {
+        return None;
+    }
+
+    let mut repo_segments = repo_part.split('/');
+    let owner = repo_segments.next()?;
+    let repo = repo_segments.next()?;
+    if repo_segments.next().is_some()
+        || !is_valid_github_owner_repo(owner, repo)
+        || repo.to_ascii_lowercase().ends_with(".zip")
+    {
+        return None;
+    }
+
+    let (branch_raw, subdir_opt) = match branch_and_subdir.split_once(':') {
+        Some((branch_part, subdir_part)) => {
+            let clean_subdir = subdir_part.trim_matches('/');
+            if clean_subdir.is_empty() {
+                (branch_part, None)
+            } else if is_valid_relative_subdir(clean_subdir) {
+                (branch_part, Some(clean_subdir.to_string()))
+            } else {
+                return None;
+            }
+        }
+        None => (branch_and_subdir, None),
+    };
+
+    if !is_valid_branch_name(branch_raw) {
+        return None;
+    }
+
+    Some((format!("{owner}/{repo}"), branch_raw.to_string(), subdir_opt))
+}
+
+fn encode_url_component(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(*byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn encode_url_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_url_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn parse_direct_manifest_url(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let scheme_len = if trimmed.starts_with("https://") {
+        "https://".len()
+    } else if trimmed.starts_with("http://") {
+        "http://".len()
+    } else {
+        return None;
+    };
+
+    let url_no_frag = trimmed.split('#').next()?;
+    let without_scheme = &url_no_frag[scheme_len..];
+    let path_without_query = without_scheme.split('?').next()?;
+    let (authority, rel_path) = path_without_query.split_once('/')?;
+    if authority.is_empty() {
+        return None;
+    }
+
+    let suffix_slash = format!("/{TERRARIA_MANIFEST_FILENAME}");
+    if rel_path != TERRARIA_MANIFEST_FILENAME && !rel_path.ends_with(&suffix_slash) {
+        return None;
+    }
+
+    let url_before_query = url_no_frag.split('?').next()?;
+    let base_url = url_before_query
+        .strip_suffix(TERRARIA_MANIFEST_FILENAME)?
+        .to_string();
+    Some((url_no_frag.to_string(), base_url))
+}
+
 fn extract_http_host(raw: &str) -> &str {
     let rest = raw
         .strip_prefix("https://")
@@ -658,9 +864,550 @@ fn is_github_url(raw: &str) -> bool {
     host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("api.github.com")
 }
 
+fn is_github_manifest_auth_host(raw: &str) -> bool {
+    let host = extract_http_host(raw);
+    is_github_url(raw) || host.eq_ignore_ascii_case("raw.githubusercontent.com")
+}
+
 fn is_github_api_asset_url(raw: &str) -> bool {
     extract_http_host(raw).eq_ignore_ascii_case("api.github.com")
         && raw.contains("/releases/assets/")
+}
+
+enum ManifestOrigin {
+    GitHubBranch {
+        owner_repo: String,
+        branch: String,
+        subdir: Option<String>,
+    },
+    DirectManifestUrl {
+        manifest_url: String,
+        base_url: String,
+    },
+}
+
+struct ManifestRequestSpec {
+    url: String,
+    accept_header: Option<&'static str>,
+    bearer_token: Option<String>,
+}
+
+impl ManifestOrigin {
+    fn resolve(source: &str) -> Option<Self> {
+        if let Some((owner_repo, branch, subdir)) = parse_github_branch_spec(source) {
+            return Some(Self::GitHubBranch {
+                owner_repo,
+                branch,
+                subdir,
+            });
+        }
+        parse_direct_manifest_url(source).map(|(manifest_url, base_url)| Self::DirectManifestUrl {
+            manifest_url,
+            base_url,
+        })
+    }
+
+    fn github_file_request(
+        owner_repo: &str,
+        branch: &str,
+        subdir: Option<&str>,
+        filename: &str,
+        token: Option<&str>,
+    ) -> ManifestRequestSpec {
+        let rel_path = match subdir {
+            Some(dir) => format!("{dir}/{filename}"),
+            None => filename.to_string(),
+        };
+        if let Some(tok) = token {
+            ManifestRequestSpec {
+                url: format!(
+                    "https://api.github.com/repos/{owner_repo}/contents/{}?ref={}",
+                    encode_url_path(&rel_path),
+                    encode_url_component(branch)
+                ),
+                accept_header: Some("application/vnd.github.raw+json"),
+                bearer_token: Some(tok.to_string()),
+            }
+        } else {
+            ManifestRequestSpec {
+                url: format!(
+                    "https://raw.githubusercontent.com/{owner_repo}/{}/{}",
+                    encode_url_path(branch),
+                    encode_url_path(&rel_path)
+                ),
+                accept_header: None,
+                bearer_token: None,
+            }
+        }
+    }
+
+    fn manifest_request(&self, token: Option<&str>) -> ManifestRequestSpec {
+        match self {
+            Self::GitHubBranch {
+                owner_repo,
+                branch,
+                subdir,
+            } => Self::github_file_request(
+                owner_repo,
+                branch,
+                subdir.as_deref(),
+                TERRARIA_MANIFEST_FILENAME,
+                token,
+            ),
+            Self::DirectManifestUrl { manifest_url, .. } => {
+                let bearer_token = token
+                    .filter(|_| is_github_manifest_auth_host(manifest_url))
+                    .map(str::to_string);
+                ManifestRequestSpec {
+                    url: manifest_url.clone(),
+                    accept_header: None,
+                    bearer_token,
+                }
+            }
+        }
+    }
+
+    fn part_request(&self, part_file: &str, token: Option<&str>) -> ManifestRequestSpec {
+        match self {
+            Self::GitHubBranch {
+                owner_repo,
+                branch,
+                subdir,
+            } => Self::github_file_request(
+                owner_repo,
+                branch,
+                subdir.as_deref(),
+                part_file,
+                token,
+            ),
+            Self::DirectManifestUrl { base_url, .. } => {
+                let url = format!("{base_url}{}", encode_url_component(part_file));
+                let bearer_token = token
+                    .filter(|_| is_github_manifest_auth_host(&url))
+                    .map(str::to_string);
+                ManifestRequestSpec {
+                    url,
+                    accept_header: None,
+                    bearer_token,
+                }
+            }
+        }
+    }
+}
+
+fn is_valid_sha256_hex(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_safe_manifest_part_filename(file: &str) -> bool {
+    !file.is_empty()
+        && !file.trim().is_empty()
+        && file.trim() == file
+        && file != "."
+        && file != ".."
+        && !file.contains('/')
+        && !file.contains('\\')
+        && !file.contains("..")
+        && !file.chars().any(char::is_control)
+}
+
+fn validate_branch_manifest(manifest: &TerrariaBranchManifest) -> LauncherResult<()> {
+    if manifest.version.trim().is_empty() {
+        return Err(LauncherError::InvalidFormat(
+            "Manifest thiếu thông tin phiên bản (version).".to_string(),
+        ));
+    }
+    if manifest.total_size == 0 {
+        return Err(LauncherError::InvalidFormat(
+            "Manifest có tổng dung lượng (total_size) bằng 0, không hợp lệ.".to_string(),
+        ));
+    }
+    let full_sha = manifest.sha256.trim();
+    if !full_sha.is_empty() && !is_valid_sha256_hex(full_sha) {
+        return Err(LauncherError::InvalidFormat(
+            "Mã SHA-256 tổng thể trong manifest không đúng định dạng 64 ký tự hex.".to_string(),
+        ));
+    }
+    if manifest.parts.is_empty() {
+        return Err(LauncherError::InvalidFormat(
+            "Manifest không chứa danh sách phần tải nào (parts rỗng).".to_string(),
+        ));
+    }
+
+    for (idx, part) in manifest.parts.iter().enumerate() {
+        if !is_safe_manifest_part_filename(&part.file) {
+            return Err(LauncherError::InvalidFormat(format!(
+                "Tên tệp phần thứ {} trong manifest không hợp lệ hoặc không an toàn: '{}'.",
+                idx + 1,
+                part.file
+            )));
+        }
+        if part.size == 0 {
+            return Err(LauncherError::InvalidFormat(format!(
+                "Phần '{}' trong manifest có kích thước bằng 0, không hợp lệ.",
+                part.file
+            )));
+        }
+        let part_sha = part.sha256.trim();
+        if !part_sha.is_empty() && !is_valid_sha256_hex(part_sha) {
+            return Err(LauncherError::InvalidFormat(format!(
+                "Mã SHA-256 của phần '{}' trong manifest không đúng định dạng 64 ký tự hex.",
+                part.file
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn format_manifest_http_error(status: reqwest::StatusCode, context: &str) -> LauncherError {
+    match status.as_u16() {
+        401 => LauncherError::Network(format!(
+            "Không có quyền xác thực khi tải {context} (HTTP 401). Vui lòng kiểm tra lại GitHub Token."
+        )),
+        403 => LauncherError::Network(format!(
+            "Bị từ chối truy cập hoặc đã vượt giới hạn tốc độ khi tải {context} (HTTP 403). Nếu là repo private hoặc hết rate limit, hãy kiểm tra/thêm GitHub Token."
+        )),
+        404 => LauncherError::NotFound(format!(
+            "Không tìm thấy {context} (HTTP 404). Kiểm tra lại tên repo, nhánh hoặc đường dẫn manifest."
+        )),
+        _ => LauncherError::Network(format!(
+            "Máy chủ trả về HTTP {status} khi tải {context}."
+        )),
+    }
+}
+
+async fn fetch_manifest_from_origin(
+    origin: &ManifestOrigin,
+    token: Option<&str>,
+    proxy_url: Option<&str>,
+) -> LauncherResult<TerrariaBranchManifest> {
+    let client = build_http_client(proxy_url)?;
+    let spec = origin.manifest_request(token);
+    let mut req = client.get(&spec.url);
+    if let Some(accept) = spec.accept_header {
+        req = req.header("Accept", accept);
+    }
+    if let Some(tok) = spec.bearer_token {
+        req = req.bearer_auth(tok);
+    }
+
+    let resp = req.send().await.map_err(|e| {
+        LauncherError::Network(format!(
+            "Lỗi kết nối khi tải {TERRARIA_MANIFEST_FILENAME}: {e}"
+        ))
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(format_manifest_http_error(
+            resp.status(),
+            TERRARIA_MANIFEST_FILENAME,
+        ));
+    }
+
+    let raw_text = resp.text().await.map_err(|e| {
+        LauncherError::Network(format!(
+            "Không thể đọc nội dung {TERRARIA_MANIFEST_FILENAME}: {e}"
+        ))
+    })?;
+
+    let manifest: TerrariaBranchManifest =
+        serde_json::from_str(raw_text.trim_start_matches('\u{feff}')).map_err(|e| {
+            LauncherError::InvalidFormat(format!(
+                "Nội dung {TERRARIA_MANIFEST_FILENAME} không phải JSON hợp lệ: {e}"
+            ))
+        })?;
+
+    validate_branch_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+pub async fn fetch_terraria_branch_manifest(
+    source: &str,
+    github_token: Option<&str>,
+    proxy_url: Option<&str>,
+) -> LauncherResult<TerrariaBranchManifest> {
+    let trimmed = source.trim();
+    let origin = ManifestOrigin::resolve(trimmed).ok_or_else(|| {
+        LauncherError::InvalidInput(
+            "Nguồn manifest không hợp lệ (hỗ trợ owner/repo#branch[:subdir], GitHub /tree/branch hoặc URL kết thúc bằng terraria-manifest.json)."
+                .to_string(),
+        )
+    })?;
+    let token = github_token.map(str::trim).filter(|s| !s.is_empty());
+    fetch_manifest_from_origin(&origin, token, proxy_url).await
+}
+
+fn installed_terraria_receipt_path(paths: &LauncherPaths) -> PathBuf {
+    paths.data_dir.join(TERRARIA_RECEIPT_FILENAME)
+}
+
+pub fn load_installed_terraria_receipt(paths: &LauncherPaths) -> Option<InstalledTerrariaReceipt> {
+    if !paths.terraria_exe().is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(installed_terraria_receipt_path(paths)).ok()?;
+    serde_json::from_str::<InstalledTerrariaReceipt>(raw.trim_start_matches('\u{feff}')).ok()
+}
+
+fn save_installed_terraria_receipt(
+    paths: &LauncherPaths,
+    receipt: &InstalledTerrariaReceipt,
+) -> LauncherResult<()> {
+    fs::create_dir_all(&paths.data_dir)?;
+    let json = serde_json::to_string_pretty(receipt)?;
+    tl_core::config::write_atomic(&installed_terraria_receipt_path(paths), json.as_bytes())?;
+    Ok(())
+}
+
+fn remove_installed_terraria_receipt(paths: &LauncherPaths) {
+    let _ = fs::remove_file(installed_terraria_receipt_path(paths));
+}
+
+fn sanitize_archive_stem(archive_name: &str) -> String {
+    let base = archive_name
+        .trim()
+        .strip_suffix(".zip")
+        .or_else(|| archive_name.trim().strip_suffix(".ZIP"))
+        .unwrap_or_else(|| archive_name.trim());
+    let cleaned: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    if cleaned.is_empty() {
+        "Terraria".to_string()
+    } else {
+        cleaned
+    }
+}
+
+async fn assemble_multipart_stream<S, B, F, Fut>(
+    manifest: &TerrariaBranchManifest,
+    dest_part: &Path,
+    on_progress: &ProgressCallback,
+    mut open_part_stream: F,
+) -> LauncherResult<String>
+where
+    S: futures_util::Stream<Item = LauncherResult<B>>,
+    B: AsRef<[u8]>,
+    F: FnMut(usize, &TerrariaManifestPart) -> Fut,
+    Fut: std::future::Future<Output = LauncherResult<S>>,
+{
+    validate_branch_manifest(manifest)?;
+
+    if let Some(parent) = dest_part.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut out_file = tokio::fs::File::create(dest_part).await?;
+    let mut full_hasher = Sha256::new();
+    let total_size = manifest.total_size;
+    let total_parts = manifest.parts.len();
+    let version = manifest.version.trim();
+    let mut base_downloaded: u64 = 0;
+    let mut last_reported: u64 = 0;
+
+    for (idx, part) in manifest.parts.iter().enumerate() {
+        let stage = format!("Đang tải Terraria {version} ({}/{total_parts})...", idx + 1);
+        emit_progress(
+            on_progress,
+            InstallTarget::Terraria,
+            &stage,
+            base_downloaded,
+            Some(total_size),
+        );
+
+        let stream = open_part_stream(idx, part).await?;
+        tokio::pin!(stream);
+
+        let mut part_hasher = Sha256::new();
+        let mut part_written: u64 = 0;
+
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            let bytes = chunk.as_ref();
+            if bytes.is_empty() {
+                continue;
+            }
+            out_file.write_all(bytes).await?;
+            part_hasher.update(bytes);
+            full_hasher.update(bytes);
+            part_written += bytes.len() as u64;
+
+            let current_total = base_downloaded + part_written;
+            if current_total.saturating_sub(last_reported) >= DOWNLOAD_PROGRESS_STEP_BYTES
+                || current_total >= total_size
+            {
+                last_reported = current_total;
+                emit_progress(
+                    on_progress,
+                    InstallTarget::Terraria,
+                    &stage,
+                    current_total,
+                    Some(total_size),
+                );
+            }
+        }
+
+        if part_written != part.size {
+            return Err(LauncherError::InvalidFormat(format!(
+                "Kích thước phần '{}' không khớp manifest (nhận {part_written} byte, kỳ vọng {} byte).",
+                part.file, part.size
+            )));
+        }
+
+        let expected_part_sha = part.sha256.trim();
+        if !expected_part_sha.is_empty() {
+            let actual_part_sha = hex::encode(part_hasher.finalize());
+            if !actual_part_sha.eq_ignore_ascii_case(expected_part_sha) {
+                return Err(LauncherError::InvalidFormat(format!(
+                    "Mã kiểm tra SHA-256 của phần '{}' không khớp (nhận {actual_part_sha}, kỳ vọng {}).",
+                    part.file,
+                    expected_part_sha.to_ascii_lowercase()
+                )));
+            }
+        }
+
+        base_downloaded += part_written;
+    }
+
+    out_file.flush().await?;
+    drop(out_file);
+
+    emit_progress(
+        on_progress,
+        InstallTarget::Terraria,
+        format!("Đang xác minh gói Terraria {version}..."),
+        base_downloaded,
+        Some(total_size.max(base_downloaded)),
+    );
+
+    let full_hash_hex = hex::encode(full_hasher.finalize());
+    let expected_full_sha = manifest.sha256.trim();
+    if !expected_full_sha.is_empty() && !full_hash_hex.eq_ignore_ascii_case(expected_full_sha) {
+        return Err(LauncherError::InvalidFormat(format!(
+            "Mã kiểm tra SHA-256 tổng thể của gói '{}' không khớp (nhận {full_hash_hex}, kỳ vọng {}).",
+            manifest.archive_name,
+            expected_full_sha.to_ascii_lowercase()
+        )));
+    }
+
+    Ok(full_hash_hex)
+}
+
+async fn install_terraria_from_manifest_streams<S, B, F, Fut>(
+    paths: &LauncherPaths,
+    source: &str,
+    manifest: &TerrariaBranchManifest,
+    on_progress: ProgressCallback,
+    open_part_stream: F,
+) -> LauncherResult<String>
+where
+    S: futures_util::Stream<Item = LauncherResult<B>>,
+    B: AsRef<[u8]>,
+    F: FnMut(usize, &TerrariaManifestPart) -> Fut,
+    Fut: std::future::Future<Output = LauncherResult<S>>,
+{
+    let cache_dir = paths.data_dir.join("cache");
+    fs::create_dir_all(&cache_dir)?;
+    let archive_stem = sanitize_archive_stem(&manifest.archive_name);
+    let part_path = cache_dir.join(format!("{archive_stem}-{}.zip.part", uuid::Uuid::new_v4()));
+    let _part_guard = TempFileGuard::new(part_path.clone());
+
+    let full_sha256 =
+        assemble_multipart_stream(manifest, &part_path, &on_progress, open_part_stream).await?;
+
+    let version = manifest.version.trim();
+    let extracted_top = extract_zip_safely_blocking(
+        part_path,
+        paths.terraria_dir.clone(),
+        InstallTarget::Terraria,
+        format!("Đang giải nén Terraria {version}..."),
+        on_progress,
+    )
+    .await?;
+
+    verify_terraria_installed(paths, &extracted_top)?;
+
+    let receipt = InstalledTerrariaReceipt {
+        version: version.to_string(),
+        sha256: full_sha256,
+        source: source.trim().to_string(),
+    };
+    save_installed_terraria_receipt(paths, &receipt)?;
+
+    Ok(format!(
+        "Đã cài đặt / cập nhật Terraria {version} vào {}.",
+        paths.terraria_dir.display()
+    ))
+}
+
+async fn install_terraria_from_branch_source(
+    paths: &LauncherPaths,
+    origin: &ManifestOrigin,
+    trimmed_source: &str,
+    token: Option<&str>,
+    proxy_url: Option<&str>,
+    on_progress: ProgressCallback,
+) -> LauncherResult<String> {
+    emit_progress(
+        &on_progress,
+        InstallTarget::Terraria,
+        format!("Đang kiểm tra {TERRARIA_MANIFEST_FILENAME}..."),
+        0,
+        None,
+    );
+
+    let manifest = fetch_manifest_from_origin(origin, token, proxy_url).await?;
+    let client = build_download_client(proxy_url)?;
+    let total_parts = manifest.parts.len();
+
+    install_terraria_from_manifest_streams(
+        paths,
+        trimmed_source,
+        &manifest,
+        on_progress,
+        |idx, part| {
+            let req_spec = origin.part_request(&part.file, token);
+            let client = client.clone();
+            let part_file = part.file.clone();
+            async move {
+                let mut req = client.get(&req_spec.url);
+                if let Some(accept) = req_spec.accept_header {
+                    req = req.header("Accept", accept);
+                }
+                if let Some(tok) = req_spec.bearer_token {
+                    req = req.bearer_auth(tok);
+                }
+
+                let resp = req.send().await.map_err(|e| {
+                    LauncherError::Network(format!(
+                        "Lỗi kết nối khi tải phần '{}' ({}/{}): {e}",
+                        part_file,
+                        idx + 1,
+                        total_parts
+                    ))
+                })?;
+
+                if !resp.status().is_success() {
+                    return Err(format_manifest_http_error(
+                        resp.status(),
+                        &format!("phần '{}' ({}/{})", part_file, idx + 1, total_parts),
+                    ));
+                }
+
+                let label = format!("phần '{}' ({}/{})", part_file, idx + 1, total_parts);
+                let stream = resp.bytes_stream().map(move |res| {
+                    res.map_err(|e| {
+                        LauncherError::Network(format!("Lỗi đọc dữ liệu khi tải {label}: {e}"))
+                    })
+                });
+                Ok(stream)
+            }
+        },
+    )
+    .await
 }
 
 struct ResolvedTerrariaDownload {
@@ -784,11 +1531,24 @@ pub async fn install_terraria_from_source(
     let trimmed_source = source.trim();
     if trimmed_source.is_empty() {
         return Err(LauncherError::InvalidInput(
-            "Vui lòng nhập nguồn tải Terraria (repo GitHub hoặc URL .zip).".to_string(),
+            "Vui lòng nhập nguồn tải Terraria (repo GitHub, nhánh manifest hoặc URL .zip)."
+                .to_string(),
         ));
     }
 
     let token = github_token.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(origin) = ManifestOrigin::resolve(trimmed_source) {
+        return install_terraria_from_branch_source(
+            paths,
+            &origin,
+            trimmed_source,
+            token,
+            proxy_url,
+            on_progress,
+        )
+        .await;
+    }
 
     let resolved = if let Some((owner_repo, tag_opt)) = parse_github_release_spec(trimmed_source) {
         emit_progress(
@@ -802,7 +1562,7 @@ pub async fn install_terraria_from_source(
     } else {
         if !trimmed_source.starts_with("http://") && !trimmed_source.starts_with("https://") {
             return Err(LauncherError::InvalidInput(
-                "Nguồn tải Terraria phải là repo GitHub (owner/repo) hoặc URL http:// / https://."
+                "Nguồn tải Terraria phải là repo GitHub (owner/repo, owner/repo#branch) hoặc URL http:// / https://."
                     .to_string(),
             ));
         }
@@ -852,6 +1612,7 @@ pub async fn install_terraria_from_source(
     .await?;
 
     verify_terraria_installed(paths, &extracted_top)?;
+    remove_installed_terraria_receipt(paths);
 
     Ok(format!(
         "Đã cài đặt Terraria vào {}.",
@@ -880,6 +1641,7 @@ pub fn install_terraria_from_local_zip(
     )?;
 
     verify_terraria_installed(paths, &extracted_top)?;
+    remove_installed_terraria_receipt(paths);
 
     Ok(format!(
         "Đã giải nén và cài đặt Terraria vào {}.",
@@ -1467,5 +2229,512 @@ mod tests {
         let (cb, _) = record_progress();
         extract_zip_safely(&zip_path, &dotnet_dir, InstallTarget::DotNet8, "extract", &cb).unwrap();
         assert!(dotnet_dir.join("host/fxr/8.0.0/hostfxr.dll").is_file());
+    }
+
+    fn build_in_memory_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            for &(name, data) in entries {
+                if name.ends_with('/') {
+                    writer.add_directory(name, options).unwrap();
+                } else {
+                    writer.start_file(name, options).unwrap();
+                    writer.write_all(data).unwrap();
+                }
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn build_two_part_manifest(zip_bytes: &[u8]) -> (TerrariaBranchManifest, Vec<u8>, Vec<u8>) {
+        let split_at = zip_bytes.len() / 2;
+        let part1 = zip_bytes[..split_at].to_vec();
+        let part2 = zip_bytes[split_at..].to_vec();
+        let manifest = TerrariaBranchManifest {
+            version: "1.4.5.8".to_string(),
+            archive_name: "Terraria_v1.4.5.8.zip".to_string(),
+            total_size: zip_bytes.len() as u64,
+            sha256: sha256_hex(zip_bytes),
+            chunk_size: split_at as u64,
+            parts: vec![
+                TerrariaManifestPart {
+                    file: "Terraria.zip.001".to_string(),
+                    size: part1.len() as u64,
+                    sha256: sha256_hex(&part1),
+                },
+                TerrariaManifestPart {
+                    file: "Terraria.zip.002".to_string(),
+                    size: part2.len() as u64,
+                    sha256: sha256_hex(&part2),
+                },
+            ],
+        };
+        (manifest, part1, part2)
+    }
+
+    #[test]
+    fn parse_github_branch_spec_handles_all_supported_and_negative_inputs() {
+        assert_eq!(
+            parse_github_branch_spec("owner/repo#terraria-game"),
+            Some(("owner/repo".to_string(), "terraria-game".to_string(), None))
+        );
+        assert_eq!(
+            parse_github_branch_spec("  PhamTriHien/TriHienKun_Terraria_Laucher#terraria-game  "),
+            Some((
+                "PhamTriHien/TriHienKun_Terraria_Laucher".to_string(),
+                "terraria-game".to_string(),
+                None
+            ))
+        );
+        assert_eq!(
+            parse_github_branch_spec("owner/repo#branch:subdir"),
+            Some((
+                "owner/repo".to_string(),
+                "branch".to_string(),
+                Some("subdir".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_github_branch_spec("owner/repo#branch:/nested/subdir/"),
+            Some((
+                "owner/repo".to_string(),
+                "branch".to_string(),
+                Some("nested/subdir".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_github_branch_spec("owner/repo#branch:"),
+            Some(("owner/repo".to_string(), "branch".to_string(), None))
+        );
+        assert_eq!(
+            parse_github_branch_spec("owner/repo#branch:///"),
+            Some(("owner/repo".to_string(), "branch".to_string(), None))
+        );
+        assert_eq!(
+            parse_github_branch_spec("owner/repo#release/v1.4.5:dist"),
+            Some((
+                "owner/repo".to_string(),
+                "release/v1.4.5".to_string(),
+                Some("dist".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_github_branch_spec("https://github.com/owner/repo/tree/terraria-game"),
+            Some(("owner/repo".to_string(), "terraria-game".to_string(), None))
+        );
+        assert_eq!(
+            parse_github_branch_spec("https://www.github.com/owner/repo/tree/feature/sub/"),
+            Some(("owner/repo".to_string(), "feature/sub".to_string(), None))
+        );
+
+        assert_eq!(parse_github_branch_spec("owner/repo"), None);
+        assert_eq!(parse_github_branch_spec("owner/repo@v1.4.5.8"), None);
+        assert_eq!(parse_github_branch_spec("https://github.com/owner/repo"), None);
+        assert_eq!(
+            parse_github_branch_spec("https://github.com/owner/repo/releases/tag/v1.4.5.8"),
+            None
+        );
+        assert_eq!(
+            parse_github_branch_spec("https://example.com/Terraria.zip"),
+            None
+        );
+        assert_eq!(
+            parse_github_branch_spec("https://example.com/terraria-manifest.json"),
+            None
+        );
+        assert_eq!(parse_github_branch_spec("owner/repo#"), None);
+        assert_eq!(parse_github_branch_spec("/repo#branch"), None);
+        assert_eq!(parse_github_branch_spec("owner/#branch"), None);
+        assert_eq!(parse_github_branch_spec("owner/repo#my branch"), None);
+        assert_eq!(parse_github_branch_spec("owner/repo#branch@tag"), None);
+        assert_eq!(parse_github_branch_spec("owner/repo#branch?x=1"), None);
+        assert_eq!(parse_github_branch_spec("owner/repo#branch:../evil"), None);
+        assert_eq!(parse_github_branch_spec("owner/repo#../evil"), None);
+        assert_eq!(
+            parse_github_branch_spec("https://github.com/owner/repo/tree/"),
+            None
+        );
+        assert_eq!(
+            parse_github_branch_spec("https://github.com/owner/repo/tree/../evil"),
+            None
+        );
+        assert_eq!(
+            parse_github_branch_spec("https://github.com/owner/repo/tree/branch?x=1"),
+            None
+        );
+        assert_eq!(
+            parse_github_branch_spec("https://gitlab.com/owner/repo/tree/main"),
+            None
+        );
+    }
+
+    #[test]
+    fn manifest_origin_builds_expected_github_and_direct_urls() {
+        let public_origin = ManifestOrigin::resolve("owner/repo#terraria-game").unwrap();
+        let pub_manifest = public_origin.manifest_request(None);
+        assert_eq!(
+            pub_manifest.url,
+            "https://raw.githubusercontent.com/owner/repo/terraria-game/terraria-manifest.json"
+        );
+        assert_eq!(pub_manifest.accept_header, None);
+        assert_eq!(pub_manifest.bearer_token, None);
+
+        let subdir_origin = ManifestOrigin::resolve("owner/repo#main:bundle/win64").unwrap();
+        let priv_manifest = subdir_origin.manifest_request(Some("tok_123"));
+        assert_eq!(
+            priv_manifest.url,
+            "https://api.github.com/repos/owner/repo/contents/bundle/win64/terraria-manifest.json?ref=main"
+        );
+        assert_eq!(
+            priv_manifest.accept_header,
+            Some("application/vnd.github.raw+json")
+        );
+        assert_eq!(priv_manifest.bearer_token.as_deref(), Some("tok_123"));
+
+        let priv_part = subdir_origin.part_request("Terraria.zip.001", Some("tok_123"));
+        assert_eq!(
+            priv_part.url,
+            "https://api.github.com/repos/owner/repo/contents/bundle/win64/Terraria.zip.001?ref=main"
+        );
+        assert_eq!(
+            priv_part.accept_header,
+            Some("application/vnd.github.raw+json")
+        );
+        assert_eq!(priv_part.bearer_token.as_deref(), Some("tok_123"));
+
+        assert!(ManifestOrigin::resolve("https://example.com/not-terraria-manifest.json").is_none());
+        let direct =
+            ManifestOrigin::resolve("https://cdn.example.com/dl/terraria-manifest.json?v=1#top")
+                .unwrap();
+        assert_eq!(
+            direct.manifest_request(Some("tok_123")).url,
+            "https://cdn.example.com/dl/terraria-manifest.json?v=1"
+        );
+        assert_eq!(direct.manifest_request(Some("tok_123")).bearer_token, None);
+        assert_eq!(
+            direct.part_request("Terraria.zip.001", None).url,
+            "https://cdn.example.com/dl/Terraria.zip.001"
+        );
+    }
+
+    #[test]
+    fn validate_branch_manifest_rejects_unsafe_and_malformed_manifests() {
+        let valid_hash = "a".repeat(64);
+        let valid = TerrariaBranchManifest {
+            version: "1.4.5.8".to_string(),
+            archive_name: "Terraria.zip".to_string(),
+            total_size: 1024,
+            sha256: valid_hash.clone(),
+            chunk_size: 512,
+            parts: vec![TerrariaManifestPart {
+                file: "Terraria.zip.001".to_string(),
+                size: 1024,
+                sha256: valid_hash,
+            }],
+        };
+        assert!(validate_branch_manifest(&valid).is_ok());
+
+        let mut empty_parts = valid.clone();
+        empty_parts.parts.clear();
+        assert!(matches!(
+            validate_branch_manifest(&empty_parts),
+            Err(LauncherError::InvalidFormat(_))
+        ));
+
+        let mut zero_total = valid.clone();
+        zero_total.total_size = 0;
+        assert!(matches!(
+            validate_branch_manifest(&zero_total),
+            Err(LauncherError::InvalidFormat(_))
+        ));
+
+        let mut empty_ver = valid.clone();
+        empty_ver.version = "   ".to_string();
+        assert!(matches!(
+            validate_branch_manifest(&empty_ver),
+            Err(LauncherError::InvalidFormat(_))
+        ));
+
+        for bad_file in ["../escape", "sub/part.001", r"sub\part.001", "a..b", ".", ""] {
+            let mut m = valid.clone();
+            m.parts[0].file = bad_file.to_string();
+            assert!(
+                matches!(
+                    validate_branch_manifest(&m),
+                    Err(LauncherError::InvalidFormat(_))
+                ),
+                "expected rejection for part file '{bad_file}'"
+            );
+        }
+
+        let mut bad_part_sha = valid.clone();
+        bad_part_sha.parts[0].sha256 = "not-valid-hex".to_string();
+        assert!(matches!(
+            validate_branch_manifest(&bad_part_sha),
+            Err(LauncherError::InvalidFormat(_))
+        ));
+
+        let mut zero_part_size = valid;
+        zero_part_size.parts[0].size = 0;
+        assert!(matches!(
+            validate_branch_manifest(&zero_part_size),
+            Err(LauncherError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn multipart_assembly_verifies_sha256_extracts_and_manages_receipt() {
+        let zip_bytes = build_in_memory_zip(&[
+            ("Terraria/", b""),
+            ("Terraria/Terraria.exe", b"MZ-TERRARIA-1458"),
+            ("Terraria/Content/Images/Logo.png", b"PNG-CHUNKED"),
+        ]);
+        let (manifest, part1, part2) = build_two_part_manifest(&zip_bytes);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let guard = TempDirGuard::new("tl_gi_multipart_ok");
+            let paths = guard.paths();
+            let (cb, log) = record_progress();
+            let parts_data = [part1.clone(), part2.clone()];
+
+            let msg = install_terraria_from_manifest_streams(
+                &paths,
+                "owner/repo#terraria-game",
+                &manifest,
+                cb,
+                |idx, _part| {
+                    let data = parts_data[idx].clone();
+                    async move {
+                        let mid = data.len() / 2;
+                        let chunks = vec![Ok(data[..mid].to_vec()), Ok(data[mid..].to_vec())];
+                        Ok(futures_util::stream::iter(chunks))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(msg.contains("1.4.5.8"));
+            assert!(paths.terraria_exe().is_file());
+            assert_eq!(
+                fs::read(paths.terraria_dir.join("Content/Images/Logo.png")).unwrap(),
+                b"PNG-CHUNKED"
+            );
+
+            let receipt = load_installed_terraria_receipt(&paths).unwrap();
+            assert_eq!(
+                receipt,
+                InstalledTerrariaReceipt {
+                    version: "1.4.5.8".to_string(),
+                    sha256: manifest.sha256.clone(),
+                    source: "owner/repo#terraria-game".to_string(),
+                }
+            );
+
+            let events = log.lock().unwrap();
+            assert!(events.iter().any(|e| e.stage.contains("(1/2)")));
+            assert!(events.iter().any(|e| e.stage.contains("(2/2)")));
+            assert_eq!(events.last().unwrap().fraction(), Some(1.0));
+
+            fs::write(installed_terraria_receipt_path(&paths), "{corrupt json").unwrap();
+            assert_eq!(load_installed_terraria_receipt(&paths), None);
+
+            save_installed_terraria_receipt(&paths, &receipt).unwrap();
+            assert_eq!(load_installed_terraria_receipt(&paths), Some(receipt));
+            fs::remove_file(paths.terraria_exe()).unwrap();
+            assert_eq!(load_installed_terraria_receipt(&paths), None);
+        });
+
+        rt.block_on(async {
+            let guard = TempDirGuard::new("tl_gi_multipart_bad_hash");
+            let paths = guard.paths();
+            let (cb, _) = record_progress();
+            let mut corrupted_part2 = part2.clone();
+            corrupted_part2[0] ^= 0xFF;
+            let parts_data = [part1.clone(), corrupted_part2];
+
+            let err = install_terraria_from_manifest_streams(
+                &paths,
+                "owner/repo#terraria-game",
+                &manifest,
+                cb,
+                |idx, _part| {
+                    let data = parts_data[idx].clone();
+                    async move {
+                        Ok(futures_util::stream::iter(vec![Ok(data)]))
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(err, LauncherError::InvalidFormat(_)));
+            assert!(err.to_string().contains("Terraria.zip.002"));
+            assert!(!paths.terraria_exe().exists());
+            assert_eq!(load_installed_terraria_receipt(&paths), None);
+        });
+
+        rt.block_on(async {
+            let guard = TempDirGuard::new("tl_gi_multipart_bad_full_hash");
+            let paths = guard.paths();
+            let (cb, _) = record_progress();
+            let mut bad_full_manifest = manifest.clone();
+            bad_full_manifest.sha256 = "0".repeat(64);
+            let parts_data = [part1, part2];
+
+            let err = install_terraria_from_manifest_streams(
+                &paths,
+                "owner/repo#terraria-game",
+                &bad_full_manifest,
+                cb,
+                |idx, _part| {
+                    let data = parts_data[idx].clone();
+                    async move { Ok(futures_util::stream::iter(vec![Ok(data)])) }
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(err, LauncherError::InvalidFormat(_)));
+            assert!(err.to_string().contains("SHA-256"));
+            assert!(!paths.terraria_exe().exists());
+        });
+    }
+
+    #[test]
+    fn fetch_and_install_from_local_manifest_http_server_end_to_end() {
+        let zip_bytes = build_in_memory_zip(&[
+            ("Terraria.exe", b"MZ-HTTP-TERRARIA"),
+            ("Content/Data.xnb", b"XNB-HTTP"),
+        ]);
+        let (manifest, part1, part2) = build_two_part_manifest(&zip_bytes);
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let server = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let manifest_json = manifest_json.clone();
+                    let part1 = part1.clone();
+                    let part2 = part2.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        let req_text = String::from_utf8_lossy(&buf[..n]);
+                        let target_path = req_text
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let path_only = target_path.split('?').next().unwrap_or(target_path);
+
+                        let (status, body): (&str, Vec<u8>) = match path_only {
+                            "/game/terraria-manifest.json" => ("200 OK", manifest_json),
+                            "/game/Terraria.zip.001" => ("200 OK", part1),
+                            "/game/Terraria.zip.002" => ("200 OK", part2),
+                            "/bad/terraria-manifest.json" => ("200 OK", b"{not-json".to_vec()),
+                            "/unauth/terraria-manifest.json" => {
+                                ("401 Unauthorized", b"unauthorized".to_vec())
+                            }
+                            "/forbidden/terraria-manifest.json" => {
+                                ("403 Forbidden", b"forbidden".to_vec())
+                            }
+                            _ => ("404 Not Found", b"not found".to_vec()),
+                        };
+
+                        let header = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(header.as_bytes()).await;
+                        let _ = socket.write_all(&body).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+
+            let manifest_url = format!("http://127.0.0.1:{port}/game/terraria-manifest.json?v=1");
+            let fetched = fetch_terraria_branch_manifest(&manifest_url, None, None)
+                .await
+                .unwrap();
+            assert_eq!(fetched, manifest);
+
+            let missing_url = format!("http://127.0.0.1:{port}/missing/terraria-manifest.json");
+            let missing_err = fetch_terraria_branch_manifest(&missing_url, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(missing_err, LauncherError::NotFound(_)));
+            assert!(missing_err.to_string().contains("404"));
+
+            let unauth_url = format!("http://127.0.0.1:{port}/unauth/terraria-manifest.json");
+            let unauth_err = fetch_terraria_branch_manifest(&unauth_url, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(unauth_err, LauncherError::Network(_)));
+            assert!(unauth_err.to_string().contains("401"));
+
+            let forbidden_url =
+                format!("http://127.0.0.1:{port}/forbidden/terraria-manifest.json");
+            let forbidden_err = fetch_terraria_branch_manifest(&forbidden_url, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(forbidden_err, LauncherError::Network(_)));
+            assert!(forbidden_err.to_string().contains("403"));
+
+            let bad_url = format!("http://127.0.0.1:{port}/bad/terraria-manifest.json");
+            let bad_err = fetch_terraria_branch_manifest(&bad_url, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(bad_err, LauncherError::InvalidFormat(_)));
+
+            let guard = TempDirGuard::new("tl_gi_http_manifest_install");
+            let paths = guard.paths();
+            let (cb, _) = record_progress();
+
+            let msg = install_terraria_from_source(&paths, &manifest_url, None, None, cb.clone())
+                .await
+                .unwrap();
+            assert!(msg.contains("1.4.5.8"));
+            assert!(paths.terraria_exe().is_file());
+            assert_eq!(
+                fs::read(paths.terraria_dir.join("Content/Data.xnb")).unwrap(),
+                b"XNB-HTTP"
+            );
+
+            let receipt = load_installed_terraria_receipt(&paths).unwrap();
+            assert_eq!(receipt.version, "1.4.5.8");
+            assert_eq!(receipt.sha256, manifest.sha256);
+            assert_eq!(receipt.source, manifest_url);
+
+            let local_zip = guard.0.join("override.zip");
+            write_test_zip(&local_zip, &[("Terraria.exe", b"MZ-LOCAL-ZIP")]);
+            install_terraria_from_local_zip(&paths, &local_zip, cb).unwrap();
+            assert_eq!(load_installed_terraria_receipt(&paths), None);
+
+            server.abort();
+        });
     }
 }

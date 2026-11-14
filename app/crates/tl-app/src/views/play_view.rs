@@ -387,6 +387,7 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
             let mut do_tml = false;
             let mut do_dotnet = false;
             let mut do_xna = false;
+            let mut do_terraria_url = false;
             let mut do_zip = false;
             let mut open_settings = false;
             let mut do_refresh = false;
@@ -405,6 +406,16 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
                     }
                     if missing_xna && accent_button(ui, "Cài XNA 4.0", ACCENT_AMBER).clicked() {
                         do_xna = true;
+                    }
+                    if missing_terraria
+                        && primary_button(ui, "Tải & Cài Terraria")
+                            .on_hover_text(format!(
+                                "Tải trực tiếp từ nguồn: {}",
+                                state.effective_terraria_source()
+                            ))
+                            .clicked()
+                    {
+                        do_terraria_url = true;
                     }
                     if missing_terraria && accent_button(ui, "Cài từ file .zip", ACCENT_CYAN).clicked()
                     {
@@ -427,6 +438,9 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui) {
             }
             if do_xna {
                 state.install_xna();
+            }
+            if do_terraria_url {
+                state.install_terraria_url();
             }
             if do_zip {
                 state.pick_and_install_terraria_zip();

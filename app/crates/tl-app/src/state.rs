@@ -1,4 +1,4 @@
-use crate::theme::ACCENT_EMERALD;
+use crate::theme::{format_bytes, ACCENT_EMERALD};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,24 +9,25 @@ use tl_core::{
     activate_modpack, backup_world, create_modpack, delete_modpack, detect_environment,
     list_modpacks, list_world_backups, parse_world_file, restore_world_backup, EnvironmentStatus,
     GameEdition, LauncherConfig, LauncherPaths, ModPackInfo, SavedJoinServer, ServerConfigData,
-    ServerProfile, TmodMetadata, WorldBackupInfo, WorldMetadata,
+    ServerProfile, TmodMetadata, WorldBackupInfo, WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 use tl_runtime::{
     browse_workshop_mods, check_firewall_rule_exists, close_upnp_port, delete_installed_mod,
     delete_staged_workshop_mod, download_and_install_tmod_url, download_and_install_xna,
     download_workshop_mod_via_steamcmd, ensure_firewall_rule, fetch_github_latest_tmod,
-    fetch_tmodloader_releases, fetch_workshop_details, fetch_workshop_image_bytes,
-    import_local_mod_files, install_dotnet8_portable, install_steamcmd_via_winget,
-    install_terraria_from_local_zip, install_terraria_from_source, install_tmodloader_release,
-    install_xna_framework_elevated, launch_game, load_banlist, load_workshop_manifest,
-    open_upnp_port, parse_workshop_id, probe_network_snapshot, probe_tcp_endpoint,
-    record_workshop_install, remove_firewall_rule, save_banlist, scan_installed_mods,
-    scan_staged_workshop_mods, set_mod_enabled, start_bore_tunnel, start_server, ActiveGameProcess,
-    BanEntry, BoreTunnelHandle, GameLaunchOptions, InstallProgress, InstallTarget,
-    InstalledModEntry, NetworkSnapshot, ProgressCallback, RemoteTmodAsset, RepaintHandle,
+    fetch_terraria_branch_manifest, fetch_tmodloader_releases, fetch_workshop_details,
+    fetch_workshop_image_bytes, import_local_mod_files, install_dotnet8_portable,
+    install_steamcmd_via_winget, install_terraria_from_local_zip, install_terraria_from_source,
+    install_tmodloader_release, install_xna_framework_elevated, launch_game, load_banlist,
+    load_installed_terraria_receipt, load_workshop_manifest, open_upnp_port, parse_workshop_id,
+    probe_network_snapshot, probe_tcp_endpoint, record_workshop_install, remove_firewall_rule,
+    save_banlist, scan_installed_mods, scan_staged_workshop_mods, set_mod_enabled,
+    start_bore_tunnel, start_server, ActiveGameProcess, BanEntry, BoreTunnelHandle,
+    GameLaunchOptions, InstallProgress, InstallTarget, InstalledModEntry,
+    InstalledTerrariaReceipt, NetworkSnapshot, ProgressCallback, RemoteTmodAsset, RepaintHandle,
     RunningGameSnapshot, ServerLifecycleState, ServerRuntimeSnapshot, ServerSupervisor,
-    StagedWorkshopMod, TmodLoaderReleaseInfo, TunnelStatus, UpnpLeaseInfo, WorkshopItemDetails,
-    WorkshopManifestRecord, WorkshopQueryResult, WorkshopSort,
+    StagedWorkshopMod, TerrariaBranchManifest, TmodLoaderReleaseInfo, TunnelStatus, UpnpLeaseInfo,
+    WorkshopItemDetails, WorkshopManifestRecord, WorkshopQueryResult, WorkshopSort,
 };
 use tokio::sync::mpsc;
 
@@ -115,6 +116,7 @@ pub enum AppEvent {
     },
     SteamCmdInstalled(Result<String, String>),
     TmlReleasesFetched(Result<Vec<TmodLoaderReleaseInfo>, String>),
+    TerrariaManifestChecked(Result<TerrariaBranchManifest, String>),
     InstallProgress(InstallProgress),
     InstallFinished {
         target: InstallTarget,
@@ -190,6 +192,9 @@ pub struct AppState {
     pub tml_releases: Vec<TmodLoaderReleaseInfo>,
     pub selected_tml_tag: String,
     pub tml_releases_busy: bool,
+    pub terraria_remote_manifest: Option<TerrariaBranchManifest>,
+    pub terraria_installed_receipt: Option<InstalledTerrariaReceipt>,
+    pub terraria_check_busy: bool,
     pub install_busy: bool,
     pub install_progress: Option<InstallProgress>,
     pub install_last_error: Option<String>,
@@ -219,6 +224,7 @@ impl AppState {
         );
         let _ = paths.ensure_dirs();
         let env = detect_environment(&paths, non_empty_opt(&config.custom_steamcmd_path));
+        let terraria_installed_receipt = load_installed_terraria_receipt(&paths);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let repaint_ctx = ctx.clone();
@@ -291,6 +297,9 @@ impl AppState {
             tml_releases: Vec::new(),
             selected_tml_tag: String::new(),
             tml_releases_busy: false,
+            terraria_remote_manifest: None,
+            terraria_installed_receipt,
+            terraria_check_busy: false,
             install_busy: false,
             install_progress: None,
             install_last_error: None,
@@ -353,6 +362,7 @@ impl AppState {
             &self.paths,
             non_empty_opt(&self.config.custom_steamcmd_path),
         );
+        self.terraria_installed_receipt = load_installed_terraria_receipt(&self.paths);
         self.refresh_worlds_and_backups();
         self.refresh_mods_and_packs();
         self.refresh_banlist();
@@ -614,6 +624,36 @@ impl AppState {
                         }
                     }
                 }
+                AppEvent::TerrariaManifestChecked(res) => {
+                    self.terraria_check_busy = false;
+                    match res {
+                        Ok(manifest) => {
+                            let ver = manifest.version.clone();
+                            let size = manifest.total_size;
+                            self.terraria_remote_manifest = Some(manifest);
+                            if !self.install_busy {
+                                if size > 0 {
+                                    self.notify_ok(format!(
+                                        "Đã kiểm tra nguồn Terraria: bản {ver} ({}).",
+                                        format_bytes(size)
+                                    ));
+                                } else {
+                                    self.notify_ok(format!(
+                                        "Đã kiểm tra nguồn Terraria: bản {ver}."
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.terraria_remote_manifest = None;
+                            if !self.install_busy {
+                                self.notify_err(format!(
+                                    "Không kiểm tra được nguồn Terraria: {e}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 AppEvent::InstallProgress(prog) => {
                     self.install_progress = Some(prog);
                 }
@@ -716,6 +756,7 @@ impl AppState {
             || self.bore_handle.is_some()
             || self.install_busy
             || self.tml_releases_busy
+            || self.terraria_check_busy
         {
             ctx.request_repaint_after(Duration::from_millis(800));
         }
@@ -983,18 +1024,36 @@ impl AppState {
         });
     }
 
+    pub fn effective_terraria_source(&self) -> &str {
+        non_empty_opt(&self.config.terraria_install_source)
+            .unwrap_or(DEFAULT_TERRARIA_INSTALL_SOURCE)
+    }
+
+    pub fn refresh_terraria_update_info(&mut self) {
+        if self.terraria_check_busy {
+            return;
+        }
+        self.terraria_check_busy = true;
+        let source = self.effective_terraria_source().to_string();
+        let token = non_empty_opt(&self.config.github_release_token).map(ToString::to_string);
+        let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+        let tx = self.event_tx.clone();
+        let wake = self.repaint.clone();
+        self.rt.spawn(async move {
+            let res = fetch_terraria_branch_manifest(&source, token.as_deref(), proxy.as_deref())
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::TerrariaManifestChecked(res));
+            wake.wake();
+        });
+    }
+
     pub fn install_terraria_url(&mut self) {
         if !self.can_start_install(Some(GameEdition::Vanilla)) {
             return;
         }
+        let source = self.effective_terraria_source().to_string();
         self.save_config();
-        let source = self.config.terraria_install_source.trim().to_string();
-        if source.is_empty() {
-            let msg = "Vui lòng nhập URL .zip hoặc GitHub owner/repo[@tag] trước khi tải Terraria.";
-            self.install_last_error = Some(msg.to_string());
-            self.notify_err(msg);
-            return;
-        }
         self.install_busy = true;
         self.install_last_error = None;
         self.install_progress = Some(InstallProgress {

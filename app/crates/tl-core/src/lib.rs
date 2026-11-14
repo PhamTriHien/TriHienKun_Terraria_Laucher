@@ -11,7 +11,7 @@ pub use binary_parsers::{
 };
 pub use config::{
     GameEdition, LauncherConfig, SavedJoinServer, ServerConfigData, ServerProfile,
-    WorldDifficultyOption, WorldSizeOption,
+    WorldDifficultyOption, WorldSizeOption, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 pub use error::{LauncherError, LauncherResult};
 pub use paths::{

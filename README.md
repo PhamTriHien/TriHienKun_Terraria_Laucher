@@ -27,13 +27,13 @@ C:\TerrariaLauncher\
 1. Mở `TerrariaLauncher.exe` (hoặc build từ `app/` bằng `cargo build --release`).
 2. Nếu máy chưa có game hoặc thiếu thành phần nền, vào tab **Chơi Game** (thanh cảnh báo thiếu thành phần) hoặc tab **Cài đặt -> Cài đặt & Cập nhật Game**:
    - **tModLoader**: tự tải bản phát hành mới nhất (**Ổn định** / **Preview**) từ GitHub Releases và tự cài **.NET 8 Runtime portable** vào `tModLoader\dotnet\` khi cần.
-   - **Terraria (Vanilla)**: cài trực tiếp từ **URL `.zip`**, **GitHub Release** (`owner/repo` hoặc `owner/repo@tag`, có tùy chọn token cho Private repo), hoặc chọn file **`.zip` có sẵn trên máy**.
+   - **Terraria (Vanilla)**: mặc định tự tải và cập nhật từ nhánh [`terraria-game`](https://github.com/PhamTriHien/TriHienKun_Terraria_Laucher/tree/terraria-game) (hỗ trợ kiểm tra bản mới & xác thực SHA-256), hoặc cài từ **nhánh/Release GitHub** (`owner/repo#branch`, `owner/repo[@tag]`), **URL `.zip`**, hoặc chọn file **`.zip` có sẵn trên máy**.
    - **Microsoft XNA Framework 4.0**: nhấn **Cài XNA Framework 4.0** để tải bộ cài chính thức và khởi chạy trình cài đặt với quyền Administrator.
 3. Chọn phiên bản muốn chơi tại tab **Chơi Game**:
    - **tModLoader 2026.9**: dùng `.NET 8` runtime (`tModLoader\dotnet\` hoặc hệ thống), hỗ trợ chọn **ModPack** và quản lý mod trực tiếp.
    - **Terraria 1.4.5.8 (Vanilla)**: cần **Microsoft XNA Framework 4.0**.
 
-> Lưu ý: Repository Git công khai chỉ lưu mã nguồn (`app/`, `README.md`, `.gitignore`), không chứa file game bản quyền hoặc file thực thi đã biên dịch (`Terraria/`, `tModLoader/`, `data/`, `*.exe`).
+> Lưu ý: Nhánh `main` chỉ lưu mã nguồn (`app/`, `README.md`, `.gitignore`); gói cài đặt Terraria v1.4.5.8 được lưu tách biệt ở nhánh orphan `terraria-game` (chia mảnh `<= 90 MiB/phần` kèm `terraria-manifest.json`).
 
 ## Các tính năng chính
 

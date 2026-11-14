@@ -313,23 +313,95 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
 
         subcard_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new("Terraria (Gói .zip hoặc GitHub Release)")
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
+            let is_synced = state.env.terraria_installed
+                && state
+                    .terraria_remote_manifest
+                    .as_ref()
+                    .zip(state.terraria_installed_receipt.as_ref())
+                    .is_some_and(|(m, r)| {
+                        !r.sha256.is_empty() && r.sha256.eq_ignore_ascii_case(&m.sha256)
+                    });
+
+            let terraria_status_pill = if let Some(m) = &state.terraria_remote_manifest {
+                let size_part = if m.total_size > 0 {
+                    format!(" ({})", format_bytes(m.total_size))
+                } else {
+                    String::new()
+                };
+                if !state.env.terraria_installed {
+                    Some((
+                        format!("Có sẵn bản {}{}", m.version, size_part),
+                        ACCENT_AMBER,
+                    ))
+                } else if is_synced {
+                    Some((
+                        format!("Đã đồng bộ bản {}{}", m.version, size_part),
+                        ACCENT_EMERALD,
+                    ))
+                } else {
+                    Some((
+                        format!("Bản trên nguồn: {}{}", m.version, size_part),
+                        ACCENT_CYAN,
+                    ))
+                }
+            } else if state.env.terraria_installed {
+                state
+                    .terraria_installed_receipt
+                    .as_ref()
+                    .map(|rec| (format!("Đã cài bản {}", rec.version), TEXT_MUTED))
+            } else {
+                None
+            };
+
+            let install_btn_label = match &state.terraria_remote_manifest {
+                Some(m) if !m.version.trim().is_empty() && !state.env.terraria_installed => {
+                    format!("Tải & Cài Terraria ({})", m.version)
+                }
+                Some(m) if !m.version.trim().is_empty() && !is_synced => {
+                    format!("Cập nhật Terraria ({})", m.version)
+                }
+                Some(m) if !m.version.trim().is_empty() => {
+                    format!("Cài lại Terraria ({})", m.version)
+                }
+                _ => "Tải & Cài từ nguồn".to_string(),
+            };
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Terraria (Nhánh GitHub, Release hoặc URL .zip)")
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
+                if let Some((text, color)) = terraria_status_pill {
+                    status_pill(ui, &text, color);
+                }
+            });
             ui.add_space(4.0);
 
             let mut config_dirty = false;
+            let mut clear_remote_manifest = false;
+            let mut do_check_update = false;
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Nguồn tải:").color(TEXT_MUTED));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut state.config.terraria_install_source)
                         .desired_width(360.0)
-                        .hint_text("URL .zip hoặc owner/repo[@tag]"),
+                        .hint_text("owner/repo#branch, owner/repo[@tag], hoặc URL .zip"),
                 );
+                if resp.changed() {
+                    clear_remote_manifest = true;
+                }
                 if resp.lost_focus() {
                     config_dirty = true;
+                }
+                if ui
+                    .add_enabled(
+                        !state.terraria_check_busy,
+                        egui::Button::new("Kiểm tra cập nhật"),
+                    )
+                    .clicked()
+                {
+                    do_check_update = true;
                 }
             });
 
@@ -346,8 +418,14 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
                 }
             });
 
-            if config_dirty {
+            if clear_remote_manifest {
+                state.terraria_remote_manifest = None;
+            }
+            if config_dirty || do_check_update {
                 state.save_config();
+            }
+            if do_check_update {
+                state.refresh_terraria_update_info();
             }
 
             ui.add_space(4.0);
@@ -356,7 +434,7 @@ fn render_game_installer_card(state: &mut AppState, ui: &mut egui::Ui) {
             let mut do_save = false;
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if primary_button(ui, "Tải & Cài từ URL/Release").clicked() {
+                    if primary_button(ui, &install_btn_label).clicked() {
                         do_url = true;
                     }
                     if accent_button(ui, "Chọn file .zip trên máy...", ACCENT_CYAN).clicked() {

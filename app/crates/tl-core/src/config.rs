@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
+pub const DEFAULT_TERRARIA_INSTALL_SOURCE: &str =
+    "PhamTriHien/TriHienKun_Terraria_Laucher#terraria-game";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GameEdition {
     Vanilla,
@@ -424,7 +427,7 @@ impl Default for LauncherConfig {
             custom_terraria_dir: String::new(),
             custom_tmodloader_dir: String::new(),
             custom_steamcmd_path: String::new(),
-            terraria_install_source: String::new(),
+            terraria_install_source: DEFAULT_TERRARIA_INSTALL_SOURCE.to_string(),
             github_release_token: String::new(),
             active_server_id: tml_profile.id.clone(),
             servers: vec![tml_profile, vanilla_profile],
@@ -444,6 +447,9 @@ impl LauncherConfig {
             return Self::default();
         };
         let mut parsed: Self = serde_json::from_str(&raw).unwrap_or_default();
+        if parsed.terraria_install_source.trim().is_empty() {
+            parsed.terraria_install_source = DEFAULT_TERRARIA_INSTALL_SOURCE.to_string();
+        }
         if parsed.servers.is_empty() {
             parsed.servers = Self::default().servers;
         }
