@@ -1,0 +1,49 @@
+{
+    "version":  "1.4.5.8",
+    "archive_name":  "Terraria-1.4.5.8.zip",
+    "total_size":  704927586,
+    "sha256":  "e59727cc26f54c95b0765ec78b09e5b66f65a9961f857e1d0eecd217001a4d8e",
+    "chunk_size":  94371840,
+    "parts":  [
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part001",
+                      "size":  94371840,
+                      "sha256":  "7083796b3912d4993096d2e79d2106bdf147555dfce64c1b05e8d407abede73d"
+                  },
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part002",
+                      "size":  94371840,
+                      "sha256":  "cc1253bda4753641e734298229045ca0add130df8a99d10eb8638bf44b58fc62"
+                  },
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part003",
+                      "size":  94371840,
+                      "sha256":  "82f14a88c081baeb3765e077e149c1a5bad484d201aa3496ec641487535fa312"
+                  },
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part004",
+                      "size":  94371840,
+                      "sha256":  "4eb6f21ebc4273f3e61a55f6d55a5bff5d224281784809c580c44563c97af447"
+                  },
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part005",
+                      "size":  94371840,
+                      "sha256":  "67b815921b27478c30097a666ddba7f07f5a8763e3903a77c6211634edd1a4d0"
+                  },
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part006",
+                      "size":  94371840,
+                      "sha256":  "6f6264e558346221d50a7eaf2767fce7e579d3289b55dd0cc0b6ec8559f5573a"
+                  },
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part007",
+                      "size":  94371840,
+                      "sha256":  "63ad872db229fcaee852a8db34cc881943fd17c8835e811691c0bf8bd86f4561"
+                  },
+                  {
+                      "file":  "Terraria-1.4.5.8.zip.part008",
+                      "size":  44324706,
+                      "sha256":  "b8ea74cc507d679f3d04f15fc343d56d0427c87a0a7a5103d1e025b1dd3d3cc1"
+                  }
+              ]
+}
