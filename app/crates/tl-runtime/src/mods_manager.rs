@@ -593,11 +593,16 @@ pub async fn browse_workshop_mods(
     let client = build_http_client(proxy_url)?;
     let page_str = page.to_string();
     let trimmed_query = query.trim();
+    let sort_param = if !trimmed_query.is_empty() && sort == WorkshopSort::Trending {
+        "textsearch"
+    } else {
+        sort.steam_param()
+    };
     let mut params: Vec<(&str, &str)> = vec![
         ("appid", "1281930"),
         ("section", "readytouseitems"),
-        ("browsesort", sort.steam_param()),
-        ("actualsort", sort.steam_param()),
+        ("browsesort", sort_param),
+        ("actualsort", sort_param),
         ("p", &page_str),
         ("numperpage", "12"),
     ];
@@ -699,6 +704,19 @@ pub async fn fetch_workshop_image_bytes(
 
 pub fn parse_workshop_browse_html(html: &str, page: u32) -> WorkshopQueryResult {
     let page = page.max(1);
+    if let Some(ssr_result) = parse_valve_ssr_workshop_browse(html, page) {
+        return ssr_result;
+    }
+
+    let legacy = parse_legacy_workshop_browse_html(html, page);
+    if !legacy.items.is_empty() {
+        return legacy;
+    }
+
+    parse_ssr_dom_cards(html, page)
+}
+
+fn parse_legacy_workshop_browse_html(html: &str, page: u32) -> WorkshopQueryResult {
     let mut items = Vec::new();
     let mut seen_ids = HashSet::new();
     let mut pos = 0usize;
@@ -742,6 +760,283 @@ pub fn parse_workshop_browse_html(html: &str, page: u32) -> WorkshopQueryResult 
         items,
         page,
         has_next_page,
+    }
+}
+
+fn extract_valve_ssr_json(html: &str) -> Option<serde_json::Value> {
+    let mut pos = 0usize;
+    while let Some((_, tag_end, tag_str)) = find_next_open_tag(html, pos, "script") {
+        let content_start = tag_end + 1;
+        let is_ssr_script = extract_html_attr(tag_str, "id")
+            .map(|id| id.trim().eq_ignore_ascii_case("valve-ssr-data"))
+            .unwrap_or(false);
+        if is_ssr_script {
+            let rel_close = find_ascii_ci(&html[content_start..], "</script>")?;
+            let raw_json = html[content_start..content_start + rel_close].trim();
+            return serde_json::from_str(raw_json).ok();
+        }
+        pos = content_start;
+    }
+    None
+}
+
+fn unwrap_json_string(val: &serde_json::Value) -> Option<serde_json::Value> {
+    match val {
+        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+        other => Some(other.clone()),
+    }
+}
+
+fn find_workshop_query_data(root: &serde_json::Value) -> Option<&serde_json::Value> {
+    let queries = root.get("queries")?.as_array()?;
+    let mut empty_candidate = None;
+    for q in queries {
+        let Some(data) = q.get("state").and_then(|s| s.get("data")) else {
+            continue;
+        };
+        let Some(results) = data.get("results").and_then(|r| r.as_array()) else {
+            continue;
+        };
+        if !results.is_empty()
+            && results
+                .iter()
+                .any(|entry| entry.get("publishedfileid").is_some())
+        {
+            return Some(data);
+        }
+        if empty_candidate.is_none()
+            && (data.get("current_page").is_some() || data.get("total_count").is_some())
+        {
+            empty_candidate = Some(data);
+        }
+    }
+    empty_candidate
+}
+
+fn build_ssr_creator_map(data: &serde_json::Value) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(list) = data
+        .get("creator_player_link_details")
+        .and_then(|v| v.as_array())
+    else {
+        return map;
+    };
+    for entry in list {
+        let Some(pub_data) = entry.get("public_data") else {
+            continue;
+        };
+        let steamid = pub_data
+            .get("steamid")
+            .and_then(|v| v.as_str().map(str::trim).map(ToString::to_string))
+            .or_else(|| json_u64(&pub_data["steamid"]).map(|n| n.to_string()));
+        let persona = pub_data
+            .get("persona_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        if let (Some(id), Some(name)) = (steamid, persona) {
+            if !id.is_empty() {
+                map.insert(id, name);
+            }
+        }
+    }
+    map
+}
+
+fn parse_valve_ssr_workshop_browse(html: &str, page: u32) -> Option<WorkshopQueryResult> {
+    let root = extract_valve_ssr_json(html)?;
+    let render_ctx = root.get("renderContext").and_then(unwrap_json_string)?;
+    let query_data = render_ctx.get("queryData").and_then(unwrap_json_string)?;
+    let data = find_workshop_query_data(&query_data)?;
+    let results = data.get("results")?.as_array()?;
+
+    let creator_map = build_ssr_creator_map(data);
+    let dom_authors = extract_ssr_dom_authors(html);
+    let mut items = Vec::with_capacity(results.len());
+    let mut seen_ids = HashSet::with_capacity(results.len());
+
+    for entry in results {
+        let Some(id) = entry["publishedfileid"]
+            .as_str()
+            .map(str::trim)
+            .map(ToString::to_string)
+            .or_else(|| json_u64(&entry["publishedfileid"]).map(|n| n.to_string()))
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
+
+        let title = entry["title"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let creator_id = entry["creator"]
+            .as_str()
+            .map(str::trim)
+            .map(ToString::to_string)
+            .or_else(|| json_u64(&entry["creator"]).map(|n| n.to_string()))
+            .unwrap_or_default();
+        let author = creator_map
+            .get(&creator_id)
+            .cloned()
+            .or_else(|| dom_authors.get(&id).cloned())
+            .unwrap_or_default();
+
+        let mut details = WorkshopItemDetails {
+            published_file_id: id,
+            title,
+            author,
+            ..Default::default()
+        };
+        apply_api_details(&mut details, entry, true);
+        items.push(details);
+    }
+
+    let current_page = json_u64(&data["current_page"])
+        .unwrap_or(page as u64)
+        .max(page as u64);
+    let has_more_pages = json_u64(&data["total_pages"]).is_some_and(|total| total > current_page);
+    let has_cursor = data["next_cursor"]
+        .as_str()
+        .map(str::trim)
+        .is_some_and(|c| !c.is_empty());
+
+    Some(WorkshopQueryResult {
+        items,
+        page,
+        has_next_page: has_more_pages || has_cursor || detect_has_next_page(html, page),
+    })
+}
+
+fn strip_author_by_prefix(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .strip_prefix("By ")
+        .or_else(|| collapsed.strip_prefix("by "))
+        .unwrap_or(&collapsed)
+        .trim()
+        .to_string()
+}
+
+fn extract_ssr_dom_authors(html: &str) -> HashMap<String, String> {
+    let mut authors = HashMap::new();
+    let mut last_id: Option<String> = None;
+    let mut pos = 0usize;
+
+    while let Some((_, tag_end, tag_str)) = find_next_open_tag(html, pos, "a") {
+        let content_start = tag_end + 1;
+        let Some(rel_close) = find_ascii_ci(&html[content_start..], "</a>") else {
+            break;
+        };
+        let close_pos = content_start + rel_close;
+        let inner = &html[content_start..close_pos];
+        pos = close_pos + 4;
+
+        let Some(href) = extract_html_attr(tag_str, "href") else {
+            continue;
+        };
+        let decoded_href = decode_html_entities(&href);
+        if decoded_href.contains("sharedfiles/filedetails") {
+            if let Some(id) = parse_workshop_id(&decoded_href) {
+                last_id = Some(id);
+            }
+        } else if decoded_href.contains("myworkshopfiles") {
+            if let Some(id) = last_id.take() {
+                let text = strip_author_by_prefix(&decode_html_entities(&strip_html_tags(inner)));
+                if !text.is_empty() {
+                    authors.entry(id).or_insert(text);
+                }
+            }
+        }
+    }
+
+    authors
+}
+
+fn parse_ssr_dom_cards(html: &str, page: u32) -> WorkshopQueryResult {
+    let mut items: Vec<WorkshopItemDetails> = Vec::new();
+    let mut index_by_id: HashMap<String, usize> = HashMap::new();
+    let mut last_id: Option<String> = None;
+    let mut pos = 0usize;
+
+    while let Some((_, tag_end, tag_str)) = find_next_open_tag(html, pos, "a") {
+        let content_start = tag_end + 1;
+        let Some(rel_close) = find_ascii_ci(&html[content_start..], "</a>") else {
+            break;
+        };
+        let close_pos = content_start + rel_close;
+        let inner = &html[content_start..close_pos];
+        pos = close_pos + 4;
+
+        let Some(href) = extract_html_attr(tag_str, "href") else {
+            continue;
+        };
+        let decoded_href = decode_html_entities(&href);
+
+        if decoded_href.contains("sharedfiles/filedetails") {
+            let Some(id) = parse_workshop_id(&decoded_href) else {
+                continue;
+            };
+            last_id = Some(id.clone());
+
+            let idx = *index_by_id.entry(id.clone()).or_insert_with(|| {
+                items.push(WorkshopItemDetails {
+                    published_file_id: id,
+                    ..Default::default()
+                });
+                items.len() - 1
+            });
+
+            if let Some((_, _, img_tag)) = find_next_open_tag(inner, 0, "img") {
+                if items[idx].preview_url.is_empty() {
+                    if let Some(src) = extract_html_attr(img_tag, "src") {
+                        let preview = decode_html_entities(src.trim());
+                        if !preview.is_empty() {
+                            items[idx].preview_url = preview;
+                        }
+                    }
+                }
+                if items[idx].title.is_empty() {
+                    if let Some(alt) = extract_html_attr(img_tag, "alt") {
+                        let title = decode_html_entities(alt.trim());
+                        if !title.is_empty() {
+                            items[idx].title = title;
+                        }
+                    }
+                }
+            }
+
+            let text_title = decode_html_entities(&strip_html_tags(inner))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text_title.is_empty() {
+                items[idx].title = text_title;
+            }
+        } else if decoded_href.contains("myworkshopfiles") {
+            if let Some(id) = last_id.as_ref() {
+                if let Some(&idx) = index_by_id.get(id) {
+                    if items[idx].author.is_empty() {
+                        let author =
+                            strip_author_by_prefix(&decode_html_entities(&strip_html_tags(inner)));
+                        if !author.is_empty() {
+                            items[idx].author = author;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    WorkshopQueryResult {
+        items,
+        page,
+        has_next_page: detect_has_next_page(html, page),
     }
 }
 
@@ -1278,6 +1573,7 @@ fn apply_api_details(
     if let Some(raw_desc) = item["file_description"]
         .as_str()
         .or_else(|| item["description"].as_str())
+        .or_else(|| item["short_description"].as_str())
     {
         let cleaned = strip_steam_bbcode(raw_desc);
         if overwrite_existing || !cleaned.is_empty() {
@@ -2605,5 +2901,143 @@ mod tests {
             assert!(!timeout_summary.contains("http://"));
             let _ = accept_task.await;
         });
+    }
+
+    #[test]
+    fn parse_workshop_browse_html_supports_valve_ssr_json_and_pagination() {
+        let ssr_query_data = serde_json::json!({
+            "queries": [
+                {
+                    "state": { "data": { "foo": "bar" } },
+                    "queryKey": ["app_admin_access", 1281930]
+                },
+                {
+                    "state": {
+                        "data": {
+                            "eresult": 1,
+                            "current_page": 1,
+                            "total_pages": 57,
+                            "total_count": 1694,
+                            "results": [
+                                {
+                                    "publishedfileid": "2824688072",
+                                    "creator": "76561198010743466",
+                                    "consumer_appid": 1281930,
+                                    "preview_url": "https://images.steamusercontent.com/ugc/calamity/",
+                                    "title": "Calamity Mod",
+                                    "short_description": "[b]Content mod[/b] for tModLoader",
+                                    "file_size": "12345678",
+                                    "time_updated": 1794000000u64,
+                                    "subscriptions": 5000000u64,
+                                    "favorited": 120000u64,
+                                    "views": 9000000u64,
+                                    "tags": [
+                                        { "tag": "New Content", "display_name": "New Content" },
+                                        { "tag": "1.4.4", "display_name": "1.4.4" }
+                                    ]
+                                },
+                                {
+                                    "publishedfileid": "3835851637",
+                                    "creator": "76561199999999999",
+                                    "consumer_appid": 1281930,
+                                    "preview_url": "https://images.steamusercontent.com/ugc/puddles/",
+                                    "title": "Fake Puddles!",
+                                    "short_description": "Rain puddles"
+                                }
+                            ],
+                            "creator_player_link_details": [
+                                {
+                                    "public_data": {
+                                        "steamid": "76561198010743466",
+                                        "persona_name": "Fabsol"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let payload = serde_json::json!({
+            "route": "workshop/browse",
+            "renderContext": {
+                "queryData": ssr_query_data.to_string()
+            }
+        });
+
+        let html = format!(
+            r#"<!DOCTYPE html><html><head>
+            <script id="valve-ssr-data" type="application/json">{payload}</script>
+            </head><body>
+            <div>
+                <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3835851637"><img src="x" alt="Fake Puddles!"/></a>
+                <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3835851637">Fake Puddles!</a>
+                <a href="https://steamcommunity.com/id/levitatingGT/myworkshopfiles/?appid=1281930">By LevitatingGT</a>
+            </div>
+            </body></html>"#
+        );
+
+        let res = parse_workshop_browse_html(&html, 1);
+        assert_eq!(res.page, 1);
+        assert!(res.has_next_page);
+        assert_eq!(res.items.len(), 2);
+        assert_eq!(res.items[0].published_file_id, "2824688072");
+        assert_eq!(res.items[0].title, "Calamity Mod");
+        assert_eq!(res.items[0].author, "Fabsol");
+        assert_eq!(res.items[0].description, "Content mod for tModLoader");
+        assert_eq!(res.items[0].file_size, 12345678);
+        assert_eq!(res.items[0].tags, vec!["New Content", "1.4.4"]);
+
+        assert_eq!(res.items[1].published_file_id, "3835851637");
+        assert_eq!(res.items[1].author, "LevitatingGT");
+
+        let empty_ssr = serde_json::json!({
+            "renderContext": {
+                "queryData": {
+                    "queries": [{
+                        "state": {
+                            "data": {
+                                "current_page": 2,
+                                "total_pages": 2,
+                                "total_count": 0,
+                                "results": []
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let empty_html = format!(r#"<script id="valve-ssr-data">{empty_ssr}</script>"#);
+        let empty_res = parse_workshop_browse_html(&empty_html, 2);
+        assert!(empty_res.items.is_empty());
+        assert!(!empty_res.has_next_page);
+    }
+
+    #[test]
+    fn parse_workshop_browse_html_falls_back_to_semantic_ssr_dom_cards() {
+        let html = r#"
+        <div class="UNowfeldbNg- Panel">
+            <div><a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3835851637" class="hash-1"><img src="https://images.steamusercontent.com/ugc/1/puddles.jpg?imw=322&amp;imh=322" alt="Fake Puddles!"/></a></div>
+            <div class="Sw3NXcvOA4Y-"><a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3835851637" class="hash-2">Fake &amp; Fun Puddles!</a></div>
+            <div class="o14JIlvi52E-"><a href="https://steamcommunity.com/id/levitatingGT/myworkshopfiles/?appid=1281930" class="hash-3">By LevitatingGT</a></div>
+        </div>
+        <div class="UNowfeldbNg- Panel">
+            <div><a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3835720328"><img src="https://images.steamusercontent.com/ugc/2/respawn.jpg" alt="Tactical Respawn"/></a></div>
+        </div>
+        "#;
+
+        let res = parse_workshop_browse_html(html, 1);
+        assert_eq!(res.items.len(), 2);
+        assert_eq!(res.items[0].published_file_id, "3835851637");
+        assert_eq!(res.items[0].title, "Fake & Fun Puddles!");
+        assert_eq!(res.items[0].author, "LevitatingGT");
+        assert_eq!(
+            res.items[0].preview_url,
+            "https://images.steamusercontent.com/ugc/1/puddles.jpg?imw=322&imh=322"
+        );
+        assert_eq!(res.items[1].published_file_id, "3835720328");
+        assert_eq!(res.items[1].title, "Tactical Respawn");
+        assert!(!res.has_next_page);
     }
 }
