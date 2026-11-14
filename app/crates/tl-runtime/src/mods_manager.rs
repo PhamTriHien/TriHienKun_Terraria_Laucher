@@ -1057,34 +1057,11 @@ pub fn pick_best_workshop_tmod(candidates: &[PathBuf]) -> Option<PathBuf> {
 }
 
 pub async fn install_steamcmd_via_winget() -> LauncherResult<String> {
-    let mut cmd = Command::new("winget");
-    cmd.args([
-        "install",
-        "--id",
-        "Valve.SteamCMD",
-        "--exact",
-        "--silent",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-    ]);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| LauncherError::Process(format!("Không chạy được winget: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        return Err(LauncherError::Process(format!(
-            "winget cài SteamCMD thất bại: {stdout} {stderr}"
-        )));
-    }
-    Ok(if stdout.is_empty() {
+    let output = crate::game_installer::run_winget_install_steamcmd(None).await?;
+    Ok(if output.is_empty() {
         "Đã cài đặt SteamCMD qua winget".to_string()
     } else {
-        stdout
+        output
     })
 }
 

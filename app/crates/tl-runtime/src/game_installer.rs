@@ -11,18 +11,24 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tl_core::paths::detect_dotnet8_runtime;
+use tl_core::paths::{detect_dotnet8_runtime, find_steamcmd};
 use tl_core::{LauncherError, LauncherPaths, LauncherResult};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command;
 use zip::ZipArchive;
 
 pub const TMODLOADER_GITHUB_REPO: &str = "tModLoader/tModLoader";
 pub const XNA_40_OFFICIAL_MSI_URL: &str =
     "https://download.microsoft.com/download/a/c/2/ac2c903b-e6e8-42c2-9fd7-bebac362a930/xnafx40_redist.msi";
+pub const STEAMCMD_OFFICIAL_ZIP_URL: &str =
+    "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip";
 pub const TERRARIA_MANIFEST_FILENAME: &str = "terraria-manifest.json";
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const TERRARIA_RECEIPT_FILENAME: &str = "terraria-installed.json";
 const DOWNLOAD_PROGRESS_STEP_BYTES: u64 = 64 * 1024;
 const PRESERVED_TOP_DIRS: &[&str] = &[
@@ -45,6 +51,7 @@ pub enum InstallTarget {
     TModLoader,
     DotNet8,
     Xna40,
+    SteamCmd,
 }
 
 impl InstallTarget {
@@ -54,6 +61,7 @@ impl InstallTarget {
             Self::TModLoader => "tModLoader",
             Self::DotNet8 => ".NET 8 Runtime",
             Self::Xna40 => "XNA Framework 4.0",
+            Self::SteamCmd => "SteamCMD",
         }
     }
 }
@@ -204,8 +212,9 @@ async fn download_to_part_file(
 
     let resp = req.send().await.map_err(|e| {
         LauncherError::Network(format!(
-            "Lỗi kết nối khi tải {}: {e}",
-            spec.target.label()
+            "Lỗi kết nối khi tải {}: {}",
+            spec.target.label(),
+            format_reqwest_error_chain(&e)
         ))
     })?;
 
@@ -233,8 +242,9 @@ async fn download_to_part_file(
     while let Some(chunk_res) = stream.next().await {
         let chunk = chunk_res.map_err(|e| {
             LauncherError::Network(format!(
-                "Lỗi đọc dữ liệu khi tải {}: {e}",
-                spec.target.label()
+                "Lỗi đọc dữ liệu khi tải {}: {}",
+                spec.target.label(),
+                format_reqwest_error_chain(&e)
             ))
         })?;
         file.write_all(&chunk).await?;
@@ -1702,6 +1712,448 @@ pub async fn download_and_install_xna(
     install_xna_framework_elevated(&cached_msi)
 }
 
+fn format_reqwest_error_chain(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(src) = current {
+        let s = src.to_string();
+        if !parts.last().is_some_and(|prev| prev == &s) {
+            parts.push(s);
+        }
+        current = src.source();
+    }
+    let joined = parts.join(" | ");
+    if err.is_timeout() && !joined.to_ascii_lowercase().contains("time") {
+        format!("{joined} | timed out")
+    } else {
+        joined
+    }
+}
+
+fn truncate_stage(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", truncated.trim_end())
+}
+
+pub fn sanitize_winget_stream_line(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1B {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() && (0x20..=0x3F).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() && (0x40..=0x7E).contains(&bytes[i]) {
+                    i += 1;
+                }
+            } else if i < bytes.len() && bytes[i] == b']' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else if i < bytes.len() && bytes[i] < 0x80 {
+                i += 1;
+            }
+            continue;
+        }
+
+        let Some(ch) = raw[i..].chars().next() else {
+            break;
+        };
+        i += ch.len_utf8();
+        if ch == '\t' {
+            out.push(' ');
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+
+    let trimmed = out.trim();
+    if trimmed.is_empty() || matches!(trimmed, "-" | "\\" | "|" | "/") {
+        return None;
+    }
+
+    let is_bar_noise = trimmed.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '█' | '▒' | '░' | '▓' | '-' | '─' | '━' | '▀' | '▄' | '▌' | '▐'
+            )
+    });
+    if is_bar_noise {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+async fn read_winget_stream_lines<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    collected: Arc<std::sync::Mutex<Vec<String>>>,
+    last_emitted: Arc<std::sync::Mutex<Option<String>>>,
+    on_line: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+
+    let emit_segment = |segment: &[u8]| {
+        let raw = String::from_utf8_lossy(segment);
+        let Some(clean) = sanitize_winget_stream_line(&raw) else {
+            return;
+        };
+        {
+            let mut last = last_emitted.lock().unwrap_or_else(|e| e.into_inner());
+            if last.as_deref() == Some(clean.as_str()) {
+                return;
+            }
+            *last = Some(clean.clone());
+        }
+        {
+            let mut list = collected.lock().unwrap_or_else(|e| e.into_inner());
+            list.push(clean.clone());
+        }
+        if let Some(ref cb) = on_line {
+            cb(clean);
+        }
+    };
+
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let mut start = 0;
+                for idx in 0..buf.len() {
+                    if buf[idx] == b'\r' || buf[idx] == b'\n' {
+                        if idx > start {
+                            emit_segment(&buf[start..idx]);
+                        }
+                        start = idx + 1;
+                    }
+                }
+                if start > 0 {
+                    buf.drain(..start);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    if !buf.is_empty() {
+        emit_segment(&buf);
+    }
+}
+
+pub(crate) async fn run_winget_install_steamcmd(
+    on_line: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> LauncherResult<String> {
+    let mut cmd = Command::new("winget");
+    cmd.args([
+        "install",
+        "--id",
+        "Valve.SteamCMD",
+        "--exact",
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| LauncherError::Process(format!("Không chạy được winget: {e}")))?;
+
+    let collected = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let last_emitted = Arc::new(std::sync::Mutex::new(None::<String>));
+
+    let stdout_task = child.stdout.take().map(|stdout| {
+        tokio::spawn(read_winget_stream_lines(
+            stdout,
+            Arc::clone(&collected),
+            Arc::clone(&last_emitted),
+            on_line.clone(),
+        ))
+    });
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(read_winget_stream_lines(
+            stderr,
+            Arc::clone(&collected),
+            Arc::clone(&last_emitted),
+            on_line,
+        ))
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| LauncherError::Process(format!("Lỗi chờ winget cài SteamCMD: {e}")))?;
+
+    if let Some(h) = stdout_task {
+        let _ = h.await;
+    }
+    if let Some(h) = stderr_task {
+        let _ = h.await;
+    }
+
+    let lines = collected.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let joined = lines.join(" | ");
+
+    if !status.success() {
+        let detail = if joined.is_empty() {
+            match status.code() {
+                Some(code) => format!("mã thoát {code}"),
+                None => "tiến trình bị ngắt".to_string(),
+            }
+        } else {
+            joined
+        };
+        return Err(LauncherError::Process(format!(
+            "winget cài SteamCMD thất bại: {detail}"
+        )));
+    }
+
+    Ok(joined)
+}
+
+fn winget_output_indicates_failure(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("failed")
+        || lower.contains("unexpected error")
+        || lower.contains("no package found")
+        || lower.contains("could not be resolved")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("thất bại")
+}
+
+fn format_steamcmd_combined_error(
+    direct_err: &str,
+    winget_err: &str,
+    proxy_url: Option<&str>,
+) -> LauncherError {
+    let combined_lower = format!("{direct_err}\n{winget_err}").to_ascii_lowercase();
+    let normalized_proxy = proxy_url.and_then(normalize_proxy_url);
+
+    let is_proxy_err = normalized_proxy.is_some()
+        || combined_lower.contains("proxy")
+        || combined_lower.contains("socks");
+    let is_refused_or_loopback = combined_lower.contains("connection refused")
+        || combined_lower.contains("actively refused")
+        || combined_lower.contains("os error 10061")
+        || combined_lower.contains("127.0.0.1");
+    let is_timeout = combined_lower.contains("timed out")
+        || combined_lower.contains("timeout")
+        || combined_lower.contains("deadline has elapsed")
+        || combined_lower.contains("os error 10060");
+    let is_dns = combined_lower.contains("dns")
+        || combined_lower.contains("lookup address")
+        || combined_lower.contains("no such host")
+        || combined_lower.contains("failed to resolve")
+        || combined_lower.contains("could not be resolved")
+        || combined_lower.contains("os error 11001")
+        || combined_lower.contains("os error 11004");
+
+    let hint = if let Some(proxy) = normalized_proxy {
+        if is_refused_or_loopback {
+            format!(
+                "Kết nối qua Proxy ({proxy}) bị từ chối (connection refused / 127.0.0.1). Hãy kiểm tra phần mềm Proxy/VPN đang chạy, hoặc tắt Proxy ở Tab Cài đặt rồi bật Cloudflare WARP (chế độ WARP)."
+            )
+        } else if is_timeout {
+            format!(
+                "Kết nối tới steamcdn-a.akamaihd.net qua Proxy ({proxy}) bị quá thời gian chờ (timed out). Hãy kiểm tra lại Proxy/VPN hoặc chuyển sang Cloudflare WARP (chế độ WARP)."
+            )
+        } else {
+            format!(
+                "Không thể tải từ steamcdn-a.akamaihd.net qua Proxy ({proxy}). Hãy kiểm tra cấu hình Proxy ở Tab Cài đặt hoặc bật Cloudflare WARP (chế độ WARP) / VPN."
+            )
+        }
+    } else if is_refused_or_loopback {
+        "Phát hiện lỗi từ chối kết nối hoặc chuyển hướng về 127.0.0.1 (connection refused) — rất có thể nhà mạng/DNS đang chặn tên miền steamcdn-a.akamaihd.net. Hãy bật Cloudflare WARP (chế độ WARP), dùng VPN, hoặc cấu hình Proxy ở Tab Cài đặt.".to_string()
+    } else if is_timeout {
+        "Kết nối tới steamcdn-a.akamaihd.net bị quá thời gian chờ (timed out), có thể nhà mạng đang chặn hoặc bóp băng thông tới Steam. Hãy bật Cloudflare WARP (chế độ WARP), dùng VPN, hoặc cấu hình Proxy ở Tab Cài đặt.".to_string()
+    } else if is_dns {
+        "Không phân giải được tên miền steamcdn-a.akamaihd.net (lỗi DNS), có thể nhà mạng/DNS đang chặn Steam. Hãy bật Cloudflare WARP (chế độ WARP), dùng VPN, hoặc cấu hình Proxy ở Tab Cài đặt.".to_string()
+    } else if is_proxy_err {
+        "Gặp lỗi Proxy khi kết nối tới steamcdn-a.akamaihd.net. Hãy kiểm tra lại Proxy hệ thống/Windows, hoặc bật Cloudflare WARP (chế độ WARP), VPN, hoặc cấu hình Proxy ở Tab Cài đặt.".to_string()
+    } else {
+        "Nếu nhà mạng hoặc DNS đang chặn steamcdn-a.akamaihd.net, hãy bật Cloudflare WARP (chế độ WARP), dùng VPN, hoặc thiết lập Proxy ở Tab Cài đặt.".to_string()
+    };
+
+    LauncherError::Network(format!(
+        "Không thể cài đặt SteamCMD.\n- Tải trực tiếp (steamcdn-a.akamaihd.net): {direct_err}\n- Cài qua winget: {winget_err}\nGợi ý: {hint}"
+    ))
+}
+
+async fn extract_and_verify_steamcmd(
+    zip_path: PathBuf,
+    steamcmd_dir: PathBuf,
+    on_progress: ProgressCallback,
+) -> LauncherResult<PathBuf> {
+    let extracted_top = extract_zip_safely_blocking(
+        zip_path,
+        steamcmd_dir.clone(),
+        InstallTarget::SteamCmd,
+        "Đang giải nén SteamCMD...",
+        on_progress,
+    )
+    .await?;
+
+    let steamcmd_exe = steamcmd_dir.join("steamcmd.exe");
+    if !steamcmd_exe.is_file() {
+        let preview = format_top_level_preview(&extracted_top);
+        return Err(LauncherError::InvalidFormat(format!(
+            "Giải nén hoàn tất nhưng không thấy steamcmd.exe tại {}. Thư mục/tệp gốc trong file nén: {preview}",
+            steamcmd_dir.display()
+        )));
+    }
+
+    Ok(steamcmd_exe)
+}
+
+async fn install_steamcmd_from_direct_url(
+    client: &Client,
+    url: &str,
+    paths: &LauncherPaths,
+    on_progress: &ProgressCallback,
+    on_log: &Arc<dyn Fn(String) + Send + Sync>,
+) -> Result<Result<String, LauncherError>, LauncherError> {
+    let cache_dir = paths.data_dir.join("cache");
+    fs::create_dir_all(&cache_dir).map_err(LauncherError::from)?;
+    let part_path = cache_dir.join(format!("steamcmd-{}.zip.part", uuid::Uuid::new_v4()));
+    let _part_guard = TempFileGuard::new(part_path.clone());
+
+    if let Err(download_err) = download_to_part_file(
+        client,
+        DownloadSpec {
+            url,
+            dest_part: &part_path,
+            target: InstallTarget::SteamCmd,
+            stage: "Đang tải SteamCMD...",
+            fallback_total: None,
+            accept_header: None,
+            bearer_token: None,
+        },
+        on_progress,
+    )
+    .await
+    {
+        return Ok(Err(download_err));
+    }
+
+    on_log("Đang giải nén SteamCMD vào thư mục dữ liệu...".to_string());
+    let steamcmd_exe =
+        extract_and_verify_steamcmd(part_path, paths.steamcmd_dir.clone(), on_progress.clone())
+            .await?;
+
+    on_log(format!("Đã cài xong SteamCMD tại {}.", steamcmd_exe.display()));
+    Ok(Ok(format!(
+        "Đã cài đặt SteamCMD tại {}.",
+        steamcmd_exe.display()
+    )))
+}
+
+pub async fn install_steamcmd_with_progress(
+    paths: &LauncherPaths,
+    proxy_url: Option<&str>,
+    on_progress: ProgressCallback,
+    on_log: Arc<dyn Fn(String) + Send + Sync>,
+) -> LauncherResult<String> {
+    let client = build_download_client(proxy_url)?;
+    on_log("Đang tải SteamCMD chính thức từ Valve (steamcdn-a.akamaihd.net)...".to_string());
+
+    let direct_err = match install_steamcmd_from_direct_url(
+        &client,
+        STEAMCMD_OFFICIAL_ZIP_URL,
+        paths,
+        &on_progress,
+        &on_log,
+    )
+    .await?
+    {
+        Ok(msg) => return Ok(msg),
+        Err(err) => err,
+    };
+
+    let direct_err_msg = direct_err.to_string();
+    on_log(format!(
+        "Tải trực tiếp thất bại: {direct_err_msg}. Đang thử qua winget..."
+    ));
+    emit_progress(
+        &on_progress,
+        InstallTarget::SteamCmd,
+        "Đang chạy winget cài Valve.SteamCMD...",
+        0,
+        None,
+    );
+
+    let log_cb = Arc::clone(&on_log);
+    let progress_cb = Arc::clone(&on_progress);
+    let stream_cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line: String| {
+        log_cb(line.clone());
+        emit_progress(
+            &progress_cb,
+            InstallTarget::SteamCmd,
+            truncate_stage(&line, 64),
+            0,
+            None,
+        );
+    });
+
+    match run_winget_install_steamcmd(Some(stream_cb)).await {
+        Ok(winget_output) => {
+            let found_path = find_steamcmd(paths, None);
+            if found_path.is_none() && winget_output_indicates_failure(&winget_output) {
+                return Err(format_steamcmd_combined_error(
+                    &direct_err_msg,
+                    winget_output.trim(),
+                    proxy_url,
+                ));
+            }
+            if let Some(ref exe) = found_path {
+                on_log(format!("Đã cài xong SteamCMD tại {}.", exe.display()));
+            } else {
+                on_log("Đã cài đặt SteamCMD qua winget.".to_string());
+            }
+            emit_progress(
+                &on_progress,
+                InstallTarget::SteamCmd,
+                "Hoàn tất cài đặt SteamCMD",
+                1,
+                Some(1),
+            );
+            Ok("Đã cài đặt SteamCMD qua winget.".to_string())
+        }
+        Err(winget_err) => Err(format_steamcmd_combined_error(
+            &direct_err_msg,
+            &winget_err.to_string(),
+            proxy_url,
+        )),
+    }
+}
+
 fn verify_terraria_installed(
     paths: &LauncherPaths,
     extracted_top: &[String],
@@ -2735,6 +3187,235 @@ mod tests {
             assert_eq!(load_installed_terraria_receipt(&paths), None);
 
             server.abort();
+        });
+    }
+
+    #[test]
+    fn steamcmd_target_label_and_official_url() {
+        assert_eq!(InstallTarget::SteamCmd.label(), "SteamCMD");
+        assert_eq!(
+            STEAMCMD_OFFICIAL_ZIP_URL,
+            "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+        );
+    }
+
+    #[test]
+    fn sanitize_winget_stream_line_filters_ansi_spinners_and_progress_bars() {
+        assert_eq!(sanitize_winget_stream_line(""), None);
+        assert_eq!(sanitize_winget_stream_line("   \t  "), None);
+        assert_eq!(sanitize_winget_stream_line("\x1b[2K\x1b[1G"), None);
+        assert_eq!(sanitize_winget_stream_line("\x1b]9;4;1;50\x07"), None);
+
+        for spinner in ["-", "\\", "|", "/", "\x1b[?25l  /  \x1b[?25h", "\x08|"] {
+            assert_eq!(
+                sanitize_winget_stream_line(spinner),
+                None,
+                "expected spinner '{spinner}' to be ignored"
+            );
+        }
+
+        for noise in [
+            "██████████░░░░░░░░░░",
+            "▒▒▒▓▓▓",
+            "----------",
+            "───━━━",
+            "\x1b[32m████▒▒░░\x1b[0m",
+        ] {
+            assert_eq!(
+                sanitize_winget_stream_line(noise),
+                None,
+                "expected noise '{noise}' to be ignored"
+            );
+        }
+
+        assert_eq!(
+            sanitize_winget_stream_line("\x1b[32mFound SteamCMD [Valve.SteamCMD]\x1b[0m"),
+            Some("Found SteamCMD [Valve.SteamCMD]".to_string())
+        );
+        assert_eq!(
+            sanitize_winget_stream_line(
+                "  \x1b[1mDownloading https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip\x1b[0m  "
+            ),
+            Some("Downloading https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip".to_string())
+        );
+        assert_eq!(
+            sanitize_winget_stream_line("  1.45 MB / 2.90 MB  "),
+            Some("1.45 MB / 2.90 MB".to_string())
+        );
+        assert_eq!(
+            sanitize_winget_stream_line("\x1b[36mĐang giải nén dữ liệu...\x1b[0m"),
+            Some("Đang giải nén dữ liệu...".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_steamcmd_zip_verifies_progress_and_rejects_missing_exe() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let guard = TempDirGuard::new("tl_gi_steamcmd_ok");
+            let paths = guard.paths();
+            let zip_path = guard.0.join("steamcmd.zip");
+            write_test_zip(
+                &zip_path,
+                &[
+                    ("steamcmd.exe", b"MZ-STEAMCMD"),
+                    ("public/steam.cfg", b"BootStrapperInhibitAll=enable"),
+                ],
+            );
+
+            let (cb, log) = record_progress();
+            let exe = extract_and_verify_steamcmd(zip_path, paths.steamcmd_dir.clone(), cb)
+                .await
+                .unwrap();
+
+            assert_eq!(exe, paths.steamcmd_dir.join("steamcmd.exe"));
+            assert!(exe.is_file());
+            assert_eq!(fs::read(&exe).unwrap(), b"MZ-STEAMCMD");
+            assert_eq!(
+                fs::read(paths.steamcmd_dir.join("public/steam.cfg")).unwrap(),
+                b"BootStrapperInhibitAll=enable"
+            );
+
+            {
+                let events = log.lock().unwrap();
+                assert!(!events.is_empty());
+                assert!(events.iter().all(|e| e.target == InstallTarget::SteamCmd));
+                assert_eq!(events.last().unwrap().fraction(), Some(1.0));
+            }
+
+            let bad_guard = TempDirGuard::new("tl_gi_steamcmd_missing");
+            let bad_paths = bad_guard.paths();
+            let bad_zip = bad_guard.0.join("not_steamcmd.zip");
+            write_test_zip(
+                &bad_zip,
+                &[("README.txt", b"missing binary"), ("bin/other.exe", b"MZ")],
+            );
+
+            let (bad_cb, _) = record_progress();
+            let err = extract_and_verify_steamcmd(bad_zip, bad_paths.steamcmd_dir.clone(), bad_cb)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LauncherError::InvalidFormat(_)));
+            assert!(err.to_string().contains("steamcmd.exe"));
+            assert!(!bad_paths.steamcmd_dir.join("steamcmd.exe").exists());
+        });
+    }
+
+    #[test]
+    fn steamcmd_http_download_and_stream_helpers_work_end_to_end() {
+        let zip_bytes = build_in_memory_zip(&[("steamcmd.exe", b"MZ-STEAMCMD-HTTP")]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let body_data = zip_bytes.clone();
+
+            let server = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body_data.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(&body_data).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+
+            let guard = TempDirGuard::new("tl_gi_steamcmd_http");
+            let paths = guard.paths();
+            let (cb, progress_log) = record_progress();
+            let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+            let logs_clone = Arc::clone(&logs);
+            let on_log: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |msg| logs_clone.lock().unwrap().push(msg));
+
+            let client = build_download_client(None).unwrap();
+            let url = format!("http://127.0.0.1:{port}/steamcmd.zip");
+            let msg = install_steamcmd_from_direct_url(&client, &url, &paths, &cb, &on_log)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(msg.contains("steamcmd.exe"));
+            assert_eq!(
+                fs::read(paths.steamcmd_dir.join("steamcmd.exe")).unwrap(),
+                b"MZ-STEAMCMD-HTTP"
+            );
+            let cache_entries: Vec<_> = fs::read_dir(paths.data_dir.join("cache"))
+                .unwrap()
+                .flatten()
+                .collect();
+            assert!(cache_entries.is_empty(), ".part temp file should be cleaned up");
+            assert!(!logs.lock().unwrap().is_empty());
+            assert_eq!(progress_log.lock().unwrap().last().unwrap().fraction(), Some(1.0));
+
+            server.abort();
+
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let streamed = Arc::new(Mutex::new(Vec::<String>::new()));
+            let last_emitted = Arc::new(Mutex::new(None));
+            let received = Arc::new(Mutex::new(Vec::<String>::new()));
+            let recv_clone = Arc::clone(&received);
+            let reader_task = tokio::spawn(read_winget_stream_lines(
+                reader,
+                Arc::clone(&streamed),
+                last_emitted,
+                Some(Arc::new(move |line| recv_clone.lock().unwrap().push(line))),
+            ));
+
+            use tokio::io::AsyncWriteExt;
+            writer
+                .write_all(
+                    "\x1b[32mFound SteamCMD\x1b[0m\r-\r\\\r████░░░\rDownloading\r\n1.0 MB / 2.0 MB\r1.0 MB / 2.0 MB\rDone"
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            drop(writer);
+            reader_task.await.unwrap();
+
+            let expected = vec![
+                "Found SteamCMD".to_string(),
+                "Downloading".to_string(),
+                "1.0 MB / 2.0 MB".to_string(),
+                "Done".to_string(),
+            ];
+            assert_eq!(*received.lock().unwrap(), expected);
+            assert_eq!(*streamed.lock().unwrap(), expected);
+
+            let err_isp = format_steamcmd_combined_error(
+                "tcp connect error: connection refused (127.0.0.1:443)",
+                "winget failed: timed out",
+                None,
+            );
+            let isp_text = err_isp.to_string();
+            assert!(isp_text.contains("steamcdn-a.akamaihd.net"));
+            assert!(isp_text.contains("127.0.0.1"));
+            assert!(isp_text.contains("Cloudflare WARP"));
+            assert!(isp_text.contains("Tab Cài đặt"));
+
+            let err_proxy = format_steamcmd_combined_error(
+                "connection refused",
+                "winget failed",
+                Some("127.0.0.1:7890"),
+            );
+            assert!(err_proxy.to_string().contains("http://127.0.0.1:7890"));
+            assert!(err_proxy.to_string().contains("Proxy"));
+
+            assert_eq!(truncate_stage("abc", 10), "abc");
+            assert_eq!(truncate_stage("Đang tải gói SteamCMD rất dài từ máy chủ", 12).chars().count(), 12);
         });
     }
 }

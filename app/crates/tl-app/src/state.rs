@@ -17,7 +17,7 @@ use tl_runtime::{
     download_workshop_mod_via_steamcmd, ensure_firewall_rule, fetch_github_latest_tmod,
     fetch_terraria_branch_manifest, fetch_tmodloader_releases, fetch_workshop_details,
     fetch_workshop_image_bytes, import_local_mod_files, install_dotnet8_portable,
-    install_steamcmd_via_winget, install_terraria_from_local_zip, install_terraria_from_source,
+    install_steamcmd_with_progress, install_terraria_from_local_zip, install_terraria_from_source,
     install_tmodloader_release, install_xna_framework_elevated, launch_game, load_banlist,
     load_installed_terraria_receipt, load_workshop_manifest, open_upnp_port, parse_workshop_id,
     probe_network_snapshot, probe_tcp_endpoint, record_workshop_install, remove_firewall_rule,
@@ -188,6 +188,7 @@ pub struct AppState {
     pub workshop_thumbnails: HashMap<String, WorkshopThumbState>,
     pub last_saved_proxy: String,
     pub steamcmd_busy: bool,
+    pub steamcmd_progress: Option<InstallProgress>,
 
     pub tml_releases: Vec<TmodLoaderReleaseInfo>,
     pub selected_tml_tag: String,
@@ -294,6 +295,7 @@ impl AppState {
             workshop_thumbnails: HashMap::new(),
             last_saved_proxy,
             steamcmd_busy: false,
+            steamcmd_progress: None,
             tml_releases: Vec::new(),
             selected_tml_tag: String::new(),
             tml_releases_busy: false,
@@ -590,10 +592,14 @@ impl AppState {
                 }
                 AppEvent::SteamCmdInstalled(res) => {
                     self.steamcmd_busy = false;
+                    self.steamcmd_progress = None;
                     self.refresh_environment();
                     match res {
                         Ok(msg) => self.notify_ok(msg),
-                        Err(e) => self.notify_err(e),
+                        Err(e) => {
+                            self.workshop_logs.push(format!("Lỗi cài SteamCMD: {e}"));
+                            self.notify_err(e);
+                        }
                     }
                 }
                 AppEvent::TmlReleasesFetched(res) => {
@@ -655,7 +661,11 @@ impl AppState {
                     }
                 }
                 AppEvent::InstallProgress(prog) => {
-                    self.install_progress = Some(prog);
+                    if prog.target == InstallTarget::SteamCmd {
+                        self.steamcmd_progress = Some(prog);
+                    } else {
+                        self.install_progress = Some(prog);
+                    }
                 }
                 AppEvent::InstallFinished { target, result } => {
                     self.install_busy = false;
@@ -1843,12 +1853,33 @@ impl AppState {
             return;
         }
         self.steamcmd_busy = true;
+        self.workshop_logs.clear();
+        self.workshop_logs
+            .push("=== Bắt đầu cài đặt SteamCMD ===".to_string());
+        self.steamcmd_progress = Some(InstallProgress {
+            target: InstallTarget::SteamCmd,
+            stage: "Đang chuẩn bị cài đặt SteamCMD...".to_string(),
+            current: 0,
+            total: None,
+        });
+
+        let paths = self.paths.clone();
+        let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+        let on_progress = self.make_progress_callback();
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
+        let tx_l = tx.clone();
+        let wake_l = wake.clone();
+        let on_log: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line| {
+            let _ = tx_l.send(AppEvent::WorkshopLog(line));
+            wake_l.wake();
+        });
+
         self.rt.spawn(async move {
-            let res = install_steamcmd_via_winget()
-                .await
-                .map_err(|e| e.to_string());
+            let res =
+                install_steamcmd_with_progress(&paths, proxy.as_deref(), on_progress, on_log)
+                    .await
+                    .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::SteamCmdInstalled(res));
             wake.wake();
         });

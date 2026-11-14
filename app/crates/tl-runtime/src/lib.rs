@@ -7,11 +7,12 @@ pub mod server_manager;
 
 pub use game_installer::{
     download_and_install_xna, fetch_terraria_branch_manifest, fetch_tmodloader_releases,
-    install_dotnet8_portable, install_terraria_from_local_zip, install_terraria_from_source,
-    install_tmodloader_release, load_installed_terraria_receipt, parse_dotnet_runtime_version,
-    parse_github_branch_spec, parse_github_release_spec, InstallProgress, InstallTarget,
-    InstalledTerrariaReceipt, ProgressCallback, TerrariaBranchManifest, TerrariaManifestPart,
-    TmodLoaderReleaseInfo, TERRARIA_MANIFEST_FILENAME, TMODLOADER_GITHUB_REPO,
+    install_dotnet8_portable, install_steamcmd_with_progress, install_terraria_from_local_zip,
+    install_terraria_from_source, install_tmodloader_release, load_installed_terraria_receipt,
+    parse_dotnet_runtime_version, parse_github_branch_spec, parse_github_release_spec,
+    sanitize_winget_stream_line, InstallProgress, InstallTarget, InstalledTerrariaReceipt,
+    ProgressCallback, TerrariaBranchManifest, TerrariaManifestPart, TmodLoaderReleaseInfo,
+    STEAMCMD_OFFICIAL_ZIP_URL, TERRARIA_MANIFEST_FILENAME, TMODLOADER_GITHUB_REPO,
     XNA_40_OFFICIAL_MSI_URL,
 };
 

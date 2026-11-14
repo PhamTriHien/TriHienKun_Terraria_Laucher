@@ -369,7 +369,7 @@ fn render_workshop_tab(state: &mut AppState, ui: &mut egui::Ui) {
     ui.add_space(12.0);
     render_staged_workshop_section(state, ui);
 
-    if !state.workshop_logs.is_empty() || state.workshop_busy {
+    if !state.workshop_logs.is_empty() || state.workshop_busy || state.steamcmd_busy {
         ui.add_space(12.0);
         render_workshop_logs_card(state, ui);
     }
@@ -400,6 +400,11 @@ fn render_workshop_search_card(state: &mut AppState, ui: &mut egui::Ui) {
                 }
             });
         });
+
+        if let Some(prog) = &state.steamcmd_progress {
+            ui.add_space(6.0);
+            crate::views::play_view::render_install_progress_bar(ui, prog);
+        }
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
@@ -1026,7 +1031,12 @@ fn render_workshop_logs_card(state: &mut AppState, ui: &mut egui::Ui) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            section_heading(ui, "Nhật ký SteamCMD");
+            let heading = if state.steamcmd_busy {
+                "Nhật ký cài đặt SteamCMD"
+            } else {
+                "Nhật ký SteamCMD"
+            };
+            section_heading(ui, heading);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(!state.workshop_logs.is_empty(), egui::Button::new("Xóa log"))
@@ -1046,7 +1056,9 @@ fn render_workshop_logs_card(state: &mut AppState, ui: &mut egui::Ui) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     if state.workshop_logs.is_empty() {
-                        let wait_msg = if state.workshop_downloading_id.is_some() {
+                        let wait_msg = if state.steamcmd_busy {
+                            "Đang tải và cài đặt SteamCMD..."
+                        } else if state.workshop_downloading_id.is_some() {
                             "Đang khởi chạy SteamCMD để tải mod..."
                         } else {
                             "Đang truy vấn thông tin Workshop..."
