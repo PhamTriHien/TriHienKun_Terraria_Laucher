@@ -20,7 +20,7 @@ pub use game_installer::{
 pub use game_runner::{
     apply_dotnet_std_env, apply_dotnet_tokio_env, install_xna_framework_elevated, launch_game,
     resolve_dotnet_launch, ActiveGameProcess, DotnetLaunchSpec, GameLaunchOptions,
-    RunningGameSnapshot,
+    RunningGameSnapshot, RuntimeTuning,
 };
 pub use modpack_sync::{
     build_modpack_share_preview, inspect_share_key_against_local, load_mod_sources,

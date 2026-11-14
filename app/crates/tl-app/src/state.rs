@@ -31,7 +31,7 @@ use tl_runtime::{
     GameLaunchOptions, InstallProgress, InstallTarget, InstalledModEntry,
     InstalledTerrariaReceipt, ModPackImportPreview, ModPackSharePreview, ModPackSyncProgress,
     ModPackSyncReport, ModSourceRecord, NetworkSnapshot, ProgressCallback, RemoteTmodAsset,
-    RepaintHandle, RunningGameSnapshot, ServerLifecycleState, ServerRuntimeSnapshot,
+    RepaintHandle, RunningGameSnapshot, RuntimeTuning, ServerLifecycleState, ServerRuntimeSnapshot,
     ServerSupervisor, StagedWorkshopMod, TerrariaBranchManifest, TmodLoaderReleaseInfo,
     TunnelStatus, UpnpLeaseInfo, WorkshopItemDetails, WorkshopManifestRecord, WorkshopQueryResult,
     WorkshopSort,
@@ -992,6 +992,10 @@ impl AppState {
             join_port,
             join_password,
             extra_args: String::new(),
+            graphics_backend: self.config.tml_graphics_backend,
+            dotnet_tiered_pgo: self.config.dotnet_tiered_pgo,
+            dotnet_server_gc: self.config.dotnet_server_gc,
+            process_priority: self.config.game_process_priority,
         };
 
         match launch_game(&self.paths, &opts) {
@@ -1347,7 +1351,18 @@ impl AppState {
         }
 
         let handle = self.rt.handle().clone();
-        match start_server(&handle, self.paths.clone(), profile, self.repaint.clone()) {
+        let tuning = RuntimeTuning {
+            tiered_pgo: self.config.dotnet_tiered_pgo,
+            server_gc: self.config.dotnet_server_gc,
+            process_priority: self.config.game_process_priority,
+        };
+        match start_server(
+            &handle,
+            self.paths.clone(),
+            profile,
+            tuning,
+            self.repaint.clone(),
+        ) {
             Ok(sup) => {
                 self.server_snapshot = self
                     .sys

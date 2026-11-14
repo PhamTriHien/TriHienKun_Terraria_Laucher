@@ -1,7 +1,10 @@
 use crate::game_runner::{
-    apply_dotnet_tokio_env, map_dotnet_spawn_error, native_lib_path_env, resolve_dotnet_launch,
-    split_shell_args, DotnetLaunchSpec,
+    apply_dotnet_tokio_env, apply_dotnet_tuning_tokio_env, map_dotnet_spawn_error,
+    native_lib_path_env, resolve_dotnet_launch, split_shell_args, DotnetLaunchSpec,
+    RuntimeTuning,
 };
+#[cfg(windows)]
+use crate::game_runner::windows_priority_flag;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -232,6 +235,7 @@ pub fn start_server(
     rt: &tokio::runtime::Handle,
     paths: LauncherPaths,
     profile: ServerProfile,
+    tuning: RuntimeTuning,
     repaint_ctx: egui_repaint::RepaintHandle,
 ) -> LauncherResult<ServerSupervisor> {
     paths.ensure_dirs()?;
@@ -297,7 +301,15 @@ pub fn start_server(
 
     let sup_clone = supervisor.clone();
     rt.spawn(async move {
-        run_server_supervisor(sup_clone, paths, profile, config_file, repaint_ctx).await;
+        run_server_supervisor(
+            sup_clone,
+            paths,
+            profile,
+            config_file,
+            tuning,
+            repaint_ctx,
+        )
+        .await;
     });
 
     Ok(supervisor)
@@ -308,11 +320,12 @@ async fn run_server_supervisor(
     paths: LauncherPaths,
     profile: ServerProfile,
     config_file: PathBuf,
+    tuning: RuntimeTuning,
     repaint: egui_repaint::RepaintHandle,
 ) {
     loop {
         sup.stop_requested.store(false, Ordering::SeqCst);
-        match spawn_server_process(&paths, &profile, &config_file) {
+        match spawn_server_process(&paths, &profile, &config_file, tuning) {
             Ok(mut child) => {
                 let pid = child.id();
                 *sup.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = pid;
@@ -420,6 +433,7 @@ fn spawn_server_process(
     paths: &LauncherPaths,
     profile: &ServerProfile,
     config_file: &Path,
+    tuning: RuntimeTuning,
 ) -> LauncherResult<Child> {
     let mut dotnet_spec: Option<DotnetLaunchSpec> = None;
     let mut cmd = match profile.edition {
@@ -434,6 +448,7 @@ fn spawn_server_process(
             let mut c = Command::new(&spec.executable);
             c.current_dir(&paths.tmodloader_dir);
             apply_dotnet_tokio_env(&spec, &mut c);
+            apply_dotnet_tuning_tokio_env(tuning, &mut c);
             if let Some(path_env) = native_lib_path_env(&paths.tmodloader_dir) {
                 c.env("PATH", path_env);
             }
@@ -456,7 +471,7 @@ fn spawn_server_process(
     }
 
     #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.creation_flags(CREATE_NO_WINDOW | windows_priority_flag(tuning.process_priority));
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

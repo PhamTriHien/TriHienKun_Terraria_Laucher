@@ -9,16 +9,52 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-use tl_core::{is_xna_framework_installed, GameEdition, LauncherError, LauncherPaths, LauncherResult};
+use tl_core::{
+    is_xna_framework_installed, GameEdition, GraphicsBackend, LauncherError, LauncherPaths,
+    LauncherResult, ProcessPriority,
+};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    ABOVE_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW as WIN32_CREATE_NO_WINDOW, HIGH_PRIORITY_CLASS,
+};
 
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NO_WINDOW: u32 = WIN32_CREATE_NO_WINDOW.0;
 const MAX_RECENT_OUTPUT_LINES: usize = 80;
 const DOTNET_ROLL_FORWARD_ENV: &str = "DOTNET_ROLL_FORWARD";
+const DOTNET_TIERED_PGO_ENV: &str = "DOTNET_TieredPGO";
+const DOTNET_GC_SERVER_ENV: &str = "DOTNET_gcServer";
+const FNA3D_FORCE_DRIVER_ENV: &str = "FNA3D_FORCE_DRIVER";
 const LAST_LAUNCH_LOG_NAME: &str = "last-game-launch.log";
+
+#[cfg(windows)]
+pub(crate) fn windows_priority_flag(priority: ProcessPriority) -> u32 {
+    match priority {
+        ProcessPriority::Normal => 0,
+        ProcessPriority::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS.0,
+        ProcessPriority::High => HIGH_PRIORITY_CLASS.0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeTuning {
+    pub tiered_pgo: bool,
+    pub server_gc: bool,
+    pub process_priority: ProcessPriority,
+}
+
+impl Default for RuntimeTuning {
+    fn default() -> Self {
+        Self {
+            tiered_pgo: true,
+            server_gc: false,
+            process_priority: ProcessPriority::Normal,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DotnetLaunchSpec {
@@ -26,7 +62,7 @@ pub struct DotnetLaunchSpec {
     pub using_bundled: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GameLaunchOptions {
     pub edition: GameEdition,
     pub modpack: String,
@@ -34,6 +70,38 @@ pub struct GameLaunchOptions {
     pub join_port: u16,
     pub join_password: String,
     pub extra_args: String,
+    pub graphics_backend: GraphicsBackend,
+    pub dotnet_tiered_pgo: bool,
+    pub dotnet_server_gc: bool,
+    pub process_priority: ProcessPriority,
+}
+
+impl Default for GameLaunchOptions {
+    fn default() -> Self {
+        let tuning = RuntimeTuning::default();
+        Self {
+            edition: GameEdition::default(),
+            modpack: String::new(),
+            join_host: String::new(),
+            join_port: 0,
+            join_password: String::new(),
+            extra_args: String::new(),
+            graphics_backend: GraphicsBackend::Auto,
+            dotnet_tiered_pgo: tuning.tiered_pgo,
+            dotnet_server_gc: tuning.server_gc,
+            process_priority: tuning.process_priority,
+        }
+    }
+}
+
+impl GameLaunchOptions {
+    pub fn runtime_tuning(&self) -> RuntimeTuning {
+        RuntimeTuning {
+            tiered_pgo: self.dotnet_tiered_pgo,
+            server_gc: self.dotnet_server_gc,
+            process_priority: self.process_priority,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +212,29 @@ fn launch_vanilla(
     paths: &LauncherPaths,
     opts: &GameLaunchOptions,
 ) -> LauncherResult<ActiveGameProcess> {
+    let cmd = build_vanilla_command(paths, opts)?;
+
+    spawn_tracked_game(
+        GameEdition::Vanilla,
+        cmd,
+        paths,
+        None,
+        "Không thể chạy Terraria.exe",
+    )
+}
+
+pub(crate) fn build_vanilla_command(
+    paths: &LauncherPaths,
+    opts: &GameLaunchOptions,
+) -> LauncherResult<Command> {
+    build_vanilla_command_with_xna(paths, opts, is_xna_framework_installed())
+}
+
+fn build_vanilla_command_with_xna(
+    paths: &LauncherPaths,
+    opts: &GameLaunchOptions,
+    xna_installed: bool,
+) -> LauncherResult<Command> {
     let exe = paths.terraria_exe();
     if !exe.is_file() {
         return Err(LauncherError::NotFound(format!(
@@ -151,7 +242,7 @@ fn launch_vanilla(
             exe.display()
         )));
     }
-    if !is_xna_framework_installed() {
+    if !xna_installed {
         return Err(LauncherError::NotFound(
             "Thiếu Microsoft XNA Framework 4.0. Hãy nhấn 'Cài đặt XNA 4.0' ở mục Kiểm tra môi trường.".to_string(),
         ));
@@ -163,13 +254,15 @@ fn launch_vanilla(
     append_join_args(&mut cmd, opts);
     append_extra_args(&mut cmd, &opts.extra_args);
 
-    spawn_tracked_game(
-        GameEdition::Vanilla,
-        cmd,
-        paths,
-        None,
-        "Không thể chạy Terraria.exe",
-    )
+    #[cfg(windows)]
+    {
+        let flag = windows_priority_flag(opts.process_priority);
+        if flag != 0 {
+            cmd.creation_flags(flag);
+        }
+    }
+
+    Ok(cmd)
 }
 
 fn launch_tmodloader(
@@ -211,12 +304,20 @@ fn build_tmodloader_command(
     let mut cmd = Command::new(&dotnet_spec.executable);
     cmd.current_dir(&paths.tmodloader_dir);
     apply_dotnet_std_env(&dotnet_spec, &mut cmd);
+    apply_dotnet_tuning_std_env(opts.runtime_tuning(), &mut cmd);
     prepend_native_lib_path(&mut cmd, &paths.tmodloader_dir);
 
     cmd.arg(&dll)
         .arg("-nosteam")
         .arg("-tmlsavedirectory")
         .arg(&paths.tml_saves_dir);
+
+    if let Some(driver) = opts.graphics_backend.fna_driver_name() {
+        cmd.env(FNA3D_FORCE_DRIVER_ENV, driver);
+        cmd.arg(format!("/gldevice:{driver}"));
+    } else {
+        cmd.env_remove(FNA3D_FORCE_DRIVER_ENV);
+    }
 
     let modpack = opts.modpack.trim();
     if should_pass_legacy_modpack_arg(paths, modpack) {
@@ -227,7 +328,7 @@ fn build_tmodloader_command(
     append_extra_args(&mut cmd, &opts.extra_args);
 
     #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.creation_flags(CREATE_NO_WINDOW | windows_priority_flag(opts.process_priority));
 
     Ok((cmd, dotnet_spec))
 }
@@ -396,6 +497,28 @@ pub fn apply_dotnet_std_env(spec: &DotnetLaunchSpec, cmd: &mut Command) {
 
 pub fn apply_dotnet_tokio_env(spec: &DotnetLaunchSpec, cmd: &mut tokio::process::Command) {
     apply_dotnet_env(spec, cmd);
+}
+
+fn apply_dotnet_tuning_env<C: ProcessCommandEnv>(tuning: RuntimeTuning, cmd: &mut C) {
+    cmd.set_env_var(
+        DOTNET_TIERED_PGO_ENV,
+        OsStr::new(if tuning.tiered_pgo { "1" } else { "0" }),
+    );
+    cmd.set_env_var(
+        DOTNET_GC_SERVER_ENV,
+        OsStr::new(if tuning.server_gc { "1" } else { "0" }),
+    );
+}
+
+pub(crate) fn apply_dotnet_tuning_std_env(tuning: RuntimeTuning, cmd: &mut Command) {
+    apply_dotnet_tuning_env(tuning, cmd);
+}
+
+pub(crate) fn apply_dotnet_tuning_tokio_env(
+    tuning: RuntimeTuning,
+    cmd: &mut tokio::process::Command,
+) {
+    apply_dotnet_tuning_env(tuning, cmd);
 }
 
 pub(crate) fn map_dotnet_spawn_error(
@@ -889,6 +1012,148 @@ mod tests {
                 assert!(msg.contains("Cài đặt .NET 8 Portable"));
             }
             other => panic!("expected LauncherError::NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tmodloader_command_applies_default_tuning_and_auto_graphics() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_tml_auto");
+        fs::write(paths.tmodloader_dll(), b"DLL").unwrap();
+        fs::create_dir_all(paths.terraria_dir.join("Content")).unwrap();
+
+        let (cmd, _) = build_tmodloader_command(&paths, &GameLaunchOptions::default()).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a.starts_with("/gldevice:")));
+
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(envs.get(OsStr::new(FNA3D_FORCE_DRIVER_ENV)), Some(&None));
+        assert_eq!(
+            envs.get(OsStr::new(DOTNET_TIERED_PGO_ENV)),
+            Some(&Some(OsStr::new("1")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new(DOTNET_GC_SERVER_ENV)),
+            Some(&Some(OsStr::new("0")))
+        );
+    }
+
+    #[test]
+    fn build_tmodloader_command_applies_vulkan_and_custom_dotnet_tuning() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_tml_vulkan");
+        fs::write(paths.tmodloader_dll(), b"DLL").unwrap();
+        fs::create_dir_all(paths.terraria_dir.join("Content")).unwrap();
+
+        let opts = GameLaunchOptions {
+            edition: GameEdition::TModLoader,
+            graphics_backend: GraphicsBackend::Vulkan,
+            dotnet_tiered_pgo: false,
+            dotnet_server_gc: true,
+            process_priority: ProcessPriority::High,
+            ..Default::default()
+        };
+        let (cmd, _) = build_tmodloader_command(&paths, &opts).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a == "/gldevice:Vulkan"));
+
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new(FNA3D_FORCE_DRIVER_ENV)),
+            Some(&Some(OsStr::new("Vulkan")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new(DOTNET_TIERED_PGO_ENV)),
+            Some(&Some(OsStr::new("0")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new(DOTNET_GC_SERVER_ENV)),
+            Some(&Some(OsStr::new("1")))
+        );
+
+        let mut tokio_cmd = tokio::process::Command::new("dotnet");
+        apply_dotnet_tuning_tokio_env(opts.runtime_tuning(), &mut tokio_cmd);
+        let tokio_envs: HashMap<_, _> = tokio_cmd.as_std().get_envs().collect();
+        assert_eq!(
+            tokio_envs.get(OsStr::new(DOTNET_TIERED_PGO_ENV)),
+            Some(&Some(OsStr::new("0")))
+        );
+        assert_eq!(
+            tokio_envs.get(OsStr::new(DOTNET_GC_SERVER_ENV)),
+            Some(&Some(OsStr::new("1")))
+        );
+
+        #[cfg(windows)]
+        {
+            assert_eq!(windows_priority_flag(ProcessPriority::Normal), 0);
+            assert_eq!(
+                windows_priority_flag(ProcessPriority::AboveNormal),
+                ABOVE_NORMAL_PRIORITY_CLASS.0
+            );
+            assert_eq!(
+                windows_priority_flag(ProcessPriority::High),
+                HIGH_PRIORITY_CLASS.0
+            );
+        }
+    }
+
+    #[test]
+    fn build_vanilla_command_validates_executable_xna_and_omits_dotnet_env() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_vanilla_cmd");
+        let opts = GameLaunchOptions {
+            edition: GameEdition::Vanilla,
+            join_host: "127.0.0.1".to_string(),
+            join_port: 7777,
+            extra_args: "-noupnp".to_string(),
+            graphics_backend: GraphicsBackend::Vulkan,
+            dotnet_tiered_pgo: false,
+            dotnet_server_gc: true,
+            process_priority: ProcessPriority::AboveNormal,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            build_vanilla_command(&paths, &opts),
+            Err(LauncherError::NotFound(_))
+        ));
+
+        fs::write(paths.terraria_exe(), b"MZ").unwrap();
+        assert!(matches!(
+            build_vanilla_command_with_xna(&paths, &opts, false),
+            Err(LauncherError::NotFound(_))
+        ));
+
+        let cmd = build_vanilla_command_with_xna(&paths, &opts, true).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let expected_saves = paths.vanilla_saves_dir.to_string_lossy().into_owned();
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-savedirectory" && w[1] == expected_saves));
+        assert!(args.iter().any(|a| a == "-noupnp"));
+
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert!(!envs.contains_key(OsStr::new(DOTNET_TIERED_PGO_ENV)));
+        assert!(!envs.contains_key(OsStr::new(DOTNET_GC_SERVER_ENV)));
+        assert!(!envs.contains_key(OsStr::new(DOTNET_ROLL_FORWARD_ENV)));
+        assert!(!envs.contains_key(OsStr::new(FNA3D_FORCE_DRIVER_ENV)));
+
+        match build_vanilla_command(&paths, &opts) {
+            Ok(real_cmd) => {
+                assert!(is_xna_framework_installed());
+                let real_envs: HashMap<_, _> = real_cmd.get_envs().collect();
+                assert!(!real_envs.contains_key(OsStr::new(DOTNET_TIERED_PGO_ENV)));
+                assert!(!real_envs.contains_key(OsStr::new(DOTNET_GC_SERVER_ENV)));
+                assert!(!real_envs.contains_key(OsStr::new(FNA3D_FORCE_DRIVER_ENV)));
+            }
+            Err(LauncherError::NotFound(_)) => assert!(!is_xna_framework_installed()),
+            Err(other) => panic!("unexpected build_vanilla_command error: {other:?}"),
         }
     }
 }

@@ -31,6 +31,57 @@ pub enum ThemeMode {
     Light,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GraphicsBackend {
+    #[default]
+    Auto,
+    D3d11,
+    Vulkan,
+    OpenGl,
+}
+
+impl GraphicsBackend {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::D3d11, Self::Vulkan, Self::OpenGl];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Tự động (Mặc định)",
+            Self::D3d11 => "Direct3D 11",
+            Self::Vulkan => "Vulkan",
+            Self::OpenGl => "OpenGL",
+        }
+    }
+
+    pub fn fna_driver_name(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::D3d11 => Some("D3D11"),
+            Self::Vulkan => Some("Vulkan"),
+            Self::OpenGl => Some("OpenGL"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ProcessPriority {
+    #[default]
+    Normal,
+    AboveNormal,
+    High,
+}
+
+impl ProcessPriority {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::AboveNormal, Self::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Bình thường",
+            Self::AboveNormal => "Ưu tiên cao hơn",
+            Self::High => "Cao",
+        }
+    }
+}
+
 impl ThemeMode {
     pub fn label(self) -> &'static str {
         match self {
@@ -401,6 +452,10 @@ pub struct LauncherConfig {
     pub proxy_url: String,
     pub auto_firewall: bool,
     pub auto_upnp: bool,
+    pub tml_graphics_backend: GraphicsBackend,
+    pub dotnet_tiered_pgo: bool,
+    pub dotnet_server_gc: bool,
+    pub game_process_priority: ProcessPriority,
 }
 
 impl Default for LauncherConfig {
@@ -473,6 +528,10 @@ impl Default for LauncherConfig {
             proxy_url: String::new(),
             auto_firewall: true,
             auto_upnp: true,
+            tml_graphics_backend: GraphicsBackend::Auto,
+            dotnet_tiered_pgo: true,
+            dotnet_server_gc: false,
+            game_process_priority: ProcessPriority::Normal,
         }
     }
 }
@@ -530,4 +589,45 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_backend_maps_to_expected_fna3d_driver_names() {
+        assert_eq!(GraphicsBackend::Auto.fna_driver_name(), None);
+        assert_eq!(GraphicsBackend::D3d11.fna_driver_name(), Some("D3D11"));
+        assert_eq!(GraphicsBackend::Vulkan.fna_driver_name(), Some("Vulkan"));
+        assert_eq!(GraphicsBackend::OpenGl.fna_driver_name(), Some("OpenGL"));
+    }
+
+    #[test]
+    fn legacy_launcher_config_json_uses_safe_performance_defaults() {
+        let legacy_json = r#"{"active_edition":"TModLoader","bore_server":"bore.pub"}"#;
+        let parsed: LauncherConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.tml_graphics_backend, GraphicsBackend::Auto);
+        assert!(parsed.dotnet_tiered_pgo);
+        assert!(!parsed.dotnet_server_gc);
+        assert_eq!(parsed.game_process_priority, ProcessPriority::Normal);
+    }
+
+    #[test]
+    fn launcher_config_roundtrips_performance_settings() {
+        let cfg = LauncherConfig {
+            tml_graphics_backend: GraphicsBackend::Vulkan,
+            dotnet_tiered_pgo: false,
+            dotnet_server_gc: true,
+            game_process_priority: ProcessPriority::High,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtrip: LauncherConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.tml_graphics_backend, GraphicsBackend::Vulkan);
+        assert!(!roundtrip.dotnet_tiered_pgo);
+        assert!(roundtrip.dotnet_server_gc);
+        assert_eq!(roundtrip.game_process_priority, ProcessPriority::High);
+    }
 }

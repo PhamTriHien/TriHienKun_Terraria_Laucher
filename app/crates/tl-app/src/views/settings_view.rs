@@ -4,7 +4,7 @@ use crate::theme::ThemePalette;
 use crate::views::play_view::render_install_progress_bar;
 use crate::{anim3d, theme};
 use egui::RichText;
-use tl_core::ThemeMode;
+use tl_core::{GraphicsBackend, ProcessPriority, ThemeMode};
 use tl_runtime::TmodLoaderReleaseInfo;
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
@@ -215,6 +215,10 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
 
+    render_performance_card(state, assets.as_ref(), ui, p);
+
+    ui.add_space(12.0);
+
     render_game_installer_card(state, assets.as_ref(), ui, p);
 
     ui.add_space(12.0);
@@ -355,6 +359,132 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             state.refresh_environment();
             state.notify_ok("Đã lưu cài đặt và làm mới cấu hình.");
         }
+    });
+}
+
+fn render_performance_card(
+    state: &mut AppState,
+    assets: &LauncherAssets,
+    ui: &mut egui::Ui,
+    p: ThemePalette,
+) {
+    theme::rpg_card(ui, assets, p, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            theme::rpg_section_heading(
+                ui,
+                assets,
+                p,
+                UiIcon::Settings,
+                "Hiệu năng & Đồ họa",
+            );
+            theme::status_pill(
+                ui,
+                &format!(
+                    "Đồ họa: {} • CPU: {}",
+                    state.config.tml_graphics_backend.label(),
+                    state.config.game_process_priority.label()
+                ),
+                p.accent_cyan,
+            );
+        });
+        ui.add_space(8.0);
+
+        theme::rpg_subcard(ui, assets, p, |ui| {
+            ui.label(
+                RichText::new("Graphics Backend (tModLoader)")
+                    .strong()
+                    .color(p.text_primary),
+            );
+            ui.add_space(6.0);
+
+            let current_backend = state.config.tml_graphics_backend;
+            let mut next_backend = None;
+            ui.horizontal_wrapped(|ui| {
+                for backend in GraphicsBackend::ALL {
+                    let active = current_backend == backend;
+                    if theme::rpg_selectable_button(
+                        ui,
+                        assets,
+                        p,
+                        active,
+                        ButtonSkin::Cyan,
+                        UiIcon::Play,
+                        backend.label(),
+                    )
+                    .clicked()
+                        && !active
+                    {
+                        next_backend = Some(backend);
+                    }
+                }
+            });
+            if let Some(backend) = next_backend {
+                state.config.tml_graphics_backend = backend;
+                state.save_config();
+            }
+
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Windows dùng card rời (RTX/GTX/RX) mặc định Tự động chọn Direct3D 11. Chỉ đổi sang Vulkan hoặc OpenGL nếu bị lỗi hiển thị hoặc tụt FPS bất thường.")
+                    .size(12.0)
+                    .color(p.text_muted),
+            );
+        });
+
+        ui.add_space(8.0);
+
+        theme::rpg_subcard(ui, assets, p, |ui| {
+            ui.label(
+                RichText::new("Tối ưu .NET 8 (tModLoader) & CPU")
+                    .strong()
+                    .color(p.text_primary),
+            );
+            ui.add_space(6.0);
+
+            let pgo_changed = ui
+                .checkbox(
+                    &mut state.config.dotnet_tiered_pgo,
+                    "Bật tối ưu JIT tăng tốc theo thời gian (Tiered PGO)",
+                )
+                .changed();
+            let gc_changed = ui
+                .checkbox(
+                    &mut state.config.dotnet_server_gc,
+                    "Dùng Server GC cho modpack nặng (tiêu tốn RAM hơn)",
+                )
+                .changed();
+            if pgo_changed || gc_changed {
+                state.save_config();
+            }
+
+            ui.add_space(6.0);
+            let current_priority = state.config.game_process_priority;
+            let mut next_priority = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Ưu tiên CPU:").color(p.text_muted));
+                for prio in ProcessPriority::ALL {
+                    let active = current_priority == prio;
+                    if theme::rpg_selectable_button(
+                        ui,
+                        assets,
+                        p,
+                        active,
+                        ButtonSkin::Amber,
+                        UiIcon::Settings,
+                        prio.label(),
+                    )
+                    .clicked()
+                        && !active
+                    {
+                        next_priority = Some(prio);
+                    }
+                }
+            });
+            if let Some(prio) = next_priority {
+                state.config.game_process_priority = prio;
+                state.save_config();
+            }
+        });
     });
 }
 
