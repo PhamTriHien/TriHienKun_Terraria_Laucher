@@ -10,6 +10,7 @@ use crate::state::{AppState, NavTab};
 use crate::theme::{rpg_compact_button, rpg_selectable_button, rpg_subcard};
 use egui::{pos2, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke};
 use tl_core::ThemeMode;
+use tl_runtime::ServerLifecycleState;
 
 pub fn render_root(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
@@ -39,6 +40,7 @@ pub fn render_root(state: &mut AppState, ui: &mut egui::Ui) {
         )
         .show(ui, |ui| {
             render_notification_banner(state, ui);
+            render_close_bridge_confirm_banner(state, ui);
             egui::ScrollArea::vertical()
                 .id_salt(("tl_main_scroll", state.active_tab as u8))
                 .auto_shrink([false, false])
@@ -140,7 +142,16 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
             );
 
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                if state.active_tab == NavTab::Settings && tab != NavTab::Settings {
+                    state.save_config();
+                    if !state.is_runtime_or_task_busy_for_paths() {
+                        state.refresh_environment();
+                    }
+                }
                 state.active_tab = tab;
+                if tab == NavTab::Server {
+                    state.refresh_worlds_and_backups();
+                }
             }
             ui.add_space(4.0);
         }
@@ -221,15 +232,25 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                 .size(11.5)
                                 .color(p.text_muted),
                             );
-                            if rpg_compact_button(
-                                ui,
-                                assets.as_ref(),
-                                p,
-                                ButtonSkin::Red,
-                                Some(UiIcon::Stop),
-                                "Lưu & Tắt",
-                            )
-                            .clicked()
+                            let is_stopping =
+                                matches!(snap.state, ServerLifecycleState::Stopping);
+                            if ui
+                                .add_enabled_ui(!is_stopping, |ui| {
+                                    rpg_compact_button(
+                                        ui,
+                                        assets.as_ref(),
+                                        p,
+                                        ButtonSkin::Red,
+                                        Some(UiIcon::Stop),
+                                        if is_stopping {
+                                            "Đang lưu..."
+                                        } else {
+                                            "Lưu & Tắt"
+                                        },
+                                    )
+                                })
+                                .inner
+                                .clicked()
                             {
                                 stop_profile_id = Some(profile_id.clone());
                             }
@@ -375,4 +396,62 @@ fn render_notification_banner(state: &mut AppState, ui: &mut egui::Ui) {
         state.notification = None;
     }
     ui.add_space(10.0);
+}
+
+fn render_close_bridge_confirm_banner(state: &mut AppState, ui: &mut egui::Ui) {
+    if !state.confirm_close_bridge_modal {
+        return;
+    }
+    let p = state.palette();
+    let assets = state.assets.clone();
+    let color = p.accent_amber;
+    let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 28);
+    let mut stay_clicked = false;
+    let mut exit_clicked = false;
+    Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, color))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(state.close_confirm_message())
+                    .size(13.0)
+                    .color(p.text_primary),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if rpg_compact_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Slate,
+                    None,
+                    "Ở lại",
+                )
+                .clicked()
+                {
+                    stay_clicked = true;
+                }
+                if rpg_compact_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Red,
+                    None,
+                    "Vẫn đóng",
+                )
+                .clicked()
+                {
+                    exit_clicked = true;
+                }
+            });
+        });
+    ui.add_space(10.0);
+    if exit_clicked {
+        state.confirm_close_bridge_and_exit(ui.ctx());
+    } else if stay_clicked {
+        state.cancel_close_bridge_modal();
+    }
 }

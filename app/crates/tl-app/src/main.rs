@@ -16,6 +16,12 @@ struct TerrariaLauncherApp {
 impl eframe::App for TerrariaLauncherApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.state.poll_background(ctx);
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.state.should_block_close_for_active_bridge()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.request_repaint();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -34,7 +40,10 @@ impl eframe::App for TerrariaLauncherApp {
 fn ensure_portable_cwd() {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            if dir.join("Terraria").is_dir() || dir.join("tModLoader").is_dir() {
+            if dir.join("Terraria").is_dir()
+                || dir.join("tModLoader").is_dir()
+                || dir.join("data").is_dir()
+            {
                 let _ = std::env::set_current_dir(dir);
                 return;
             }
@@ -51,6 +60,10 @@ fn main() -> eframe::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,wgpu_core=warn,wgpu_hal=warn,naga=warn")
         .try_init();
+
+    let Some(_instance_guard) = tl_runtime::acquire_single_instance_guard() else {
+        return Ok(());
+    };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Terraria Launcher")

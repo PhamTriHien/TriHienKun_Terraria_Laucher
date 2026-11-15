@@ -2,12 +2,14 @@ use crate::http_client::build_http_client;
 #[cfg(windows)]
 use crate::mods_manager::CREATE_NO_WINDOW;
 use crate::mods_manager::{
-    browse_workshop_mods, collect_tmods_recursive, download_and_install_tmod_url_with_source,
-    enrich_workshop_items_batch, fetch_github_latest_tmod, import_local_mod_files,
-    parse_workshop_id, pick_best_workshop_tmod, record_workshop_install, scan_installed_mods,
-    scan_staged_workshop_mods, validate_workshop_id, workshop_staging_content_dir,
-    InstalledModEntry, RemoteTmodAsset, StagedWorkshopMod, WorkshopItemDetails,
-    WorkshopManifestRecord, WorkshopSort, TMODLOADER_STEAM_APP_ID,
+    apply_proxy_env, browse_workshop_mods, collect_tmods_recursive,
+    detect_installed_tml_year_month, download_and_install_tmod_url_with_source,
+    enrich_workshop_items_batch, fetch_github_latest_tmod, has_any_tmod_changed_or_new,
+    import_local_mod_files, parse_workshop_id, pick_best_workshop_tmods, record_workshop_install,
+    scan_installed_mods, scan_staged_workshop_mods, snapshot_tmod_files, validate_workshop_id,
+    workshop_staging_content_dir, InstalledModEntry, RemoteTmodAsset, StagedWorkshopMod,
+    TmodFileSnapshot, WorkshopItemDetails, WorkshopManifestRecord, WorkshopSort,
+    TMODLOADER_STEAM_APP_ID,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -520,6 +522,7 @@ pub async fn sync_modpack_from_share_key(
     paths: &LauncherPaths,
     steamcmd_exe: Option<&Path>,
     proxy_url: Option<&str>,
+    github_token: Option<&str>,
     active_modpack: &str,
     payload: &ModPackShareKeyPayload,
     desired_pack_name: &str,
@@ -593,7 +596,7 @@ pub async fn sync_modpack_from_share_key(
             if !matches!(entry.source, SharedModSource::ManualOnly)
                 && !existing_sources
                     .iter()
-                    .any(|r| r.internal_name == entry.internal_name)
+                    .any(|r| r.internal_name.eq_ignore_ascii_case(&entry.internal_name))
             {
                 let _ = upsert_mod_source(
                     paths,
@@ -698,7 +701,7 @@ pub async fn sync_modpack_from_share_key(
             "Đang tải mod từ GitHub / URL...",
         );
 
-        let res = download_other_mod_entry(paths, proxy_url, entry, &log_cb).await;
+        let res = download_other_mod_entry(paths, proxy_url, github_token, entry, &log_cb).await;
         match res {
             Ok(meta) => {
                 downloaded_other += 1;
@@ -725,14 +728,29 @@ pub async fn sync_modpack_from_share_key(
         );
     }
 
+    let mut missing_manual_names = HashSet::new();
     for entry in pending_manual {
-        emit_log(
-            &log_cb,
-            format!(
-                "Thiếu mod thủ công '{}': cần cài file .tmod từ chủ phòng.",
-                entry.internal_name
-            ),
-        );
+        if let Some(existing) = initial_installed
+            .iter()
+            .find(|m| m.meta.internal_name.eq_ignore_ascii_case(&entry.internal_name))
+        {
+            emit_log(
+                &log_cb,
+                format!(
+                    "Thiếu mod thủ công '{}' (đang có v{}, cần v{}): cần cài file .tmod từ chủ phòng.",
+                    entry.internal_name, existing.meta.version, entry.version
+                ),
+            );
+        } else {
+            emit_log(
+                &log_cb,
+                format!(
+                    "Thiếu mod thủ công '{}': cần cài file .tmod từ chủ phòng.",
+                    entry.internal_name
+                ),
+            );
+        }
+        missing_manual_names.insert(entry.internal_name.clone());
         missing_manual.push(entry.internal_name.clone());
         completed.fetch_add(1, Ordering::Relaxed);
         emit_progress(
@@ -746,27 +764,43 @@ pub async fn sync_modpack_from_share_key(
 
     let all_installed = scan_installed_mods(paths)?;
     let all_metas: Vec<TmodMetadata> = all_installed.into_iter().map(|e| e.meta).collect();
-    let installed_name_set: HashSet<String> =
-        all_metas.iter().map(|m| m.internal_name.clone()).collect();
+    let installed_by_lower: HashMap<String, String> = all_metas
+        .iter()
+        .map(|m| (m.internal_name.to_ascii_lowercase(), m.internal_name.clone()))
+        .collect();
+    let failed_lower: HashSet<String> = failed_names
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let missing_manual_lower: HashSet<String> = missing_manual_names
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let resolved_lower: HashMap<String, String> = resolved_internal_names
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+        .collect();
 
     let mut seen_enabled = HashSet::new();
     let mut pack_enabled_names = Vec::new();
     let mut workshop_ids = Vec::new();
 
     for entry in &payload.mods {
+        let entry_lower = entry.internal_name.to_ascii_lowercase();
+        if failed_lower.contains(&entry_lower) || missing_manual_lower.contains(&entry_lower) {
+            continue;
+        }
         if let SharedModSource::Workshop { id } = &entry.source {
             workshop_ids.push(id.clone());
         }
-        if failed_names.contains(&entry.internal_name) {
-            continue;
-        }
-        let target_name = resolved_internal_names
-            .get(&entry.internal_name)
-            .map(String::as_str)
-            .unwrap_or(&entry.internal_name);
-        if installed_name_set.contains(target_name) && seen_enabled.insert(target_name.to_string())
-        {
-            pack_enabled_names.push(target_name.to_string());
+        let target_lower = resolved_lower
+            .get(&entry_lower)
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or(entry_lower);
+        if let Some(canonical_name) = installed_by_lower.get(&target_lower) {
+            if seen_enabled.insert(canonical_name.to_ascii_lowercase()) {
+                pack_enabled_names.push(canonical_name.clone());
+            }
         }
     }
 
@@ -887,6 +921,12 @@ async fn run_batched_workshop_sync(
         &format!("Đang tải {} mod Workshop qua SteamCMD...", unique_ids.len()),
     );
 
+    let staging_content = workshop_staging_content_dir(paths);
+    let before_snapshots: HashMap<String, TmodFileSnapshot> = unique_ids
+        .iter()
+        .map(|wid| (wid.clone(), snapshot_tmod_files(&staging_content.join(wid))))
+        .collect();
+
     let mut cmd = Command::new(exe);
     cmd.arg("+force_install_dir")
         .arg(&staging_dir)
@@ -898,6 +938,7 @@ async fn run_batched_workshop_sync(
             .arg(wid);
     }
     cmd.arg("+quit");
+    apply_proxy_env(&mut cmd, proxy_url);
 
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -964,8 +1005,8 @@ async fn run_batched_workshop_sync(
         let _ = h.await;
     }
 
-    let exit_code = match wait_res {
-        Ok(status) => status.code(),
+    let (status_success, exit_code) = match wait_res {
+        Ok(status) => (status.success(), status.code()),
         Err(e) => {
             let msg = format!("Lỗi chờ steamcmd.exe: {e}");
             emit_log(log_cb, msg.clone());
@@ -993,20 +1034,53 @@ async fn run_batched_workshop_sync(
         .map(|d| (d.published_file_id.clone(), d))
         .collect();
 
-    let staging_content = workshop_staging_content_dir(paths);
     let counted_snapshot = live_counted
         .lock()
         .map(|s| s.clone())
         .unwrap_or_default();
 
+    let target_tml_ym = detect_installed_tml_year_month(paths);
     for wid in unique_ids {
         let entries = &entries_by_id[&wid];
         let item_dir = staging_content.join(&wid);
+        let wid_dir_changed = before_snapshots
+            .get(&wid)
+            .is_some_and(|before| has_any_tmod_changed_or_new(&item_dir, before));
+        let wid_downloaded = should_accept_workshop_download_for_batch(
+            &counted_snapshot,
+            &wid,
+            status_success,
+            wid_dir_changed,
+        );
+
+        if !wid_downloaded {
+            let msg = format!(
+                "SteamCMD không tải được Workshop ID {wid} (mã thoát {exit_code:?})."
+            );
+            emit_log(log_cb, msg.clone());
+            for entry in entries {
+                outcome
+                    .failed
+                    .push((entry.internal_name.clone(), msg.clone()));
+            }
+            if !counted_snapshot.contains(&wid) {
+                completed.fetch_add(entries.len(), Ordering::Relaxed);
+                emit_progress(
+                    progress_cb,
+                    completed,
+                    total,
+                    entry_label(entries[0]),
+                    &format!("Thất bại Workshop ID {wid}"),
+                );
+            }
+            continue;
+        }
+
         let mut found_tmods = Vec::new();
         collect_tmods_recursive(&item_dir, &mut found_tmods);
 
         for entry in entries {
-            let best_tmod = pick_tmod_for_entry(&found_tmods, &entry.internal_name);
+            let best_tmod = pick_tmod_for_entry(&found_tmods, entry, &item_dir, target_tml_ym);
             if let Some(tmod_path) = best_tmod {
                 match import_local_mod_files(&[tmod_path], paths, false) {
                     Ok(imported) => {
@@ -1022,7 +1096,7 @@ async fn run_batched_workshop_sync(
                         if let Some(first) = imported.first() {
                             if !imported
                                 .iter()
-                                .any(|m| m.internal_name == entry.internal_name)
+                                .any(|m| m.internal_name.eq_ignore_ascii_case(&entry.internal_name))
                                 && !first.internal_name.is_empty()
                             {
                                 outcome.resolved_names.insert(
@@ -1041,7 +1115,8 @@ async fn run_batched_workshop_sync(
                 }
             } else {
                 let msg = format!(
-                    "SteamCMD kết thúc ({exit_code:?}) nhưng không tìm thấy .tmod cho Workshop ID {wid}"
+                    "SteamCMD kết thúc ({exit_code:?}) nhưng không tìm thấy .tmod hợp lệ cho '{}' (Workshop ID {wid})",
+                    entry.internal_name
                 );
                 emit_log(log_cb, msg.clone());
                 outcome.failed.push((entry.internal_name.clone(), msg));
@@ -1061,6 +1136,15 @@ async fn run_batched_workshop_sync(
     }
 
     outcome
+}
+
+fn should_accept_workshop_download_for_batch(
+    counted_snapshot: &HashSet<String>,
+    wid: &str,
+    status_success: bool,
+    wid_dir_changed: bool,
+) -> bool {
+    counted_snapshot.contains(wid) || (status_success && wid_dir_changed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1112,6 +1196,7 @@ fn spawn_steamcmd_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 async fn download_other_mod_entry(
     paths: &LauncherPaths,
     proxy_url: Option<&str>,
+    github_token: Option<&str>,
     entry: &SharedModEntry,
     log_cb: &Arc<impl Fn(String) + Send + Sync + 'static>,
 ) -> LauncherResult<TmodMetadata> {
@@ -1145,7 +1230,7 @@ async fn download_other_mod_entry(
                 }
             }
 
-            let assets = fetch_github_latest_tmod(repo, proxy_url).await?;
+            let assets = fetch_github_latest_tmod(repo, proxy_url, github_token).await?;
             let chosen = pick_github_asset_for_mod(&assets, &entry.internal_name).ok_or_else(
                 || {
                     LauncherError::NotFound(format!(
@@ -1235,20 +1320,27 @@ fn pick_github_asset_for_mod<'a>(
     None
 }
 
-fn pick_tmod_for_entry(candidates: &[PathBuf], internal_name: &str) -> Option<PathBuf> {
+fn pick_tmod_for_entry(
+    candidates: &[PathBuf],
+    entry: &SharedModEntry,
+    stop_dir: &Path,
+    target_tml_ym: (u32, u32),
+) -> Option<PathBuf> {
     let matching: Vec<PathBuf> = candidates
         .iter()
         .filter(|p| {
             parse_tmod_file(p)
-                .map(|m| m.internal_name == internal_name)
+                .map(|m| meta_matches_shared_entry(&m, entry))
                 .unwrap_or(false)
         })
         .cloned()
         .collect();
-    if !matching.is_empty() {
-        return pick_best_workshop_tmod(&matching);
+    if matching.is_empty() {
+        return None;
     }
-    pick_best_workshop_tmod(candidates)
+    pick_best_workshop_tmods(&matching, stop_dir, target_tml_ym)
+        .into_iter()
+        .next()
 }
 
 fn find_matching_staged_mod<'a>(
@@ -1266,7 +1358,7 @@ fn find_matching_staged_mod<'a>(
 }
 
 fn meta_matches_shared_entry(meta: &TmodMetadata, entry: &SharedModEntry) -> bool {
-    if meta.internal_name != entry.internal_name {
+    if !meta.internal_name.eq_ignore_ascii_case(&entry.internal_name) {
         return false;
     }
     let req_ver = entry.version.trim();
@@ -1902,6 +1994,7 @@ mod tests {
             meta: override_meta,
             enabled: true,
             missing_deps: Vec::new(),
+            disabled_deps: Vec::new(),
         }];
 
         let mod_names = vec![
@@ -1980,6 +2073,7 @@ mod tests {
             meta: dummy_meta("SavedOverrideMod", "Saved Override Mod", "1.0.0", ""),
             enabled: true,
             missing_deps: Vec::new(),
+            disabled_deps: Vec::new(),
         }];
         let outdated_check =
             inspect_share_key_against_local(&paths, &preview.share_key, &outdated_installed, &[])
@@ -2112,6 +2206,7 @@ mod tests {
 
             let report = sync_modpack_from_share_key(
                 &paths,
+                None,
                 None,
                 None,
                 "",
@@ -2276,6 +2371,7 @@ mod tests {
                 &paths,
                 None,
                 None,
+                None,
                 "",
                 &payload,
                 "MissingSteamCmdPack",
@@ -2291,6 +2387,230 @@ mod tests {
             assert_eq!(report.failed_mods.len(), 1);
             assert_eq!(report.failed_mods[0].0, "MissingWsMod");
             assert!(report.failed_mods[0].1.contains("SteamCMD"));
+
+            let install_txt = fs::read_to_string(
+                paths
+                    .tml_modpacks_dir()
+                    .join(&report.pack_name)
+                    .join("Mods")
+                    .join("install.txt"),
+            )
+            .unwrap_or_default();
+            assert!(!install_txt.contains("2619954303"));
+
+            let _ = fs::remove_dir_all(&paths.base_dir);
+        });
+    }
+
+    #[test]
+    fn manual_only_version_mismatch_is_reported_missing_and_excluded_from_pack() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let paths = make_temp_paths("manual_mismatch");
+            paths.ensure_dirs().unwrap();
+
+            write_tmod_file(
+                &paths.tml_mods_dir().join("CustomPrivateMod.tmod"),
+                "CustomPrivateMod",
+                "Custom Private Mod",
+                "1.0.0",
+                "",
+            );
+
+            let payload = ModPackShareKeyPayload {
+                v: 1,
+                name: "ManualMismatchPack".to_string(),
+                mods: vec![SharedModEntry {
+                    internal_name: "CustomPrivateMod".to_string(),
+                    display_name: "Custom Private Mod".to_string(),
+                    version: "2.0.0".to_string(),
+                    source: SharedModSource::ManualOnly,
+                }],
+            };
+            let share_key = encode_modpack_share_key(&payload).unwrap();
+            let installed = scan_installed_mods(&paths).unwrap();
+            let check =
+                inspect_share_key_against_local(&paths, &share_key, &installed, &[]).unwrap();
+            assert_eq!(check.already_present_count, 0);
+            assert_eq!(check.manual_only_count, 1);
+
+            let report = sync_modpack_from_share_key(
+                &paths,
+                None,
+                None,
+                None,
+                "",
+                &payload,
+                "ManualMismatchPack",
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(report.already_present, 0);
+            assert_eq!(report.missing_manual, vec!["CustomPrivateMod"]);
+            let pack_enabled = tl_core::load_enabled_mods(
+                &paths
+                    .tml_modpacks_dir()
+                    .join(&report.pack_name)
+                    .join("Mods")
+                    .join("enabled.json"),
+            )
+            .unwrap_or_default();
+            assert!(pack_enabled.is_empty());
+
+            let _ = fs::remove_dir_all(&paths.base_dir);
+        });
+    }
+
+    #[test]
+    fn pick_tmod_for_entry_requires_matching_name_and_version_never_unrelated() {
+        let paths = make_temp_paths("pick_tmod_entry");
+        paths.ensure_dirs().unwrap();
+        let item_dir = workshop_staging_content_dir(&paths).join("987654321");
+        let unrelated = item_dir.join("2026.9").join("UnrelatedMod.tmod");
+        let target_v1 = item_dir.join("2026.9").join("MyTargetMod.tmod");
+        write_tmod_file(&unrelated, "UnrelatedMod", "Unrelated Mod", "1.0.0", "");
+        write_tmod_file(&target_v1, "MyTargetMod", "My Target Mod", "1.0.0", "");
+        let candidates = vec![unrelated.clone(), target_v1.clone()];
+
+        let missing_entry = SharedModEntry {
+            internal_name: "CompletelyDifferent".to_string(),
+            display_name: "Completely Different".to_string(),
+            version: "".to_string(),
+            source: SharedModSource::Workshop {
+                id: "987654321".to_string(),
+            },
+        };
+        assert_eq!(
+            pick_tmod_for_entry(&candidates, &missing_entry, &item_dir, (2026, 9)),
+            None
+        );
+
+        let wrong_version = SharedModEntry {
+            internal_name: "mytargetmod".to_string(),
+            display_name: "My Target Mod".to_string(),
+            version: "2.0.0".to_string(),
+            source: SharedModSource::Workshop {
+                id: "987654321".to_string(),
+            },
+        };
+        assert_eq!(
+            pick_tmod_for_entry(&candidates, &wrong_version, &item_dir, (2026, 9)),
+            None
+        );
+
+        let exact_match_ci = SharedModEntry {
+            internal_name: "mytargetmod".to_string(),
+            display_name: "My Target Mod".to_string(),
+            version: "1.0.0".to_string(),
+            source: SharedModSource::Workshop {
+                id: "987654321".to_string(),
+            },
+        };
+        assert_eq!(
+            pick_tmod_for_entry(&candidates, &exact_match_ci, &item_dir, (2026, 9)),
+            Some(target_v1)
+        );
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn batched_workshop_acceptance_requires_marker_or_success_with_change() {
+        let mut counted = HashSet::new();
+        assert!(!should_accept_workshop_download_for_batch(
+            &counted, "111", false, false
+        ));
+        assert!(!should_accept_workshop_download_for_batch(
+            &counted, "111", false, true
+        ));
+        assert!(!should_accept_workshop_download_for_batch(
+            &counted, "111", true, false
+        ));
+        assert!(should_accept_workshop_download_for_batch(
+            &counted, "111", true, true
+        ));
+
+        counted.insert("111".to_string());
+        assert!(should_accept_workshop_download_for_batch(
+            &counted, "111", false, false
+        ));
+    }
+
+    #[test]
+    fn sync_modpack_case_insensitive_present_and_omits_failed_workshop_from_install_txt() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let paths = make_temp_paths("install_txt_filter");
+            paths.ensure_dirs().unwrap();
+
+            write_tmod_file(
+                &paths.tml_mods_dir().join("ExistingWsMod.tmod"),
+                "ExistingWsMod",
+                "Existing Ws Mod",
+                "1.2.3",
+                "",
+            );
+
+            let payload = ModPackShareKeyPayload {
+                v: 1,
+                name: "FilterInstallTxtPack".to_string(),
+                mods: vec![
+                    SharedModEntry {
+                        internal_name: "existingwsmod".to_string(),
+                        display_name: "Existing Ws Mod".to_string(),
+                        version: "1.2.3".to_string(),
+                        source: SharedModSource::Workshop {
+                            id: "111111111".to_string(),
+                        },
+                    },
+                    SharedModEntry {
+                        internal_name: "FailedWsMod".to_string(),
+                        display_name: "Failed Ws Mod".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: SharedModSource::Workshop {
+                            id: "222222222".to_string(),
+                        },
+                    },
+                ],
+            };
+
+            let report = sync_modpack_from_share_key(
+                &paths,
+                None,
+                None,
+                None,
+                "",
+                &payload,
+                "FilterInstallTxtPack",
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(report.already_present, 1);
+            assert_eq!(report.failed_mods.len(), 1);
+            assert_eq!(report.failed_mods[0].0, "FailedWsMod");
+
+            let pack_mods_dir = paths.tml_modpacks_dir().join(&report.pack_name).join("Mods");
+            let pack_enabled =
+                tl_core::load_enabled_mods(&pack_mods_dir.join("enabled.json")).unwrap_or_default();
+            assert_eq!(pack_enabled, vec!["ExistingWsMod".to_string()]);
+
+            let install_txt = fs::read_to_string(pack_mods_dir.join("install.txt")).unwrap();
+            assert!(install_txt.contains("111111111"));
+            assert!(!install_txt.contains("222222222"));
 
             let _ = fs::remove_dir_all(&paths.base_dir);
         });

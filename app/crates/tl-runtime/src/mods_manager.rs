@@ -2,18 +2,19 @@ use crate::http_client::{build_http_client, normalize_proxy_url};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tl_core::config::write_atomic;
 use tl_core::{
-    load_enabled_mods, parse_tmod_file, save_enabled_mods, LauncherError, LauncherPaths,
-    LauncherResult, TmodMetadata,
+    load_enabled_mods, parse_tmod_file, save_enabled_mods, scan_tmod_directory, LauncherError,
+    LauncherPaths, LauncherResult, TmodMetadata,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -32,6 +33,7 @@ pub struct InstalledModEntry {
     pub meta: TmodMetadata,
     pub enabled: bool,
     pub missing_deps: Vec<String>,
+    pub disabled_deps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +170,10 @@ pub fn scan_installed_mods(paths: &LauncherPaths) -> LauncherResult<Vec<Installe
     fs::create_dir_all(&mods_dir)?;
 
     let enabled_list = load_enabled_mods(&paths.tml_enabled_json()).unwrap_or_default();
-    let enabled_set: HashSet<String> = enabled_list.into_iter().collect();
+    let enabled_lower: HashSet<String> = enabled_list
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
 
     let mut parsed = Vec::new();
     for entry in fs::read_dir(&mods_dir)?.flatten() {
@@ -184,34 +189,113 @@ pub fn scan_installed_mods(paths: &LauncherPaths) -> LauncherResult<Vec<Installe
         }
     }
 
-    let available_names: HashSet<String> = parsed.iter().map(|m| m.internal_name.clone()).collect();
+    let available_lower: HashSet<String> = parsed
+        .iter()
+        .map(|m| m.internal_name.to_ascii_lowercase())
+        .collect();
 
     let mut out: Vec<InstalledModEntry> = parsed
         .into_iter()
         .map(|meta| {
-            let enabled = enabled_set.contains(&meta.internal_name);
-            let missing_deps = meta
-                .mod_references
-                .iter()
-                .filter_map(|raw_ref| {
-                    let dep_name = raw_ref.split('@').next().unwrap_or(raw_ref).trim();
-                    if dep_name.is_empty() || available_names.contains(dep_name) {
-                        None
-                    } else {
-                        Some(dep_name.to_string())
+            let enabled = enabled_lower.contains(&meta.internal_name.to_ascii_lowercase());
+            let mut missing_deps = Vec::new();
+            let mut disabled_deps = Vec::new();
+            for raw_ref in &meta.mod_references {
+                let dep_name = raw_ref.split('@').next().unwrap_or(raw_ref).trim();
+                if dep_name.is_empty() {
+                    continue;
+                }
+                let dep_lower = dep_name.to_ascii_lowercase();
+                if !available_lower.contains(&dep_lower) {
+                    if !missing_deps
+                        .iter()
+                        .any(|d: &String| d.eq_ignore_ascii_case(dep_name))
+                    {
+                        missing_deps.push(dep_name.to_string());
                     }
-                })
-                .collect();
+                } else if enabled
+                    && !enabled_lower.contains(&dep_lower)
+                    && !disabled_deps
+                        .iter()
+                        .any(|d: &String| d.eq_ignore_ascii_case(dep_name))
+                {
+                    disabled_deps.push(dep_name.to_string());
+                }
+            }
             InstalledModEntry {
                 meta,
                 enabled,
                 missing_deps,
+                disabled_deps,
             }
         })
         .collect();
 
     out.sort_by_key(|a| a.meta.display_name.to_lowercase());
     Ok(out)
+}
+
+pub fn enable_mod_and_installed_deps(
+    paths: &LauncherPaths,
+    internal_name: &str,
+) -> LauncherResult<Vec<String>> {
+    let target = internal_name.trim();
+    if target.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mods_dir = paths.tml_mods_dir();
+    fs::create_dir_all(&mods_dir)?;
+
+    let installed = scan_tmod_directory(&mods_dir).unwrap_or_default();
+    let by_name: HashMap<String, TmodMetadata> = installed
+        .into_iter()
+        .map(|m| (m.internal_name.to_ascii_lowercase(), m))
+        .collect();
+
+    let target_lower = target.to_ascii_lowercase();
+    if !by_name.contains_key(&target_lower) {
+        return Err(LauncherError::NotFound(format!(
+            "Không tìm thấy mod '{target}' trong thư mục Mods."
+        )));
+    }
+
+    let enabled_path = paths.tml_enabled_json();
+    let mut current = load_enabled_mods(&enabled_path).unwrap_or_default();
+    let mut enabled_lower: HashSet<String> =
+        current.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let mut newly_enabled = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(target_lower);
+
+    while let Some(key) = queue.pop_front() {
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        let Some(meta) = by_name.get(&key) else {
+            continue;
+        };
+        let canonical_name = meta.internal_name.clone();
+        if enabled_lower.insert(canonical_name.to_ascii_lowercase()) {
+            current.push(canonical_name.clone());
+            newly_enabled.push(canonical_name);
+        }
+        for raw_ref in &meta.mod_references {
+            let dep = raw_ref.split('@').next().unwrap_or(raw_ref).trim();
+            let dep_lower = dep.to_ascii_lowercase();
+            if !dep_lower.is_empty() && by_name.contains_key(&dep_lower) && !visited.contains(&dep_lower)
+            {
+                queue.push_back(dep_lower);
+            }
+        }
+    }
+
+    if !newly_enabled.is_empty() {
+        save_enabled_mods(&enabled_path, &current)?;
+    }
+
+    Ok(newly_enabled)
 }
 
 pub fn set_mod_enabled(
@@ -222,14 +306,43 @@ pub fn set_mod_enabled(
     let enabled_path = paths.tml_enabled_json();
     let mut current = load_enabled_mods(&enabled_path).unwrap_or_default();
     if enable {
-        if !current.iter().any(|n| n == internal_name) {
-            current.push(internal_name.to_string());
+        let canonical_name = scan_tmod_directory(&paths.tml_mods_dir())
+            .ok()
+            .and_then(|mods| {
+                mods.into_iter()
+                    .find(|m| m.internal_name.eq_ignore_ascii_case(internal_name))
+                    .map(|m| m.internal_name)
+            })
+            .unwrap_or_else(|| internal_name.to_string());
+        if !current
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&canonical_name))
+        {
+            current.push(canonical_name);
         }
     } else {
-        current.retain(|n| n != internal_name);
+        current.retain(|n| !n.eq_ignore_ascii_case(internal_name));
     }
     save_enabled_mods(&enabled_path, &current)?;
     Ok(current)
+}
+
+pub fn remove_workshop_manifest_entry(
+    paths: &LauncherPaths,
+    internal_name: &str,
+) -> LauncherResult<()> {
+    let manifest_path = workshop_manifest_path(paths);
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let mut records = load_workshop_manifest(paths);
+    let before = records.len();
+    records.retain(|r| !r.internal_name.eq_ignore_ascii_case(internal_name));
+    if records.len() != before {
+        let json = serde_json::to_string_pretty(&records)?;
+        write_atomic(&manifest_path, json.as_bytes())?;
+    }
+    Ok(())
 }
 
 pub fn delete_installed_mod(
@@ -240,8 +353,102 @@ pub fn delete_installed_mod(
     if mod_file_path.is_file() {
         fs::remove_file(mod_file_path)?;
     }
-    let _ = set_mod_enabled(paths, internal_name, false);
+    set_mod_enabled(paths, internal_name, false)?;
+    remove_workshop_manifest_entry(paths, internal_name)?;
     Ok(())
+}
+
+struct TempDirCleanupGuard(PathBuf);
+
+impl Drop for TempDirCleanupGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct TempFileCleanupGuard(Option<PathBuf>);
+
+impl Drop for TempFileCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn is_safe_mod_file_stem(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed != name || trimmed == "." || trimmed == ".." {
+        return false;
+    }
+    if trimmed.ends_with(['.', ' '])
+        || trimmed.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'])
+        || trimmed.contains("..")
+        || trimmed.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let mut comps = Path::new(trimmed).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+fn same_disk_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+fn remove_duplicate_internal_mods(mods_dir: &Path, keep_dest: &Path, internal_name: &str) {
+    let Ok(entries) = fs::read_dir(mods_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let is_tmod = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("tmod"));
+        if !is_tmod || same_disk_path(&p, keep_dest) {
+            continue;
+        }
+        if parse_tmod_file(&p)
+            .is_ok_and(|existing| existing.internal_name.eq_ignore_ascii_case(internal_name))
+        {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+fn install_validated_tmod_file(
+    src: &Path,
+    meta: &TmodMetadata,
+    mods_dir: &Path,
+    paths: &LauncherPaths,
+    auto_enable: bool,
+) -> LauncherResult<TmodMetadata> {
+    let target_name = {
+        let trimmed = meta.internal_name.trim();
+        if is_safe_mod_file_stem(trimmed) {
+            format!("{trimmed}.tmod")
+        } else {
+            meta.file_name.clone()
+        }
+    };
+    let dest = mods_dir.join(&target_name);
+    if !same_disk_path(src, &dest) {
+        fs::copy(src, &dest)?;
+    }
+    if !meta.internal_name.trim().is_empty() {
+        remove_duplicate_internal_mods(mods_dir, &dest, &meta.internal_name);
+    }
+    if auto_enable {
+        set_mod_enabled(paths, &meta.internal_name, true)?;
+    }
+    parse_tmod_file(&dest)
 }
 
 pub fn import_local_mod_files(
@@ -252,6 +459,7 @@ pub fn import_local_mod_files(
     let mods_dir = paths.tml_mods_dir();
     fs::create_dir_all(&mods_dir)?;
     let mut imported = Vec::new();
+    let target_tml_ym = detect_installed_tml_year_month(paths);
 
     for src in sources {
         let ext = src
@@ -262,47 +470,56 @@ pub fn import_local_mod_files(
 
         if ext == "tmod" {
             let meta = parse_tmod_file(src)?;
-            let dest = mods_dir.join(&meta.file_name);
-            fs::copy(src, &dest)?;
-            if auto_enable {
-                set_mod_enabled(paths, &meta.internal_name, true)?;
-            }
-            imported.push(parse_tmod_file(&dest)?);
+            imported.push(install_validated_tmod_file(
+                src,
+                &meta,
+                &mods_dir,
+                paths,
+                auto_enable,
+            )?);
         } else if ext == "zip" {
+            let tmp_root =
+                mods_dir.join(format!(".tl_zip_import_tmp_{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&tmp_root)?;
+            let _cleanup_guard = TempDirCleanupGuard(tmp_root.clone());
+
             let mut archive = ZipArchive::new(File::open(src)?)?;
+            let mut extracted = Vec::new();
             for i in 0..archive.len() {
                 let mut entry = archive.by_index(i)?;
                 if entry.is_dir() {
                     continue;
                 }
-                let Some(fname) = entry
-                    .enclosed_name()
-                    .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                else {
+                let Some(rel_path) = entry.enclosed_name() else {
                     continue;
                 };
-                if fname.to_ascii_lowercase().ends_with(".tmod") {
-                    let temp = mods_dir.join(format!(".import_{fname}.part"));
-                    {
-                        let mut out = File::create(&temp)?;
-                        std::io::copy(&mut entry, &mut out)?;
-                    }
-                    match parse_tmod_file(&temp) {
-                        Ok(meta) => {
-                            let dest = mods_dir.join(&fname);
-                            let _ = fs::remove_file(&dest);
-                            fs::rename(&temp, &dest)?;
-                            if auto_enable {
-                                set_mod_enabled(paths, &meta.internal_name, true)?;
-                            }
-                            imported.push(parse_tmod_file(&dest)?);
-                        }
-                        Err(e) => {
-                            let _ = fs::remove_file(&temp);
-                            return Err(e);
-                        }
-                    }
+                let is_tmod = rel_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("tmod"));
+                if !is_tmod {
+                    continue;
                 }
+
+                let out_path = tmp_root.join(&rel_path);
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut out = File::create(&out_path)?;
+                std::io::copy(&mut entry, &mut out)?;
+                extracted.push(out_path);
+            }
+
+            let selected = pick_best_workshop_tmods(&extracted, &tmp_root, target_tml_ym);
+            for candidate in selected {
+                let meta = parse_tmod_file(&candidate)?;
+                imported.push(install_validated_tmod_file(
+                    &candidate,
+                    &meta,
+                    &mods_dir,
+                    paths,
+                    auto_enable,
+                )?);
             }
         }
     }
@@ -313,6 +530,7 @@ pub fn import_local_mod_files(
 pub async fn fetch_github_latest_tmod(
     owner_repo: &str,
     proxy_url: Option<&str>,
+    github_token: Option<&str>,
 ) -> LauncherResult<Vec<RemoteTmodAsset>> {
     let repo = owner_repo
         .trim()
@@ -326,9 +544,13 @@ pub async fn fetch_github_latest_tmod(
 
     let client = build_http_client(proxy_url)?;
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let resp = client
+    let mut req = client
         .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/vnd.github+json");
+    if let Some(tok) = github_token.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| LauncherError::Network(format!("Lỗi kết nối GitHub API: {e}")))?;
@@ -435,15 +657,16 @@ pub async fn download_and_install_tmod_url_with_source(
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
         })
-        .unwrap_or_else(|| "downloaded_mod.tmod".to_string());
+        .unwrap_or_else(|| "downloaded_mod".to_string());
 
-    let file_name = if raw_name.to_ascii_lowercase().ends_with(".tmod") {
-        raw_name
+    let fallback_stem = if raw_name.to_ascii_lowercase().ends_with(".tmod") {
+        raw_name[..raw_name.len() - 5].to_string()
     } else {
-        format!("{raw_name}.tmod")
+        raw_name
     };
 
-    let part_path = mods_dir.join(format!(".{file_name}.part"));
+    let part_path = mods_dir.join(format!(".tl_dl_{}.tmod.part", uuid::Uuid::new_v4()));
+    let mut part_guard = TempFileCleanupGuard(Some(part_path.clone()));
     {
         let mut file = File::create(&part_path)?;
         let mut stream = resp.bytes_stream();
@@ -458,23 +681,32 @@ pub async fn download_and_install_tmod_url_with_source(
     let parsed = match parse_tmod_file(&part_path) {
         Ok(m) => m,
         Err(e) => {
-            let _ = fs::remove_file(&part_path);
             return Err(LauncherError::InvalidFormat(format!(
                 "File tải về không phải .tmod hợp lệ: {e}"
             )));
         }
     };
 
-    let final_name = if parsed.internal_name.is_empty() {
-        file_name
+    let stem = if !parsed.internal_name.is_empty() {
+        parsed.internal_name.clone()
     } else {
-        format!("{}.tmod", parsed.internal_name)
+        fallback_stem
     };
-    let final_path = mods_dir.join(&final_name);
+    if !is_safe_mod_file_stem(&stem) {
+        return Err(LauncherError::InvalidFormat(format!(
+            "Tên mod '{stem}' không hợp lệ hoặc không an toàn."
+        )));
+    }
+    let final_path = mods_dir.join(format!("{stem}.tmod"));
     let _ = fs::remove_file(&final_path);
     fs::rename(&part_path, &final_path)?;
+    part_guard.0 = None;
 
-    if auto_enable {
+    if !parsed.internal_name.is_empty() {
+        remove_duplicate_internal_mods(&mods_dir, &final_path, &parsed.internal_name);
+    }
+
+    if auto_enable && !parsed.internal_name.is_empty() {
         set_mod_enabled(paths, &parsed.internal_name, true)?;
     }
 
@@ -1216,8 +1448,7 @@ pub fn record_workshop_install(
         let time_updated = details
             .map(|d| d.time_updated)
             .filter(|&t| t > 0)
-            .or_else(|| previous.map(|p| p.time_updated))
-            .unwrap_or(0);
+            .unwrap_or_else(|| Utc::now().timestamp().max(1) as u64);
 
         let record = WorkshopManifestRecord {
             published_file_id: workshop_id.to_string(),
@@ -1295,6 +1526,7 @@ pub fn scan_staged_workshop_mods(paths: &LauncherPaths) -> LauncherResult<Vec<St
         .collect();
     let manifest = load_workshop_manifest(paths);
 
+    let target_ym = detect_installed_tml_year_month(paths);
     let mut out = Vec::new();
     for entry in fs::read_dir(&content_dir)?.flatten() {
         let mod_dir = entry.path();
@@ -1312,41 +1544,42 @@ pub fn scan_staged_workshop_mods(paths: &LauncherPaths) -> LauncherResult<Vec<St
 
         let mut found_tmods = Vec::new();
         collect_tmods_recursive(&mod_dir, &mut found_tmods);
-        let Some(best_tmod) = pick_best_workshop_tmod(&found_tmods) else {
-            continue;
-        };
-        let Ok(meta) = parse_tmod_file(&best_tmod) else {
-            continue;
-        };
+        let best_tmods = pick_best_workshop_tmods(&found_tmods, &mod_dir, target_ym);
+        for best_tmod in best_tmods {
+            let Ok(meta) = parse_tmod_file(&best_tmod) else {
+                continue;
+            };
 
-        let installed = (!meta.internal_name.is_empty()
-            && installed_internal_names.contains(&meta.internal_name))
-            || installed_file_names.contains(&meta.file_name);
-        let enabled = installed && enabled_set.contains(&meta.internal_name);
+            let installed = (!meta.internal_name.is_empty()
+                && installed_internal_names.contains(&meta.internal_name))
+                || installed_file_names.contains(&meta.file_name);
+            let enabled = installed && enabled_set.contains(&meta.internal_name);
 
-        let manifest_rec = manifest
-            .iter()
-            .find(|r| r.published_file_id == workshop_id && r.internal_name == meta.internal_name)
-            .or_else(|| manifest.iter().find(|r| r.published_file_id == workshop_id));
+            let manifest_rec = manifest
+                .iter()
+                .find(|r| r.published_file_id == workshop_id && r.internal_name == meta.internal_name)
+                .or_else(|| manifest.iter().find(|r| r.published_file_id == workshop_id));
 
-        let workshop_title = manifest_rec
-            .and_then(|r| (!r.workshop_title.is_empty()).then(|| r.workshop_title.clone()));
-        let author = manifest_rec.and_then(|r| (!r.author.is_empty()).then(|| r.author.clone()));
-        let preview_url =
-            manifest_rec.and_then(|r| (!r.preview_url.is_empty()).then(|| r.preview_url.clone()));
-        let time_updated = manifest_rec.and_then(|r| (r.time_updated > 0).then_some(r.time_updated));
+            let workshop_title = manifest_rec
+                .and_then(|r| (!r.workshop_title.is_empty()).then(|| r.workshop_title.clone()));
+            let author = manifest_rec.and_then(|r| (!r.author.is_empty()).then(|| r.author.clone()));
+            let preview_url =
+                manifest_rec.and_then(|r| (!r.preview_url.is_empty()).then(|| r.preview_url.clone()));
+            let time_updated =
+                manifest_rec.and_then(|r| (r.time_updated > 0).then_some(r.time_updated));
 
-        out.push(StagedWorkshopMod {
-            workshop_id,
-            mod_dir,
-            meta,
-            installed,
-            enabled,
-            workshop_title,
-            author,
-            preview_url,
-            time_updated,
-        });
+            out.push(StagedWorkshopMod {
+                workshop_id: workshop_id.clone(),
+                mod_dir: mod_dir.clone(),
+                meta,
+                installed,
+                enabled,
+                workshop_title,
+                author,
+                preview_url,
+                time_updated,
+            });
+        }
     }
 
     out.sort_by(|a, b| {
@@ -1368,9 +1601,190 @@ pub fn delete_staged_workshop_mod(paths: &LauncherPaths, workshop_id: &str) -> L
     Ok(())
 }
 
-pub fn pick_best_workshop_tmod(candidates: &[PathBuf]) -> Option<PathBuf> {
-    if candidates.is_empty() {
+fn scan_year_month_token(text: &str, sep: u8) -> Option<(u32, u32)> {
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len() {
+        if i + 6 > bytes.len() {
+            break;
+        }
+        if bytes[i] == b'2'
+            && bytes[i + 1] == b'0'
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+            && bytes[i + 4] == sep
+            && bytes[i + 5].is_ascii_digit()
+        {
+            if i > 0 && bytes[i - 1].is_ascii_digit() {
+                continue;
+            }
+            let year_str = std::str::from_utf8(&bytes[i..i + 4]).ok()?;
+            let mut m_end = i + 6;
+            if m_end < bytes.len() && bytes[m_end].is_ascii_digit() {
+                m_end += 1;
+            }
+            if m_end < bytes.len() && bytes[m_end].is_ascii_digit() {
+                continue;
+            }
+            let month_str = std::str::from_utf8(&bytes[i + 5..m_end]).ok()?;
+            let (Ok(year), Ok(month)) = (year_str.parse::<u32>(), month_str.parse::<u32>()) else {
+                continue;
+            };
+            if (2020..=2099).contains(&year) && (1..=12).contains(&month) {
+                return Some((year, month));
+            }
+        }
+    }
+    None
+}
+
+pub fn detect_installed_tml_year_month(paths: &LauncherPaths) -> (u32, u32) {
+    let targets_path = paths.tmodloader_dir.join("tMLMod.targets");
+    if let Ok(content) = fs::read_to_string(&targets_path) {
+        let mut rest = content.as_str();
+        while let Some(idx) = rest.find("TML_") {
+            let after = &rest[idx + 4..];
+            if let Some(ym) = scan_year_month_token(after, b'_') {
+                return ym;
+            }
+            rest = after;
+        }
+    }
+
+    let deps_path = paths.tmodloader_dir.join("tModLoader.deps.json");
+    if let Ok(content) = fs::read_to_string(&deps_path) {
+        let lower = content.to_ascii_lowercase();
+        let mut search_from = 0usize;
+        while let Some(rel) = lower[search_from..].find("tmodloader") {
+            let start = search_from + rel + "tmodloader".len();
+            let window_end = content[start..]
+                .find(['}', '\n', '\r'])
+                .map(|off| start + off)
+                .unwrap_or(content.len())
+                .min(start + 64);
+            if let Some(ym) = scan_year_month_token(&content[start..window_end], b'.') {
+                return ym;
+            }
+            search_from = start;
+        }
+        let simple_deps_ym = (!content.contains("\"runtimeTarget\"")
+            && !content.contains("\"libraries\""))
+        .then(|| scan_year_month_token(&content, b'.'))
+        .flatten();
+        if let Some(ym) = simple_deps_ym {
+            return ym;
+        }
+    }
+
+    let tml_dll_mtime = fs::metadata(paths.tmodloader_dll())
+        .and_then(|m| m.modified())
+        .ok();
+    let logs_dir = paths.tmodloader_dir.join("tModLoader-Logs");
+    for log_name in ["client.log", "server.log"] {
+        let log_path = logs_dir.join(log_name);
+        if let Some(dll_mtime) = tml_dll_mtime {
+            let log_is_stale = fs::metadata(&log_path)
+                .and_then(|m| m.modified())
+                .map(|log_mtime| log_mtime < dll_mtime)
+                .unwrap_or(false);
+            if log_is_stale {
+                continue;
+            }
+        }
+        if let Ok(content) = fs::read_to_string(&log_path) {
+            if let Some(ym) = content
+                .lines()
+                .take(10)
+                .filter(|line| line.to_ascii_lowercase().contains("tmodloader"))
+                .find_map(|line| scan_year_month_token(line, b'.'))
+            {
+                return ym;
+            }
+        }
+    }
+
+    (2026, 9)
+}
+
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first_parent = paths.first()?.parent()?;
+    let mut comps: Vec<_> = first_parent.components().collect();
+    for p in &paths[1..] {
+        let parent = p.parent()?;
+        let p_comps: Vec<_> = parent.components().collect();
+        let shared = comps
+            .iter()
+            .zip(p_comps.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        comps.truncate(shared);
+    }
+    if comps.is_empty() {
         return None;
+    }
+    let mut out = PathBuf::new();
+    for c in comps {
+        out.push(c.as_os_str());
+    }
+    while let Some(name) = out.file_name().and_then(|s| s.to_str()) {
+        if parse_workshop_version_tuple(name).is_some() {
+            let Some(parent) = out.parent() else {
+                break;
+            };
+            out = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    Some(out)
+}
+
+fn tmod_workshop_rank(
+    path: &Path,
+    stop_dir: Option<&Path>,
+    target_tml_ym: (u32, u32),
+) -> (u8, (u32, u32, u32, u32)) {
+    match workshop_path_version(path, stop_dir) {
+        Some((major, minor, patch, rev)) if major >= 2022 => {
+            if (major, minor) <= target_tml_ym {
+                (3, (major, minor, patch, rev))
+            } else {
+                (
+                    1,
+                    (
+                        u32::MAX - major,
+                        u32::MAX - minor,
+                        u32::MAX - patch,
+                        u32::MAX - rev,
+                    ),
+                )
+            }
+        }
+        None => (2, (0, 0, 0, 0)),
+        Some(v) => (0, v),
+    }
+}
+
+fn candidate_mod_group_key(path: &Path) -> String {
+    if path.is_file() {
+        if let Ok(meta) = parse_tmod_file(path) {
+            let trimmed = meta.internal_name.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_ascii_lowercase();
+            }
+        }
+    }
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| path.to_string_lossy().to_ascii_lowercase())
+}
+
+fn pick_best_workshop_tmods_inner(
+    candidates: &[PathBuf],
+    stop_dir: Option<&Path>,
+    target_tml_ym: (u32, u32),
+) -> Vec<PathBuf> {
+    if candidates.is_empty() {
+        return Vec::new();
     }
 
     let any_exists = candidates.iter().any(|p| p.is_file());
@@ -1389,29 +1803,65 @@ pub fn pick_best_workshop_tmod(candidates: &[PathBuf]) -> Option<PathBuf> {
     };
 
     if pool.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    if let Some(preferred) = pool
-        .iter()
-        .copied()
-        .filter(|p| workshop_path_version(p) == Some((2026, 9)))
-        .max_by(|a, b| a.as_os_str().cmp(b.as_os_str()))
-    {
-        return Some(preferred.clone());
+    let mut by_mod: HashMap<String, Vec<&PathBuf>> = HashMap::new();
+    for cand in pool {
+        by_mod
+            .entry(candidate_mod_group_key(cand))
+            .or_default()
+            .push(cand);
     }
 
-    pool.into_iter()
-        .max_by(|a, b| {
-            let va = workshop_path_version(a);
-            let vb = workshop_path_version(b);
-            va.cmp(&vb).then_with(|| a.as_os_str().cmp(b.as_os_str()))
+    let mut picked: Vec<PathBuf> = by_mod
+        .into_values()
+        .filter_map(|group| {
+            group
+                .into_iter()
+                .max_by(|a, b| {
+                    let ra = tmod_workshop_rank(a, stop_dir, target_tml_ym);
+                    let rb = tmod_workshop_rank(b, stop_dir, target_tml_ym);
+                    ra.cmp(&rb).then_with(|| a.as_os_str().cmp(b.as_os_str()))
+                })
+                .cloned()
         })
-        .cloned()
+        .collect();
+
+    picked.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    picked
 }
 
-pub async fn install_steamcmd_via_winget() -> LauncherResult<String> {
-    let output = crate::game_installer::run_winget_install_steamcmd(None).await?;
+pub fn pick_best_workshop_tmods(
+    candidates: &[PathBuf],
+    stop_dir: &Path,
+    target_tml_ym: (u32, u32),
+) -> Vec<PathBuf> {
+    pick_best_workshop_tmods_inner(candidates, Some(stop_dir), target_tml_ym)
+}
+
+pub fn pick_best_workshop_tmod(candidates: &[PathBuf]) -> Option<PathBuf> {
+    let stop = common_ancestor(candidates);
+    let target = (2026, 9);
+    pick_best_workshop_tmods_inner(candidates, stop.as_deref(), target)
+        .into_iter()
+        .max_by(|a, b| {
+            let ra = tmod_workshop_rank(a, stop.as_deref(), target);
+            let rb = tmod_workshop_rank(b, stop.as_deref(), target);
+            ra.cmp(&rb).then_with(|| a.as_os_str().cmp(b.as_os_str()))
+        })
+}
+
+pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy_url: Option<&str>) {
+    if let Some(norm) = proxy_url.and_then(normalize_proxy_url) {
+        cmd.env("HTTP_PROXY", &norm)
+            .env("HTTPS_PROXY", &norm)
+            .env("ALL_PROXY", &norm);
+    }
+}
+
+pub async fn install_steamcmd_via_winget(proxy_url: Option<&str>) -> LauncherResult<String> {
+    let output = crate::game_installer::run_winget_install_steamcmd(None, proxy_url).await?;
     Ok(if output.is_empty() {
         "Đã cài đặt SteamCMD qua winget".to_string()
     } else {
@@ -1423,6 +1873,7 @@ pub async fn download_workshop_mod_via_steamcmd(
     steamcmd_exe: &Path,
     paths: &LauncherPaths,
     workshop_id: &str,
+    proxy_url: Option<&str>,
     auto_enable: bool,
     on_log: impl Fn(String) + Send + Sync + 'static,
 ) -> LauncherResult<Vec<TmodMetadata>> {
@@ -1437,6 +1888,9 @@ pub async fn download_workshop_mod_via_steamcmd(
     let staging_dir = paths.steamcmd_dir.join("staging");
     fs::create_dir_all(&staging_dir)?;
 
+    let workshop_item_dir = workshop_staging_content_dir(paths).join(workshop_id);
+    let before_snapshot = snapshot_tmod_files(&workshop_item_dir);
+
     let mut cmd = Command::new(steamcmd_exe);
     cmd.arg("+force_install_dir")
         .arg(&staging_dir)
@@ -1446,6 +1900,7 @@ pub async fn download_workshop_mod_via_steamcmd(
         .arg("1281930")
         .arg(workshop_id)
         .arg("+quit");
+    apply_proxy_env(&mut cmd, proxy_url);
 
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -1459,12 +1914,18 @@ pub async fn download_workshop_mod_via_steamcmd(
         .map_err(|e| LauncherError::Process(format!("Không thể chạy steamcmd.exe: {e}")))?;
 
     let log_cb = Arc::new(on_log);
+    let saw_downloaded_marker = Arc::new(AtomicBool::new(false));
     let stdout_task = child.stdout.take().map(|stdout| {
         let cb = Arc::clone(&log_cb);
+        let marker = Arc::clone(&saw_downloaded_marker);
+        let wid = workshop_id.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.trim().is_empty() {
+                    if line_indicates_workshop_downloaded(&line, &wid) {
+                        marker.store(true, Ordering::Release);
+                    }
                     cb(line);
                 }
             }
@@ -1472,10 +1933,15 @@ pub async fn download_workshop_mod_via_steamcmd(
     });
     let stderr_task = child.stderr.take().map(|stderr| {
         let cb = Arc::clone(&log_cb);
+        let marker = Arc::clone(&saw_downloaded_marker);
+        let wid = workshop_id.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.trim().is_empty() {
+                    if line_indicates_workshop_downloaded(&line, &wid) {
+                        marker.store(true, Ordering::Release);
+                    }
                     cb(line);
                 }
             }
@@ -1494,20 +1960,29 @@ pub async fn download_workshop_mod_via_steamcmd(
         let _ = h.await;
     }
 
-    let workshop_item_dir = workshop_staging_content_dir(paths).join(workshop_id);
+    let any_changed_or_new = has_any_tmod_changed_or_new(&workshop_item_dir, &before_snapshot);
+    let saw_marker = saw_downloaded_marker.load(Ordering::Acquire);
+    if !should_accept_workshop_download(status.success(), saw_marker, any_changed_or_new) {
+        return Err(LauncherError::Process(format!(
+            "SteamCMD thất bại (mã thoát {:?}) khi tải Workshop item {workshop_id}.",
+            status.code()
+        )));
+    }
 
     let mut found_tmods = Vec::new();
     collect_tmods_recursive(&workshop_item_dir, &mut found_tmods);
 
-    let Some(best_tmod) = pick_best_workshop_tmod(&found_tmods) else {
+    let target_ym = detect_installed_tml_year_month(paths);
+    let best_tmods = pick_best_workshop_tmods(&found_tmods, &workshop_item_dir, target_ym);
+    if best_tmods.is_empty() {
         return Err(LauncherError::NotFound(format!(
             "SteamCMD kết thúc ({:?}) nhưng không tìm thấy file .tmod trong {}. Nếu Steam bị chặn kết nối, hãy bật Proxy/VPN hoặc dùng GitHub/Import .tmod.",
             status.code(),
             workshop_item_dir.display()
         )));
-    };
+    }
 
-    import_local_mod_files(&[best_tmod], paths, auto_enable)
+    import_local_mod_files(&best_tmods, paths, auto_enable)
 }
 
 pub(crate) fn validate_workshop_id(workshop_id: &str) -> LauncherResult<&str> {
@@ -1549,7 +2024,43 @@ pub(crate) fn collect_tmods_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn parse_workshop_version_tuple(segment: &str) -> Option<(u32, u32)> {
+pub(crate) type TmodFileSnapshot = HashMap<PathBuf, (Option<SystemTime>, u64)>;
+
+pub(crate) fn snapshot_tmod_files(dir: &Path) -> TmodFileSnapshot {
+    let mut paths = Vec::new();
+    collect_tmods_recursive(dir, &mut paths);
+    let mut out = HashMap::with_capacity(paths.len());
+    for p in paths {
+        if let Ok(meta) = fs::metadata(&p) {
+            out.insert(p, (meta.modified().ok(), meta.len()));
+        }
+    }
+    out
+}
+
+pub(crate) fn has_any_tmod_changed_or_new(dir: &Path, before: &TmodFileSnapshot) -> bool {
+    let after = snapshot_tmod_files(dir);
+    after.iter().any(|(path, state)| match before.get(path) {
+        None => true,
+        Some(prev) => prev != state,
+    })
+}
+
+pub(crate) fn line_indicates_workshop_downloaded(line: &str, workshop_id: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains(&format!("downloaded item {workshop_id}"))
+        || lower.contains("success. downloaded item")
+}
+
+pub(crate) fn should_accept_workshop_download(
+    success: bool,
+    saw_marker: bool,
+    any_changed_or_new: bool,
+) -> bool {
+    success || saw_marker || any_changed_or_new
+}
+
+fn parse_workshop_version_tuple(segment: &str) -> Option<(u32, u32, u32, u32)> {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
         return None;
@@ -1566,12 +2077,17 @@ fn parse_workshop_version_tuple(segment: &str) -> Option<(u32, u32)> {
     }
     let major = parts[0].parse::<u32>().ok()?;
     let minor = parts[1].parse::<u32>().ok()?;
-    Some((major, minor))
+    let patch = parts.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let rev = parts.get(3).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    Some((major, minor, patch, rev))
 }
 
-fn workshop_path_version(path: &Path) -> Option<(u32, u32)> {
+fn workshop_path_version(path: &Path, stop_dir: Option<&Path>) -> Option<(u32, u32, u32, u32)> {
     let mut dir = path.parent();
     while let Some(current) = dir {
+        if stop_dir == Some(current) {
+            break;
+        }
         if let Some(name) = current.file_name().and_then(|s| s.to_str()) {
             if let Some(ver) = parse_workshop_version_tuple(name) {
                 return Some(ver);
@@ -2580,6 +3096,16 @@ mod tests {
     }
 
     fn write_minimal_tmod(path: &Path, internal_name: &str, display_name: &str, version: &str) {
+        write_minimal_tmod_with_refs(path, internal_name, display_name, version, &[]);
+    }
+
+    fn write_minimal_tmod_with_refs(
+        path: &Path,
+        internal_name: &str,
+        display_name: &str,
+        version: &str,
+        mod_references: &[&str],
+    ) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -2588,6 +3114,13 @@ mod tests {
         write_dotnet_str(&mut info, display_name);
         write_dotnet_str(&mut info, "author");
         write_dotnet_str(&mut info, "TestAuthor");
+        if !mod_references.is_empty() {
+            write_dotnet_str(&mut info, "modReferences");
+            for r in mod_references {
+                write_dotnet_str(&mut info, r);
+            }
+            write_dotnet_str(&mut info, "");
+        }
         write_dotnet_str(&mut info, "");
 
         let mut tmod = Vec::new();
@@ -2712,9 +3245,10 @@ mod tests {
 
     #[test]
     fn pick_best_workshop_tmod_uses_numeric_version_tuples() {
-        assert_eq!(parse_workshop_version_tuple("2026.10"), Some((2026, 10)));
-        assert_eq!(parse_workshop_version_tuple("2026.09"), Some((2026, 9)));
-        assert_eq!(parse_workshop_version_tuple("2026.2"), Some((2026, 2)));
+        assert_eq!(parse_workshop_version_tuple("2026.10"), Some((2026, 10, 0, 0)));
+        assert_eq!(parse_workshop_version_tuple("2026.09"), Some((2026, 9, 0, 0)));
+        assert_eq!(parse_workshop_version_tuple("2026.2"), Some((2026, 2, 0, 0)));
+        assert_eq!(parse_workshop_version_tuple("1.4.4.9"), Some((1, 4, 4, 9)));
         assert_eq!(parse_workshop_version_tuple("CalamityMod"), None);
         assert!(parse_workshop_version_tuple("2026.10") > parse_workshop_version_tuple("2026.2"));
 
@@ -2726,7 +3260,7 @@ mod tests {
         let picked = pick_best_workshop_tmod(&candidates_without_2026_9).unwrap();
         assert_eq!(
             picked,
-            PathBuf::from(r"C:\staging\1281930\2824688072\2026.10\CalamityMod.tmod")
+            PathBuf::from(r"C:\staging\1281930\2824688072\2026.2\CalamityMod.tmod")
         );
 
         let candidates_with_2026_9 = vec![
@@ -2738,6 +3272,27 @@ mod tests {
         assert_eq!(
             picked_2026_9,
             PathBuf::from(r"C:\staging\1281930\2824688072\2026.9\CalamityMod.tmod")
+        );
+
+        let root_vs_legacy_and_future = vec![
+            PathBuf::from(r"C:\staging\1281930\2824688072\1.4.4.9\CalamityMod.tmod"),
+            PathBuf::from(r"C:\staging\1281930\2824688072\CalamityMod.tmod"),
+            PathBuf::from(r"C:\staging\1281930\2824688072\2026.11\CalamityMod.tmod"),
+            PathBuf::from(r"C:\staging\1281930\2824688072\2026.10\CalamityMod.tmod"),
+        ];
+        assert_eq!(
+            pick_best_workshop_tmod(&root_vs_legacy_and_future).unwrap(),
+            PathBuf::from(r"C:\staging\1281930\2824688072\CalamityMod.tmod")
+        );
+
+        let only_future_and_legacy = vec![
+            PathBuf::from(r"C:\staging\1281930\2824688072\1.4.4.9\CalamityMod.tmod"),
+            PathBuf::from(r"C:\staging\1281930\2824688072\2026.11\CalamityMod.tmod"),
+            PathBuf::from(r"C:\staging\1281930\2824688072\2026.10\CalamityMod.tmod"),
+        ];
+        assert_eq!(
+            pick_best_workshop_tmod(&only_future_and_legacy).unwrap(),
+            PathBuf::from(r"C:\staging\1281930\2824688072\2026.10\CalamityMod.tmod")
         );
 
         assert_eq!(pick_best_workshop_tmod(&[]), None);
@@ -2753,7 +3308,7 @@ mod tests {
             .join("staging/steamapps/workshop/content/1281930/2824688072/2026.2/CalamityMod.tmod");
         let staged_new = paths
             .steamcmd_dir
-            .join("staging/steamapps/workshop/content/1281930/2824688072/2026.10/CalamityMod.tmod");
+            .join("staging/steamapps/workshop/content/1281930/2824688072/2026.9/CalamityMod.tmod");
         write_minimal_tmod(&staged_old, "CalamityMod", "Calamity Mod", "2.0.4");
         write_minimal_tmod(&staged_new, "CalamityMod", "Calamity Mod", "2.0.5");
 
@@ -3124,5 +3679,404 @@ mod tests {
         assert_eq!(res.items[1].published_file_id, "3835720328");
         assert_eq!(res.items[1].title, "Tactical Respawn");
         assert!(!res.has_next_page);
+    }
+
+    #[test]
+    fn scan_installed_mods_reports_disabled_deps_and_bfs_enables_transitively() {
+        let paths = make_temp_paths("deps_bfs");
+        paths.ensure_dirs().unwrap();
+        let mods_dir = paths.tml_mods_dir();
+
+        write_minimal_tmod_with_refs(
+            &mods_dir.join("ModA.tmod"),
+            "ModA",
+            "Alpha Mod",
+            "1.0.0",
+            &["ModB@1.0", "UninstalledLib"],
+        );
+        write_minimal_tmod_with_refs(
+            &mods_dir.join("ModB.tmod"),
+            "ModB",
+            "Beta Lib",
+            "1.0.0",
+            &["ModC"],
+        );
+        write_minimal_tmod(&mods_dir.join("ModC.tmod"), "ModC", "Core Util", "1.0.0");
+
+        set_mod_enabled(&paths, "ModA", true).unwrap();
+
+        let entries = scan_installed_mods(&paths).unwrap();
+        let alpha = entries.iter().find(|e| e.meta.internal_name == "ModA").unwrap();
+        let beta = entries.iter().find(|e| e.meta.internal_name == "ModB").unwrap();
+        assert!(alpha.enabled);
+        assert_eq!(alpha.missing_deps, vec!["UninstalledLib".to_string()]);
+        assert_eq!(alpha.disabled_deps, vec!["ModB".to_string()]);
+        assert!(!beta.enabled);
+        assert!(beta.disabled_deps.is_empty());
+
+        let newly_enabled = enable_mod_and_installed_deps(&paths, "ModA").unwrap();
+        assert_eq!(
+            newly_enabled,
+            vec!["ModB".to_string(), "ModC".to_string()]
+        );
+
+        let after = scan_installed_mods(&paths).unwrap();
+        let alpha_after = after.iter().find(|e| e.meta.internal_name == "ModA").unwrap();
+        let beta_after = after.iter().find(|e| e.meta.internal_name == "ModB").unwrap();
+        let gamma_after = after.iter().find(|e| e.meta.internal_name == "ModC").unwrap();
+        assert!(alpha_after.disabled_deps.is_empty());
+        assert!(beta_after.enabled);
+        assert!(gamma_after.enabled);
+
+        assert!(enable_mod_and_installed_deps(&paths, "ModA")
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn detect_installed_tml_year_month_parses_targets_deps_and_fallback() {
+        let paths = make_temp_paths("tml_ym");
+        paths.ensure_dirs().unwrap();
+        fs::create_dir_all(&paths.tmodloader_dir).unwrap();
+
+        assert_eq!(detect_installed_tml_year_month(&paths), (2026, 9));
+
+        fs::write(
+            paths.tmodloader_dir.join("tModLoader.deps.json"),
+            r#"{"runtimeTarget":{"name":".NETCoreApp,Version=v8.0"},"libraries":{"JetBrains.Annotations/2025.2.4":{},"tModLoader/1.4.4.9":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_installed_tml_year_month(&paths), (2026, 9));
+
+        fs::write(
+            paths.tmodloader_dir.join("tMLMod.targets"),
+            "<Project><PropertyGroup><DefineConstants>$(DefineConstants);TML_2025_11</DefineConstants></PropertyGroup></Project>",
+        )
+        .unwrap();
+        assert_eq!(detect_installed_tml_year_month(&paths), (2025, 11));
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn pick_best_workshop_tmods_bounds_stop_dir_supports_multi_mods_and_compat_order() {
+        let paths = make_temp_paths("picker_multi");
+        let item_dir = paths
+            .base_dir
+            .join("2025.1")
+            .join("workshop_item");
+        let root_a = item_dir.join("MainMod.tmod");
+        let ver_compat_a = item_dir.join("2026.8").join("MainMod.tmod");
+        let ver_future_a = item_dir.join("2026.10").join("MainMod.tmod");
+        let root_b = item_dir.join("SupportLib.tmod");
+
+        write_minimal_tmod(&root_a, "MainMod", "Main Mod", "1.0.0");
+        write_minimal_tmod(&ver_compat_a, "MainMod", "Main Mod", "1.1.0");
+        write_minimal_tmod(&ver_future_a, "MainMod", "Main Mod", "1.2.0");
+        write_minimal_tmod(&root_b, "SupportLib", "Support Lib", "1.0.0");
+
+        let picked = pick_best_workshop_tmods(
+            &[
+                root_a.clone(),
+                ver_compat_a.clone(),
+                ver_future_a.clone(),
+                root_b.clone(),
+            ],
+            &item_dir,
+            (2026, 9),
+        );
+        assert_eq!(picked.len(), 2);
+        assert!(picked.contains(&ver_compat_a));
+        assert!(picked.contains(&root_b));
+
+        let only_unversioned_and_future =
+            pick_best_workshop_tmods(&[root_a.clone(), ver_future_a], &item_dir, (2026, 9));
+        assert_eq!(only_unversioned_and_future, vec![root_a]);
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn import_local_mod_files_normalizes_name_removes_duplicates_and_picks_zip() {
+        let paths = make_temp_paths("import_norm");
+        paths.ensure_dirs().unwrap();
+        let stage_dir = paths.base_dir.join("incoming");
+        fs::create_dir_all(&stage_dir).unwrap();
+
+        let copy_one = stage_dir.join("CoolMod (1).tmod");
+        let copy_two = stage_dir.join("CoolMod - Copy.tmod");
+        write_minimal_tmod(&copy_one, "CoolMod", "Cool Mod", "1.0.0");
+        write_minimal_tmod(&copy_two, "CoolMod", "Cool Mod", "1.1.0");
+        fs::copy(&copy_one, paths.tml_mods_dir().join("CoolMod (1).tmod")).unwrap();
+
+        let imported = import_local_mod_files(&[copy_two], &paths, true).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].internal_name, "CoolMod");
+        assert_eq!(imported[0].version, "1.1.0");
+        assert!(paths.tml_mods_dir().join("CoolMod.tmod").is_file());
+        assert!(!paths.tml_mods_dir().join("CoolMod (1).tmod").exists());
+
+        let zip_src_old = stage_dir.join("zip_old.tmod");
+        let zip_src_match = stage_dir.join("zip_match.tmod");
+        let zip_src_future = stage_dir.join("zip_future.tmod");
+        let zip_src_helper = stage_dir.join("helper.tmod");
+        write_minimal_tmod(&zip_src_old, "ZipMod", "Zip Mod", "1.0.0");
+        write_minimal_tmod(&zip_src_match, "ZipMod", "Zip Mod", "1.1.0");
+        write_minimal_tmod(&zip_src_future, "ZipMod", "Zip Mod", "1.2.0");
+        write_minimal_tmod(&zip_src_helper, "ZipHelper", "Zip Helper", "2.0.0");
+
+        let zip_path = stage_dir.join("bundle.zip");
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (archive_path, disk_path) in [
+                ("2025.6/ZipMod.tmod", &zip_src_old),
+                ("2026.9/ZipMod.tmod", &zip_src_match),
+                ("2026.11/ZipMod.tmod", &zip_src_future),
+                ("ZipHelper.tmod", &zip_src_helper),
+            ] {
+                writer.start_file(archive_path, opts).unwrap();
+                writer.write_all(&fs::read(disk_path).unwrap()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let zip_imported = import_local_mod_files(&[zip_path], &paths, true).unwrap();
+        assert_eq!(zip_imported.len(), 2);
+        let zip_mod = parse_tmod_file(&paths.tml_mods_dir().join("ZipMod.tmod")).unwrap();
+        assert_eq!(zip_mod.version, "1.1.0");
+        assert!(paths.tml_mods_dir().join("ZipHelper.tmod").is_file());
+
+        let leftover_tmp = fs::read_dir(paths.tml_mods_dir())
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".tl_zip_import_tmp_")
+            });
+        assert!(!leftover_tmp);
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn detect_installed_tml_year_month_skips_stale_log_older_than_dll() {
+        let paths = make_temp_paths("tml_stale_log");
+        paths.ensure_dirs().unwrap();
+        fs::create_dir_all(paths.tmodloader_dir.join("tModLoader-Logs")).unwrap();
+
+        let log_path = paths.tmodloader_dir.join("tModLoader-Logs").join("client.log");
+        fs::write(&log_path, "[INFO] tModLoader v2024.1.2.0").unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(7200);
+        File::options()
+            .write(true)
+            .open(&log_path)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        fs::write(paths.tmodloader_dll(), b"NEW-DLL").unwrap();
+        assert_eq!(detect_installed_tml_year_month(&paths), (2026, 9));
+
+        fs::write(
+            paths.tmodloader_dir.join("tModLoader-Logs").join("server.log"),
+            "[INFO] tModLoader v2026.5.1.0",
+        )
+        .unwrap();
+        assert_eq!(detect_installed_tml_year_month(&paths), (2026, 5));
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn record_workshop_install_assigns_nonzero_timestamp_without_stale_inheritance() {
+        let paths = make_temp_paths("ws_nonzero_ts");
+        paths.ensure_dirs().unwrap();
+        let mod_path = paths.tml_mods_dir().join("TimeMod.tmod");
+        write_minimal_tmod(&mod_path, "TimeMod", "Time Mod", "1.0.0");
+        let meta = parse_tmod_file(&mod_path).unwrap();
+
+        let old_details = WorkshopItemDetails {
+            published_file_id: "555555555".to_string(),
+            title: "Time Mod".to_string(),
+            time_updated: 1_500_000_000,
+            ..Default::default()
+        };
+        record_workshop_install(&paths, Some(&old_details), "555555555", std::slice::from_ref(&meta))
+            .unwrap();
+
+        record_workshop_install(&paths, None, "555555555", &[meta]).unwrap();
+        let loaded = load_workshop_manifest(&paths);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].time_updated > 1_500_000_000);
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn delete_installed_mod_cleans_enabled_and_workshop_manifest_case_insensitively() {
+        let paths = make_temp_paths("del_manifest");
+        paths.ensure_dirs().unwrap();
+        let mod_path = paths.tml_mods_dir().join("AlphaMod.tmod");
+        write_minimal_tmod(&mod_path, "AlphaMod", "Alpha Mod", "1.0.0");
+        let meta = parse_tmod_file(&mod_path).unwrap();
+        set_mod_enabled(&paths, "alphamod", true).unwrap();
+        record_workshop_install(&paths, None, "777777777", &[meta]).unwrap();
+
+        delete_installed_mod(&paths, &mod_path, "ALPHAMOD").unwrap();
+        assert!(!mod_path.exists());
+        assert!(load_enabled_mods(&paths.tml_enabled_json()).unwrap().is_empty());
+        assert!(load_workshop_manifest(&paths).is_empty());
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn case_insensitive_scan_enable_and_set_mod_enabled() {
+        let paths = make_temp_paths("ci_enable");
+        paths.ensure_dirs().unwrap();
+
+        write_minimal_tmod(
+            &paths.tml_mods_dir().join("BossLib.tmod"),
+            "BossLib",
+            "Boss Lib",
+            "1.0.0",
+        );
+        write_minimal_tmod_with_refs(
+            &paths.tml_mods_dir().join("CalamityMod.tmod"),
+            "CalamityMod",
+            "Calamity Mod",
+            "2.0.0",
+            &["bosslib"],
+        );
+
+        save_enabled_mods(&paths.tml_enabled_json(), &["calamitymod".to_string()]).unwrap();
+        let scanned = scan_installed_mods(&paths).unwrap();
+        let cal = scanned
+            .iter()
+            .find(|e| e.meta.internal_name == "CalamityMod")
+            .unwrap();
+        assert!(cal.enabled);
+        assert!(cal.missing_deps.is_empty());
+        assert_eq!(cal.disabled_deps, vec!["bosslib".to_string()]);
+
+        let newly = enable_mod_and_installed_deps(&paths, "CALAMITYMOD").unwrap();
+        assert_eq!(newly, vec!["BossLib".to_string()]);
+        let enabled = load_enabled_mods(&paths.tml_enabled_json()).unwrap();
+        assert_eq!(enabled, vec!["calamitymod".to_string(), "BossLib".to_string()]);
+
+        set_mod_enabled(&paths, "BOSSLIB", false).unwrap();
+        let after_disable = load_enabled_mods(&paths.tml_enabled_json()).unwrap();
+        assert_eq!(after_disable, vec!["calamitymod".to_string()]);
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn download_and_install_tmod_url_rejects_unsafe_stem_and_removes_duplicates() {
+        let paths = make_temp_paths("dl_url_safe");
+        paths.ensure_dirs().unwrap();
+
+        let temp_src = paths.base_dir.join("src");
+        fs::create_dir_all(&temp_src).unwrap();
+        let bad_tmod = temp_src.join("bad.tmod");
+        write_minimal_tmod(&bad_tmod, "../Escape", "Escape", "1.0.0");
+        let bad_bytes = fs::read(&bad_tmod).unwrap();
+
+        let good_tmod = temp_src.join("good.tmod");
+        write_minimal_tmod(&good_tmod, "CleanMod", "Clean Mod", "2.0.0");
+        let good_bytes = fs::read(&good_tmod).unwrap();
+
+        let dup_old = paths.tml_mods_dir().join("cleanmod_old.tmod");
+        write_minimal_tmod(&dup_old, "cleanmod", "Clean Mod Old", "1.0.0");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for body in [bad_bytes, good_bytes] {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&body);
+                }
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = download_and_install_tmod_url(
+                &format!("http://{addr}/../../unsafe.tmod"),
+                Some("../ignored"),
+                &paths,
+                None,
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, LauncherError::InvalidFormat(_)));
+
+            let ok_meta = download_and_install_tmod_url(
+                &format!("http://{addr}/CleanMod.tmod"),
+                None,
+                &paths,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ok_meta.internal_name, "CleanMod");
+        });
+        server.join().unwrap();
+
+        assert!(paths.tml_mods_dir().join("CleanMod.tmod").is_file());
+        assert!(!dup_old.exists());
+        let leftover_parts = fs::read_dir(paths.tml_mods_dir())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".tl_dl_"));
+        assert!(!leftover_parts);
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn workshop_snapshot_and_marker_gate_rejects_stale_staging_on_failure() {
+        let paths = make_temp_paths("ws_snapshot_gate");
+        paths.ensure_dirs().unwrap();
+        let item_dir = workshop_staging_content_dir(&paths).join("123456789");
+        let stale_file = item_dir.join("2026.9").join("StaleMod.tmod");
+        write_minimal_tmod(&stale_file, "StaleMod", "Stale Mod", "1.0.0");
+
+        let before = snapshot_tmod_files(&item_dir);
+        assert!(!has_any_tmod_changed_or_new(&item_dir, &before));
+        assert!(!line_indicates_workshop_downloaded(
+            "ERROR! Timeout downloading item 123456789.",
+            "123456789"
+        ));
+        assert!(line_indicates_workshop_downloaded(
+            "Success. Downloaded item 123456789 to C:\\staging",
+            "123456789"
+        ));
+        assert!(!should_accept_workshop_download(false, false, false));
+        assert!(should_accept_workshop_download(false, true, false));
+        assert!(should_accept_workshop_download(true, false, false));
+
+        write_minimal_tmod(&stale_file, "StaleMod", "Stale Mod", "1.0.1-longer");
+        assert!(has_any_tmod_changed_or_new(&item_dir, &before));
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
     }
 }

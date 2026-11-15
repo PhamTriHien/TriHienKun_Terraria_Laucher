@@ -3,13 +3,14 @@ use crate::http_client::{build_http_client, ensure_rustls_provider, LAUNCHER_USE
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use std::collections::{HashMap, HashSet};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket as StdUdpSocket,
 };
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use sysinfo::Networks;
 use tl_core::{LauncherError, LauncherResult};
@@ -76,6 +77,7 @@ pub struct UpnpLeaseInfo {
     pub local_ip: Ipv4Addr,
     pub port: u16,
     pub is_cgnat: bool,
+    pub lease_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,18 +136,36 @@ pub enum DirectHostStatus {
     Error(String),
 }
 
+type BridgePeerMap = HashMap<u16, (IpAddr, CancellationToken)>;
+
+fn is_bannable_peer_ip(ip: IpAddr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified()
+}
+
+fn normalize_ban_set(ips: impl IntoIterator<Item = IpAddr>) -> HashSet<IpAddr> {
+    ips.into_iter()
+        .map(|ip| ip.to_canonical())
+        .filter(|ip| is_bannable_peer_ip(*ip))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectHostConfig {
     pub local_target_port: u16,
     pub host_port: u16,
     pub bind_ipv4: Option<Ipv4Addr>,
     pub try_upnp: bool,
+    pub initial_banned_ips: Vec<IpAddr>,
 }
 
 #[derive(Clone)]
 pub struct DirectPortHostHandle {
     cancel: CancellationToken,
     status: Arc<RwLock<DirectHostStatus>>,
+    banned_ips: Arc<RwLock<HashSet<IpAddr>>>,
+    bridge_peers: Arc<RwLock<BridgePeerMap>>,
+    has_upnp_lease: Arc<AtomicBool>,
+    cleanup_done: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl DirectPortHostHandle {
@@ -153,11 +173,45 @@ impl DirectPortHostHandle {
         self.cancel.cancel();
     }
 
+    pub fn stop_and_wait(&self, timeout: Duration) {
+        self.stop();
+        if !self.has_upnp_lease.load(Ordering::SeqCst) {
+            return;
+        }
+        let (lock, cvar) = &*self.cleanup_done;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = cvar.wait_timeout_while(guard, timeout, |done| !*done);
+    }
+
     pub fn current_status(&self) -> DirectHostStatus {
         self.status
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn set_banned_ips(&self, ips: impl IntoIterator<Item = IpAddr>) {
+        let ban_set = normalize_ban_set(ips);
+        *self.banned_ips.write().unwrap_or_else(|e| e.into_inner()) = ban_set.clone();
+        let tokens_to_cancel: Vec<CancellationToken> = {
+            let peers = self.bridge_peers.read().unwrap_or_else(|e| e.into_inner());
+            peers
+                .values()
+                .filter(|(peer_ip, _)| ban_set.contains(peer_ip))
+                .map(|(_, tok)| tok.clone())
+                .collect()
+        };
+        for tok in tokens_to_cancel {
+            tok.cancel();
+        }
+    }
+
+    pub fn resolve_bridged_peer(&self, loopback_client_port: u16) -> Option<IpAddr> {
+        self.bridge_peers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&loopback_client_port)
+            .map(|(ip, _)| *ip)
     }
 }
 
@@ -240,7 +294,17 @@ pub fn split_endpoint_host_port(endpoint: &str) -> Option<(String, u16)> {
     if let Some(rest) = trimmed.strip_prefix('[') {
         let (host_raw, suffix) = rest.split_once(']')?;
         let host = host_raw.trim();
-        if host.is_empty() || host.parse::<Ipv6Addr>().is_err() {
+        if host.is_empty() {
+            return None;
+        }
+        let valid_v6 = if let Some((addr_part, scope_part)) = host.split_once('%') {
+            !scope_part.is_empty()
+                && !scope_part.contains(['%', '[', ']', ':'])
+                && addr_part.parse::<Ipv6Addr>().is_ok()
+        } else {
+            host.parse::<Ipv6Addr>().is_ok()
+        };
+        if !valid_v6 {
             return None;
         }
         let port_str = suffix.trim().strip_prefix(':')?;
@@ -664,11 +728,145 @@ fn push_unique_ipv4(target: &mut Vec<Ipv4Addr>, ip: Ipv4Addr) {
     }
 }
 
-async fn open_upnp_port_mapping_on(
+struct UpnpServiceEndpoint {
+    client: reqwest::Client,
+    control_url: String,
+    service_type: String,
+    local_ip: Ipv4Addr,
+    gateway_label: String,
+}
+
+fn build_upnp_add_port_mapping_body(
+    service_type: &str,
+    internal_port: u16,
+    external_port: u16,
+    local_ip: Ipv4Addr,
+    lease_seconds: u32,
+) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:AddPortMapping xmlns:u="{service_type}">
+      <NewRemoteHost></NewRemoteHost>
+      <NewExternalPort>{external_port}</NewExternalPort>
+      <NewProtocol>TCP</NewProtocol>
+      <NewInternalPort>{internal_port}</NewInternalPort>
+      <NewInternalClient>{local_ip}</NewInternalClient>
+      <NewEnabled>1</NewEnabled>
+      <NewPortMappingDescription>TerrariaLauncher</NewPortMappingDescription>
+      <NewLeaseDuration>{lease_seconds}</NewLeaseDuration>
+    </u:AddPortMapping>
+  </s:Body>
+</s:Envelope>"#
+    )
+}
+
+async fn send_upnp_add_port_mapping_inner(
+    client: &reqwest::Client,
+    control_url: &str,
+    service_type: &str,
+    internal_port: u16,
+    external_port: u16,
+    local_ip: Ipv4Addr,
+    lease_seconds: u32,
+) -> Result<(), (bool, LauncherError)> {
+    let add_body = build_upnp_add_port_mapping_body(
+        service_type,
+        internal_port,
+        external_port,
+        local_ip,
+        lease_seconds,
+    );
+    let soap_resp = client
+        .post(control_url)
+        .header("Content-Type", "text/xml; charset=\"utf-8\"")
+        .header("SOAPAction", format!("\"{service_type}#AddPortMapping\""))
+        .body(add_body)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                false,
+                LauncherError::Network(format!("Lỗi gửi UPnP AddPortMapping: {e}")),
+            )
+        })?;
+
+    if !soap_resp.status().is_success() {
+        let err_body = soap_resp.text().await.unwrap_or_default();
+        return Err((
+            true,
+            LauncherError::Network(format_upnp_soap_rejection(&err_body)),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn send_upnp_add_port_mapping(
+    client: &reqwest::Client,
+    control_url: &str,
+    service_type: &str,
+    internal_port: u16,
+    external_port: u16,
+    local_ip: Ipv4Addr,
+    lease_seconds: u32,
+) -> LauncherResult<()> {
+    send_upnp_add_port_mapping_inner(
+        client,
+        control_url,
+        service_type,
+        internal_port,
+        external_port,
+        local_ip,
+        lease_seconds,
+    )
+    .await
+    .map_err(|(_, err)| err)
+}
+
+async fn add_port_mapping_with_lease_fallback(
+    client: &reqwest::Client,
+    control_url: &str,
+    service_type: &str,
+    internal_port: u16,
+    external_port: u16,
+    local_ip: Ipv4Addr,
+) -> LauncherResult<u32> {
+    match send_upnp_add_port_mapping_inner(
+        client,
+        control_url,
+        service_type,
+        internal_port,
+        external_port,
+        local_ip,
+        0,
+    )
+    .await
+    {
+        Ok(()) => Ok(0),
+        Err((true, _)) => {
+            send_upnp_add_port_mapping(
+                client,
+                control_url,
+                service_type,
+                internal_port,
+                external_port,
+                local_ip,
+                3600,
+            )
+            .await?;
+            Ok(3600)
+        }
+        Err((false, err)) => Err(err),
+    }
+}
+
+async fn discover_upnp_service_endpoint(
     internal_port: u16,
     external_port: u16,
     preferred_local_ip: Option<Ipv4Addr>,
-) -> LauncherResult<(UpnpLeaseInfo, String)> {
+) -> LauncherResult<UpnpServiceEndpoint> {
     if internal_port == 0 || external_port == 0 {
         return Err(LauncherError::InvalidInput(
             "Cổng server không hợp lệ (port = 0)".to_string(),
@@ -749,52 +947,51 @@ async fn open_upnp_port_mapping_on(
     })?;
 
     let control_url = resolve_upnp_url(&location_url, &control_path);
+    Ok(UpnpServiceEndpoint {
+        client,
+        control_url,
+        service_type,
+        local_ip,
+        gateway_label,
+    })
+}
 
-    let add_body = format!(
-        r#"<?xml version="1.0"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-  <s:Body>
-    <u:AddPortMapping xmlns:u="{service_type}">
-      <NewRemoteHost></NewRemoteHost>
-      <NewExternalPort>{external_port}</NewExternalPort>
-      <NewProtocol>TCP</NewProtocol>
-      <NewInternalPort>{internal_port}</NewInternalPort>
-      <NewInternalClient>{local_ip}</NewInternalClient>
-      <NewEnabled>1</NewEnabled>
-      <NewPortMappingDescription>TerrariaLauncher</NewPortMappingDescription>
-      <NewLeaseDuration>0</NewLeaseDuration>
-    </u:AddPortMapping>
-  </s:Body>
-</s:Envelope>"#
-    );
+async fn open_upnp_port_mapping_on(
+    internal_port: u16,
+    external_port: u16,
+    preferred_local_ip: Option<Ipv4Addr>,
+) -> LauncherResult<(UpnpLeaseInfo, String)> {
+    let endpoint =
+        discover_upnp_service_endpoint(internal_port, external_port, preferred_local_ip).await?;
+    let lease_seconds = add_port_mapping_with_lease_fallback(
+        &endpoint.client,
+        &endpoint.control_url,
+        &endpoint.service_type,
+        internal_port,
+        external_port,
+        endpoint.local_ip,
+    )
+    .await?;
 
-    let soap_resp = client
-        .post(&control_url)
-        .header("Content-Type", "text/xml; charset=\"utf-8\"")
-        .header("SOAPAction", format!("\"{service_type}#AddPortMapping\""))
-        .body(add_body)
-        .send()
-        .await
-        .map_err(|e| LauncherError::Network(format!("Lỗi gửi UPnP AddPortMapping: {e}")))?;
-
-    if !soap_resp.status().is_success() {
-        let err_body = soap_resp.text().await.unwrap_or_default();
-        return Err(LauncherError::Network(format_upnp_soap_rejection(&err_body)));
-    }
-
-    let external_ip = query_upnp_external_ip(&client, &control_url, &service_type).await;
+    let external_ip = query_upnp_external_ip(
+        &endpoint.client,
+        &endpoint.control_url,
+        &endpoint.service_type,
+    )
+    .await;
     let is_cgnat = external_ip.map(is_cgnat_or_private_ipv4).unwrap_or(false);
 
     Ok((
         UpnpLeaseInfo {
-            control_url,
-            service_type,
+            control_url: endpoint.control_url,
+            service_type: endpoint.service_type,
             external_ip,
-            local_ip,
+            local_ip: endpoint.local_ip,
             port: external_port,
             is_cgnat,
+            lease_seconds,
         },
-        gateway_label,
+        endpoint.gateway_label,
     ))
 }
 
@@ -852,6 +1049,133 @@ pub async fn close_upnp_port(lease: &UpnpLeaseInfo) -> LauncherResult<()> {
         )));
     }
     Ok(())
+}
+
+async fn resolve_upnp_port_status(
+    lease: &UpnpLeaseInfo,
+    gateway_label: String,
+    cancel: &CancellationToken,
+) -> Option<UpnpPortStatus> {
+    if lease.is_cgnat {
+        return Some(UpnpPortStatus::CarrierGradeNat {
+            wan_ip: lease.external_ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            external_port: lease.port,
+        });
+    }
+    if let Some(ip) = lease.external_ip {
+        return Some(UpnpPortStatus::Mapped {
+            external_ip: ip,
+            external_port: lease.port,
+            gateway_label,
+        });
+    }
+
+    let fallback_pub = match build_http_client(None) {
+        Ok(client) => {
+            tokio::select! {
+                _ = cancel.cancelled() => return None,
+                ip = query_public_ipv4_with_client(&client, Duration::from_millis(2500)) => ip,
+            }
+        }
+        Err(_) => None,
+    };
+    if let Some(pub_ip) = fallback_pub {
+        if is_cgnat_or_private_ipv4(pub_ip) {
+            Some(UpnpPortStatus::CarrierGradeNat {
+                wan_ip: pub_ip,
+                external_port: lease.port,
+            })
+        } else {
+            Some(UpnpPortStatus::Mapped {
+                external_ip: pub_ip,
+                external_port: lease.port,
+                gateway_label,
+            })
+        }
+    } else {
+        Some(UpnpPortStatus::Unavailable(
+            "Đã mở cổng UPnP nhưng không xác định được IP WAN công cộng".to_string(),
+        ))
+    }
+}
+
+async fn setup_direct_host_upnp(
+    host_port: u16,
+    bind_ipv4: Option<Ipv4Addr>,
+    cancel: &CancellationToken,
+    has_upnp_lease: &AtomicBool,
+) -> (
+    Option<UpnpLeaseInfo>,
+    Option<reqwest::Client>,
+    Option<UpnpPortStatus>,
+) {
+    let endpoint = tokio::select! {
+        _ = cancel.cancelled() => return (None, None, None),
+        res = discover_upnp_service_endpoint(host_port, host_port, bind_ipv4) => match res {
+            Ok(ep) => ep,
+            Err(err) => {
+                return (
+                    None,
+                    None,
+                    Some(UpnpPortStatus::Unavailable(clean_launcher_error_msg(err))),
+                );
+            }
+        },
+    };
+
+    if cancel.is_cancelled() {
+        return (None, None, None);
+    }
+
+    has_upnp_lease.store(true, Ordering::SeqCst);
+    let lease_seconds = match add_port_mapping_with_lease_fallback(
+        &endpoint.client,
+        &endpoint.control_url,
+        &endpoint.service_type,
+        host_port,
+        host_port,
+        endpoint.local_ip,
+    )
+    .await
+    {
+        Ok(seconds) => seconds,
+        Err(err) => {
+            has_upnp_lease.store(false, Ordering::SeqCst);
+            return (
+                None,
+                None,
+                Some(UpnpPortStatus::Unavailable(clean_launcher_error_msg(err))),
+            );
+        }
+    };
+
+    let mut lease = UpnpLeaseInfo {
+        control_url: endpoint.control_url.clone(),
+        service_type: endpoint.service_type.clone(),
+        external_ip: None,
+        local_ip: endpoint.local_ip,
+        port: host_port,
+        is_cgnat: false,
+        lease_seconds,
+    };
+
+    if cancel.is_cancelled() {
+        return (Some(lease), Some(endpoint.client), None);
+    }
+
+    let external_ip = tokio::select! {
+        _ = cancel.cancelled() => return (Some(lease), Some(endpoint.client), None),
+        ip = query_upnp_external_ip(
+            &endpoint.client,
+            &endpoint.control_url,
+            &endpoint.service_type,
+        ) => ip,
+    };
+    lease.external_ip = external_ip;
+    lease.is_cgnat = external_ip.map(is_cgnat_or_private_ipv4).unwrap_or(false);
+
+    let status = resolve_upnp_port_status(&lease, endpoint.gateway_label, cancel).await;
+    (Some(lease), Some(endpoint.client), status)
 }
 
 pub(crate) fn extract_igd_location_from_ssdp(packet: &str) -> Option<String> {
@@ -1402,10 +1726,18 @@ struct ClientGuard {
     counter: Arc<AtomicUsize>,
     status: Arc<RwLock<DirectHostStatus>>,
     wake_ui: crate::server_manager::egui_repaint::RepaintHandle,
+    outbound_port: Option<u16>,
+    bridge_peers: Arc<RwLock<BridgePeerMap>>,
 }
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
+        if let Some(port) = self.outbound_port {
+            self.bridge_peers
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&port);
+        }
         let next = self
             .counter
             .fetch_sub(1, Ordering::SeqCst)
@@ -1434,49 +1766,94 @@ fn update_active_client_count(
     }
 }
 
-fn spawn_tcp_bridge_worker(
-    listener: TcpListener,
+#[derive(Clone)]
+struct TcpBridgeContext {
     local_target_port: u16,
     cancel: CancellationToken,
     active_clients: Arc<AtomicUsize>,
     status: Arc<RwLock<DirectHostStatus>>,
     wake_ui: crate::server_manager::egui_repaint::RepaintHandle,
-) {
+    banned_ips: Arc<RwLock<HashSet<IpAddr>>>,
+    bridge_peers: Arc<RwLock<BridgePeerMap>>,
+}
+
+fn is_peer_banned(banned_ips: &RwLock<HashSet<IpAddr>>, peer_ip: IpAddr) -> bool {
+    is_bannable_peer_ip(peer_ip)
+        && banned_ips
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&peer_ip)
+}
+
+fn configure_bridge_tcp_stream(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    let _ = SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
+fn spawn_tcp_bridge_worker(listener: TcpListener, ctx: TcpBridgeContext) {
     tokio::spawn(async move {
         loop {
             let accepted = tokio::select! {
-                _ = cancel.cancelled() => break,
+                _ = ctx.cancel.cancelled() => break,
                 res = listener.accept() => res,
             };
-            let Ok((mut inbound, _)) = accepted else {
+            let Ok((mut inbound, peer_addr)) = accepted else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             };
-            let _ = inbound.set_nodelay(true);
-            let child_cancel = cancel.clone();
-            let counter = Arc::clone(&active_clients);
-            let st_ref = Arc::clone(&status);
-            let wake_ref = wake_ui.clone();
+            let peer_ip = peer_addr.ip().to_canonical();
+            if is_peer_banned(&ctx.banned_ips, peer_ip) {
+                drop(inbound);
+                continue;
+            }
+            configure_bridge_tcp_stream(&inbound);
+            let conn_ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let target_v4 =
-                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_target_port));
+                let target_v4 = SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    conn_ctx.local_target_port,
+                ));
                 let Ok(Ok(mut outbound)) =
                     timeout(Duration::from_secs(3), TcpStream::connect(target_v4)).await
                 else {
                     return;
                 };
-                let _ = outbound.set_nodelay(true);
+                if is_peer_banned(&conn_ctx.banned_ips, peer_ip) {
+                    return;
+                }
+                configure_bridge_tcp_stream(&outbound);
 
-                let now_count = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                update_active_client_count(&st_ref, &wake_ref, now_count);
+                let outbound_port = outbound.local_addr().ok().map(|a| a.port());
+                let conn_cancel = CancellationToken::new();
+                if let Some(port) = outbound_port {
+                    conn_ctx
+                        .bridge_peers
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(port, (peer_ip, conn_cancel.clone()));
+                }
+
+                let now_count = conn_ctx.active_clients.fetch_add(1, Ordering::SeqCst) + 1;
                 let _guard = ClientGuard {
-                    counter,
-                    status: st_ref,
-                    wake_ui: wake_ref,
+                    counter: Arc::clone(&conn_ctx.active_clients),
+                    status: Arc::clone(&conn_ctx.status),
+                    wake_ui: conn_ctx.wake_ui.clone(),
+                    outbound_port,
+                    bridge_peers: Arc::clone(&conn_ctx.bridge_peers),
                 };
 
+                if is_peer_banned(&conn_ctx.banned_ips, peer_ip) {
+                    return;
+                }
+                update_active_client_count(&conn_ctx.status, &conn_ctx.wake_ui, now_count);
+
                 tokio::select! {
-                    _ = child_cancel.cancelled() => {}
+                    _ = conn_ctx.cancel.cancelled() => {}
+                    _ = conn_cancel.cancelled() => {}
                     _ = copy_bidirectional(&mut inbound, &mut outbound) => {}
                 }
             });
@@ -1546,14 +1923,27 @@ pub fn start_direct_port_host(
     wake_ui: crate::server_manager::egui_repaint::RepaintHandle,
 ) -> DirectPortHostHandle {
     let cancel = CancellationToken::new();
+    let banned_ips = Arc::new(RwLock::new(normalize_ban_set(
+        config.initial_banned_ips.iter().copied(),
+    )));
+    let bridge_peers = Arc::new(RwLock::new(HashMap::new()));
+    let has_upnp_lease = Arc::new(AtomicBool::new(false));
     if config.local_target_port == 0 || config.host_port == 0 {
         let status = Arc::new(RwLock::new(DirectHostStatus::Error(
             "Cổng server hoặc cổng host không hợp lệ (port = 0)".to_string(),
         )));
         wake_ui.wake();
-        return DirectPortHostHandle { cancel, status };
+        return DirectPortHostHandle {
+            cancel,
+            status,
+            banned_ips,
+            bridge_peers,
+            has_upnp_lease,
+            cleanup_done: Arc::new((Mutex::new(true), Condvar::new())),
+        };
     }
 
+    let cleanup_done = Arc::new((Mutex::new(false), Condvar::new()));
     let status = Arc::new(RwLock::new(DirectHostStatus::Starting {
         local_port: config.local_target_port,
         host_port: config.host_port,
@@ -1561,9 +1951,23 @@ pub fn start_direct_port_host(
     let handle = DirectPortHostHandle {
         cancel: cancel.clone(),
         status: Arc::clone(&status),
+        banned_ips: Arc::clone(&banned_ips),
+        bridge_peers: Arc::clone(&bridge_peers),
+        has_upnp_lease: Arc::clone(&has_upnp_lease),
+        cleanup_done: Arc::clone(&cleanup_done),
     };
 
     rt.spawn(async move {
+        struct CleanupDoneGuard(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for CleanupDoneGuard {
+            fn drop(&mut self) {
+                let (lock, cvar) = &*self.0;
+                let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *done = true;
+                cvar.notify_all();
+            }
+        }
+        let _cleanup_guard = CleanupDoneGuard(cleanup_done);
         let local_v4 = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
             config.local_target_port,
@@ -1588,6 +1992,15 @@ pub fn start_direct_port_host(
 
         let bind_ip = config.bind_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED);
         let active_clients = Arc::new(AtomicUsize::new(0));
+        let bridge_ctx = TcpBridgeContext {
+            local_target_port: config.local_target_port,
+            cancel: cancel.clone(),
+            active_clients: Arc::clone(&active_clients),
+            status: Arc::clone(&status),
+            wake_ui: wake_ui.clone(),
+            banned_ips: Arc::clone(&banned_ips),
+            bridge_peers: Arc::clone(&bridge_peers),
+        };
         let mut bridging_tcp = false;
         let mut ipv6_ready = false;
 
@@ -1607,42 +2020,32 @@ pub fn start_direct_port_host(
                 }
             };
             bridging_tcp = true;
-            spawn_tcp_bridge_worker(
-                v4_listener,
-                config.local_target_port,
-                cancel.clone(),
-                Arc::clone(&active_clients),
-                Arc::clone(&status),
-                wake_ui.clone(),
-            );
+            spawn_tcp_bridge_worker(v4_listener, bridge_ctx.clone());
 
             if config.bind_ipv4.is_none() {
                 if let Ok(v6_listener) = bind_tcp_v6_only_listener(config.host_port) {
                     ipv6_ready = true;
-                    spawn_tcp_bridge_worker(
-                        v6_listener,
-                        config.local_target_port,
-                        cancel.clone(),
-                        Arc::clone(&active_clients),
-                        Arc::clone(&status),
-                        wake_ui.clone(),
-                    );
+                    spawn_tcp_bridge_worker(v6_listener, bridge_ctx.clone());
                 }
             }
         } else {
-            if let Ok(v4_listener) = bind_tcp_v4_listener(bind_ip, config.host_port) {
-                bridging_tcp = true;
-                spawn_tcp_bridge_worker(
-                    v4_listener,
-                    config.local_target_port,
-                    cancel.clone(),
-                    Arc::clone(&active_clients),
-                    Arc::clone(&status),
-                    wake_ui.clone(),
-                );
-            } else if let Some(check_ip) = config.bind_ipv4.or(primary_lan_ip) {
-                let lan_sock = SocketAddr::V4(SocketAddrV4::new(check_ip, config.host_port));
-                if !is_local_tcp_socket_listening(lan_sock, Duration::from_millis(500)).await {
+            let check_ip = config.bind_ipv4.or(primary_lan_ip);
+            let already_listening_v4 = match check_ip {
+                Some(ip) => {
+                    is_local_tcp_socket_listening(
+                        SocketAddr::V4(SocketAddrV4::new(ip, config.host_port)),
+                        Duration::from_millis(400),
+                    )
+                    .await
+                }
+                None => false,
+            };
+
+            if !already_listening_v4 {
+                if let Ok(v4_listener) = bind_tcp_v4_listener(bind_ip, config.host_port) {
+                    bridging_tcp = true;
+                    spawn_tcp_bridge_worker(v4_listener, bridge_ctx.clone());
+                } else if check_ip.is_some() {
                     let candidate_ips: Vec<Ipv4Addr> = match config.bind_ipv4 {
                         Some(ip) => vec![ip],
                         None => interfaces
@@ -1656,14 +2059,7 @@ pub fn start_direct_port_host(
                         if let Ok(nic_listener) = bind_tcp_v4_listener(nic_ip, config.host_port) {
                             bound_any = true;
                             bridging_tcp = true;
-                            spawn_tcp_bridge_worker(
-                                nic_listener,
-                                config.local_target_port,
-                                cancel.clone(),
-                                Arc::clone(&active_clients),
-                                Arc::clone(&status),
-                                wake_ui.clone(),
-                            );
+                            spawn_tcp_bridge_worker(nic_listener, bridge_ctx.clone());
                         }
                     }
                     if !bound_any {
@@ -1685,14 +2081,7 @@ pub fn start_direct_port_host(
                     Ok(v6_listener) => {
                         bridging_tcp = true;
                         ipv6_ready = true;
-                        spawn_tcp_bridge_worker(
-                            v6_listener,
-                            config.local_target_port,
-                            cancel.clone(),
-                            Arc::clone(&active_clients),
-                            Arc::clone(&status),
-                            wake_ui.clone(),
-                        );
+                        spawn_tcp_bridge_worker(v6_listener, bridge_ctx.clone());
                     }
                     Err(_) => {
                         let check_v6 = global_ipv6.unwrap_or(Ipv6Addr::LOCALHOST);
@@ -1742,79 +2131,16 @@ pub fn start_direct_port_host(
         }
         wake_ui.wake();
 
-        let mut active_lease: Option<UpnpLeaseInfo> = None;
+        let (active_lease, upnp_client) = if config.try_upnp {
+            let (lease, client, upnp_status) = setup_direct_host_upnp(
+                config.host_port,
+                config.bind_ipv4,
+                &cancel,
+                &has_upnp_lease,
+            )
+            .await;
 
-        if config.try_upnp {
-            let upnp_fut = async {
-                match config.bind_ipv4 {
-                    Some(pinned) => {
-                        open_upnp_port_mapping_on(config.host_port, config.host_port, Some(pinned))
-                            .await
-                    }
-                    None => open_upnp_port_mapping(config.host_port, config.host_port).await,
-                }
-            };
-
-            let upnp_outcome = tokio::select! {
-                _ = cancel.cancelled() => None,
-                res = upnp_fut => Some(res),
-            };
-
-            if let Some(res) = upnp_outcome {
-                let resolved_upnp = match res {
-                    Ok((lease, gateway_label)) => {
-                        let ext_port = lease.port;
-                        let is_cgnat = lease.is_cgnat;
-                        let ext_ip = lease.external_ip;
-                        active_lease = Some(lease);
-
-                        if is_cgnat {
-                            let wan_ip = ext_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
-                            UpnpPortStatus::CarrierGradeNat {
-                                wan_ip,
-                                external_port: ext_port,
-                            }
-                        } else if let Some(ip) = ext_ip {
-                            UpnpPortStatus::Mapped {
-                                external_ip: ip,
-                                external_port: ext_port,
-                                gateway_label,
-                            }
-                        } else {
-                            let fallback_pub = match build_http_client(None) {
-                                Ok(client) => {
-                                    query_public_ipv4_with_client(
-                                        &client,
-                                        Duration::from_millis(2500),
-                                    )
-                                    .await
-                                }
-                                Err(_) => None,
-                            };
-                            if let Some(pub_ip) = fallback_pub {
-                                if is_cgnat_or_private_ipv4(pub_ip) {
-                                    UpnpPortStatus::CarrierGradeNat {
-                                        wan_ip: pub_ip,
-                                        external_port: ext_port,
-                                    }
-                                } else {
-                                    UpnpPortStatus::Mapped {
-                                        external_ip: pub_ip,
-                                        external_port: ext_port,
-                                        gateway_label,
-                                    }
-                                }
-                            } else {
-                                UpnpPortStatus::Unavailable(
-                                    "Đã mở cổng UPnP nhưng không xác định được IP WAN công cộng"
-                                        .to_string(),
-                                )
-                            }
-                        }
-                    }
-                    Err(err) => UpnpPortStatus::Unavailable(clean_launcher_error_msg(err)),
-                };
-
+            if let Some(resolved_upnp) = upnp_status {
                 let mut updated = false;
                 {
                     let mut guard = status.write().unwrap_or_else(|e| e.into_inner());
@@ -1827,14 +2153,42 @@ pub fn start_direct_port_host(
                     wake_ui.wake();
                 }
             }
-        }
+            (lease, client)
+        } else {
+            (None, None)
+        };
 
-        cancel.cancelled().await;
+        loop {
+            if let (Some(lease), Some(client)) = (active_lease.as_ref(), upnp_client.as_ref()) {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(1500)) => {
+                        let _ = send_upnp_add_port_mapping(
+                            client,
+                            &lease.control_url,
+                            &lease.service_type,
+                            lease.port,
+                            lease.port,
+                            lease.local_ip,
+                            lease.lease_seconds,
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                cancel.cancelled().await;
+                break;
+            }
+        }
 
         if let Some(lease) = active_lease {
             let _ = close_upnp_port(&lease).await;
         }
 
+        bridge_peers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         {
             let mut guard = status.write().unwrap_or_else(|e| e.into_inner());
             *guard = DirectHostStatus::Stopped;
@@ -1893,33 +2247,58 @@ pub async fn probe_tcp_endpoint(host: &str, port: u16) -> Result<u128, String> {
     }
 }
 
-pub async fn resolve_ipv6_bridge_target(host: &str, port: u16) -> Option<Ipv6Addr> {
+pub async fn resolve_ipv6_bridge_target(host: &str, port: u16) -> Option<SocketAddrV6> {
     let trimmed = host.trim();
     let unbracketed = trimmed
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(trimmed)
         .trim();
-    let before_zone = unbracketed.split('%').next().unwrap_or("").trim();
-    let clean = before_zone
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(before_zone)
-        .trim();
-    if clean.is_empty() {
-        return None;
-    }
-    if let Ok(v6) = clean.parse::<Ipv6Addr>() {
-        return Some(v6);
-    }
-    if clean.parse::<Ipv4Addr>().is_ok() || clean.eq_ignore_ascii_case("localhost") {
+    if unbracketed.is_empty() {
         return None;
     }
 
-    let lookup_port = if port > 0 { port } else { 7777 };
+    let target_port = if port > 0 { port } else { 7777 };
+
+    if let Some((addr_part, scope_part)) = unbracketed.split_once('%') {
+        let addr_clean = addr_part.trim();
+        let scope_clean = scope_part.trim();
+        if scope_clean.is_empty() || scope_clean.contains(['%', '[', ']', ':']) {
+            return None;
+        }
+        let v6 = addr_clean.parse::<Ipv6Addr>().ok()?;
+        if let Ok(scope_id) = scope_clean.parse::<u32>() {
+            return Some(SocketAddrV6::new(v6, target_port, 0, scope_id));
+        }
+        let Ok(Ok(addrs)) = timeout(
+            Duration::from_millis(1500),
+            tokio::net::lookup_host((unbracketed, target_port)),
+        )
+        .await
+        else {
+            return None;
+        };
+        return addrs.into_iter().find_map(|addr| match addr {
+            SocketAddr::V6(v6_sock) => Some(SocketAddrV6::new(
+                *v6_sock.ip(),
+                target_port,
+                v6_sock.flowinfo(),
+                v6_sock.scope_id(),
+            )),
+            SocketAddr::V4(_) => None,
+        });
+    }
+
+    if let Ok(v6) = unbracketed.parse::<Ipv6Addr>() {
+        return Some(SocketAddrV6::new(v6, target_port, 0, 0));
+    }
+    if unbracketed.parse::<Ipv4Addr>().is_ok() || unbracketed.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+
     let Ok(Ok(addrs)) = timeout(
         Duration::from_millis(1500),
-        tokio::net::lookup_host((clean, lookup_port)),
+        tokio::net::lookup_host((unbracketed, target_port)),
     )
     .await
     else {
@@ -1931,44 +2310,29 @@ pub async fn resolve_ipv6_bridge_target(host: &str, port: u16) -> Option<Ipv6Add
         return None;
     }
     list.iter().find_map(|addr| match addr {
-        SocketAddr::V6(v6) => Some(*v6.ip()),
+        SocketAddr::V6(v6) => Some(*v6),
         SocketAddr::V4(_) => None,
     })
 }
 
 pub async fn start_ipv4_to_ipv6_client_bridge(
-    target_ip: Ipv6Addr,
-    target_port: u16,
+    target: SocketAddrV6,
 ) -> LauncherResult<LocalClientBridgeHandle> {
-    if target_port == 0 {
+    if target.port() == 0 {
         return Err(LauncherError::InvalidInput(
             "Cổng đích IPv6 không hợp lệ (port = 0)".to_string(),
         ));
     }
 
-    let remote = SocketAddr::V6(SocketAddrV6::new(target_ip, target_port, 0, 0));
-    if target_ip.is_loopback() || detect_primary_global_ipv6() == Some(target_ip) {
-        if !is_local_tcp_socket_listening(remote, Duration::from_millis(400)).await {
-            return Err(LauncherError::Network(format!(
-                "Không kết nối được tới [{target_ip}]:{target_port} — cổng IPv6 trên máy này chưa mở hoặc Server chưa chạy."
-            )));
-        }
-    } else {
-        match timeout(Duration::from_millis(2500), TcpStream::connect(remote)).await {
-            Ok(Ok(probe_stream)) => {
-                drop(probe_stream);
-            }
-            Ok(Err(e)) => {
-                return Err(LauncherError::Network(format!(
-                    "Không kết nối được tới [{target_ip}]:{target_port} — cổng phía host đang đóng hoặc bị tường lửa IPv6 của modem/router chặn ({e})."
-                )));
-            }
-            Err(_) => {
-                return Err(LauncherError::Network(format!(
-                    "Hết thời gian chờ kết nối tới [{target_ip}]:{target_port} — tường lửa IPv6 trên modem/router có thể đang chặn hoặc host chưa mở cổng."
-                )));
-            }
-        }
+    let target_ip = *target.ip();
+    let remote = SocketAddr::V6(target);
+    if (target_ip.is_loopback()
+        || (target.scope_id() == 0 && detect_primary_global_ipv6() == Some(target_ip)))
+        && !is_local_tcp_socket_listening(remote, Duration::from_millis(400)).await
+    {
+        return Err(LauncherError::Network(format!(
+            "Không kết nối được tới {target} — cổng IPv6 trên máy này chưa mở hoặc Server chưa chạy."
+        )));
     }
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1996,9 +2360,10 @@ pub async fn start_ipv4_to_ipv6_client_bridge(
                 res = listener.accept() => res,
             };
             let Ok((mut inbound, _)) = accepted else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             };
-            let _ = inbound.set_nodelay(true);
+            configure_bridge_tcp_stream(&inbound);
             let child_cancel = task_cancel.clone();
             tokio::spawn(async move {
                 let Ok(Ok(mut outbound)) =
@@ -2006,7 +2371,7 @@ pub async fn start_ipv4_to_ipv6_client_bridge(
                 else {
                     return;
                 };
-                let _ = outbound.set_nodelay(true);
+                configure_bridge_tcp_stream(&outbound);
                 tokio::select! {
                     _ = child_cancel.cancelled() => {}
                     _ = copy_bidirectional(&mut inbound, &mut outbound) => {}
@@ -2182,6 +2547,13 @@ mod tests {
             split_endpoint_host_port("  [::1]:7777  "),
             Some(("::1".to_string(), 7777))
         );
+        assert_eq!(
+            split_endpoint_host_port("[fe80::1%12]:7777"),
+            Some(("fe80::1%12".to_string(), 7777))
+        );
+        assert_eq!(split_endpoint_host_port("[fe80::1%]:7777"), None);
+        assert_eq!(split_endpoint_host_port("[fe80::1%1%2]:7777"), None);
+        assert_eq!(split_endpoint_host_port("[fe80::1%1:2]:7777"), None);
         assert_eq!(split_endpoint_host_port(""), None);
         assert_eq!(split_endpoint_host_port("play.example.com"), None);
         assert_eq!(split_endpoint_host_port("play.example.com:0"), None);
@@ -2221,6 +2593,7 @@ mod tests {
                     host_port: 7777,
                     bind_ipv4: None,
                     try_upnp: false,
+                    initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
             );
@@ -2228,6 +2601,8 @@ mod tests {
                 invalid.current_status(),
                 DirectHostStatus::Error(_)
             ));
+            assert_eq!(invalid.resolve_bridged_peer(7777), None);
+            invalid.set_banned_ips([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
 
             let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let upstream_port = upstream.local_addr().unwrap().port();
@@ -2263,6 +2638,7 @@ mod tests {
                     host_port,
                     bind_ipv4: None,
                     try_upnp: false,
+                    initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
             );
@@ -2570,6 +2946,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                     host_port,
                     bind_ipv4: None,
                     try_upnp: false,
+                    initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
             );
@@ -2736,7 +3113,8 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
 
         rt.block_on(async {
             assert!(matches!(
-                start_ipv4_to_ipv6_client_bridge(Ipv6Addr::LOCALHOST, 0).await,
+                start_ipv4_to_ipv6_client_bridge(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
+                    .await,
                 Err(LauncherError::InvalidInput(_))
             ));
 
@@ -2744,7 +3122,13 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
             let closed_v6_port = free_v6.local_addr().unwrap().port();
             drop(free_v6);
             assert!(matches!(
-                start_ipv4_to_ipv6_client_bridge(Ipv6Addr::LOCALHOST, closed_v6_port).await,
+                start_ipv4_to_ipv6_client_bridge(SocketAddrV6::new(
+                    Ipv6Addr::LOCALHOST,
+                    closed_v6_port,
+                    0,
+                    0
+                ))
+                .await,
                 Err(LauncherError::Network(_))
             ));
 
@@ -2763,9 +3147,14 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                 }
             });
 
-            let bridge = start_ipv4_to_ipv6_client_bridge(Ipv6Addr::LOCALHOST, v6_port)
-                .await
-                .expect("bridge to [::1] echo listener must succeed");
+            let bridge = start_ipv4_to_ipv6_client_bridge(SocketAddrV6::new(
+                Ipv6Addr::LOCALHOST,
+                v6_port,
+                0,
+                0,
+            ))
+            .await
+            .expect("bridge to [::1] echo listener must succeed");
             let local_port = bridge.local_port();
             assert_ne!(local_port, 0);
 
@@ -2897,9 +3286,14 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                 assert!(probe_local_endpoint_listening("localhost", v6_port)
                     .await
                     .is_ok());
-                let bridge = start_ipv4_to_ipv6_client_bridge(Ipv6Addr::LOCALHOST, v6_port)
-                    .await
-                    .expect("local IPv6 bridge pre-flight must succeed passively");
+                let bridge = start_ipv4_to_ipv6_client_bridge(SocketAddrV6::new(
+                    Ipv6Addr::LOCALHOST,
+                    v6_port,
+                    0,
+                    0,
+                ))
+                .await
+                .expect("local IPv6 bridge pre-flight must succeed passively");
                 assert!(
                     timeout(Duration::from_millis(60), v6_loop.accept())
                         .await
@@ -2931,6 +3325,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                     host_port: server_port,
                     bind_ipv4: None,
                     try_upnp: false,
+                    initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
             );
@@ -2980,22 +3375,29 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
 
         rt.block_on(async {
             let expected: Ipv6Addr = "2405:4802:1d52::1".parse().unwrap();
+            let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
             assert_eq!(
                 resolve_ipv6_bridge_target("2405:4802:1d52::1", 7777).await,
-                Some(expected)
+                Some(SocketAddrV6::new(expected, 7777, 0, 0))
             );
             assert_eq!(
                 resolve_ipv6_bridge_target("  [2405:4802:1d52::1]  ", 7777).await,
-                Some(expected)
+                Some(SocketAddrV6::new(expected, 7777, 0, 0))
             );
             assert_eq!(
                 resolve_ipv6_bridge_target("[2405:4802:1d52::1%12]", 7777).await,
-                Some(expected)
+                Some(SocketAddrV6::new(expected, 7777, 0, 12))
             );
             assert_eq!(
                 resolve_ipv6_bridge_target("2405:4802:1d52::1%12", 0).await,
-                Some(expected)
+                Some(SocketAddrV6::new(expected, 7777, 0, 12))
             );
+            assert_eq!(
+                resolve_ipv6_bridge_target("[fe80::1%12]", 7779).await,
+                Some(SocketAddrV6::new(link_local, 7779, 0, 12))
+            );
+            assert_eq!(resolve_ipv6_bridge_target("[fe80::1%]", 7777).await, None);
+            assert_eq!(resolve_ipv6_bridge_target("fe80::1%1%2", 7777).await, None);
 
             assert_eq!(resolve_ipv6_bridge_target("", 7777).await, None);
             assert_eq!(resolve_ipv6_bridge_target("[]", 7777).await, None);
@@ -3003,6 +3405,493 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
             assert_eq!(resolve_ipv6_bridge_target("192.168.1.25", 7777).await, None);
             assert_eq!(resolve_ipv6_bridge_target("localhost", 7777).await, None);
             assert_eq!(resolve_ipv6_bridge_target("  LOCALHOST  ", 7777).await, None);
+        });
+    }
+
+    async fn wait_for_direct_host_running(handle: &DirectPortHostHandle) -> DirectHostActiveInfo {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match handle.current_status() {
+                DirectHostStatus::Running(info) => return info,
+                DirectHostStatus::Error(e) => panic!("direct host failed: {e}"),
+                _ if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+                other => panic!("timed out waiting for Running, got {other:?}"),
+            }
+        }
+    }
+
+    async fn stop_direct_host_and_wait(handle: &DirectPortHostHandle) {
+        handle.stop();
+        let stop_deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(handle.current_status(), DirectHostStatus::Stopped)
+            && Instant::now() < stop_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(matches!(handle.current_status(), DirectHostStatus::Stopped));
+    }
+
+    #[test]
+    fn normalize_ban_set_canonicalizes_and_excludes_loopback_and_unspecified() {
+        let banned = normalize_ban_set([
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            "::ffff:127.0.0.1".parse().unwrap(),
+            "::ffff:0.0.0.0".parse().unwrap(),
+            "::ffff:192.168.1.50".parse().unwrap(),
+            "2001:db8::42".parse().unwrap(),
+        ]);
+
+        assert_eq!(banned.len(), 2);
+        assert!(banned.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))));
+        assert!(banned.contains(&"2001:db8::42".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn direct_port_host_tracks_bridged_peers_and_enforces_ip_bans() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let upstream_port = upstream.local_addr().unwrap().port();
+            let (peer_port_tx, mut peer_port_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            tokio::spawn(async move {
+                while let Ok((mut sock, peer_addr)) = upstream.accept().await {
+                    let _ = peer_port_tx.send(peer_addr.port());
+                    tokio::spawn(async move {
+                        let mut req = [0u8; 4];
+                        while sock.read_exact(&mut req).await.is_ok() {
+                            if &req == b"PING" && sock.write_all(b"PONG").await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+
+            let probe_free = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+            let host_port = probe_free.local_addr().unwrap().port();
+            drop(probe_free);
+
+            let handle = start_direct_port_host(
+                &tokio::runtime::Handle::current(),
+                DirectHostConfig {
+                    local_target_port: upstream_port,
+                    host_port,
+                    bind_ipv4: None,
+                    try_upnp: false,
+                    initial_banned_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                },
+                crate::server_manager::egui_repaint::RepaintHandle::default(),
+            );
+            let _running = wait_for_direct_host_running(&handle).await;
+
+            let mut loop_client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+                .await
+                .expect("loopback client must connect despite LOCALHOST in initial_banned_ips");
+            loop_client.write_all(b"PING").await.unwrap();
+            let mut reply = [0u8; 4];
+            loop_client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"PONG");
+
+            let loop_outbound_port = timeout(Duration::from_secs(2), peer_port_rx.recv())
+                .await
+                .expect("expected upstream peer port")
+                .expect("channel open");
+            assert_eq!(
+                handle.resolve_bridged_peer(loop_outbound_port),
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            );
+            assert_eq!(handle.resolve_bridged_peer(0), None);
+
+            handle.set_banned_ips([
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                "::ffff:127.0.0.1".parse().unwrap(),
+            ]);
+
+            loop_client.write_all(b"PING").await.unwrap();
+            loop_client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"PONG");
+
+            let mut loop_client_2 = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+                .await
+                .expect("new loopback connection must remain allowed");
+            loop_client_2.write_all(b"PING").await.unwrap();
+            loop_client_2.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"PONG");
+            let loop_outbound_port_2 = timeout(Duration::from_secs(2), peer_port_rx.recv())
+                .await
+                .expect("expected second upstream peer port")
+                .expect("channel open");
+
+            drop(loop_client);
+            drop(loop_client_2);
+
+            let clear_deadline = Instant::now() + Duration::from_secs(2);
+            while (handle.resolve_bridged_peer(loop_outbound_port).is_some()
+                || handle.resolve_bridged_peer(loop_outbound_port_2).is_some())
+                && Instant::now() < clear_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            assert_eq!(handle.resolve_bridged_peer(loop_outbound_port), None);
+            assert_eq!(handle.resolve_bridged_peer(loop_outbound_port_2), None);
+
+            if let Some(lan_ip) =
+                detect_primary_lan_ipv4().filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            {
+                if let Ok(Ok(mut lan_client)) = timeout(
+                    Duration::from_secs(2),
+                    TcpStream::connect((lan_ip, host_port)),
+                )
+                .await
+                {
+                    lan_client.write_all(b"PING").await.unwrap();
+                    lan_client.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply, b"PONG");
+
+                    let lan_outbound_port = timeout(Duration::from_secs(2), peer_port_rx.recv())
+                        .await
+                        .expect("expected LAN upstream peer port")
+                        .expect("channel open");
+                    let peer_ip = lan_client.local_addr().unwrap().ip().to_canonical();
+                    assert_eq!(handle.resolve_bridged_peer(lan_outbound_port), Some(peer_ip));
+
+                    if is_bannable_peer_ip(peer_ip) {
+                        handle.set_banned_ips([peer_ip]);
+
+                        let mut drop_buf = [0u8; 4];
+                        let drop_res =
+                            timeout(Duration::from_secs(1), lan_client.read(&mut drop_buf))
+                                .await
+                                .expect("banned peer must be dropped immediately");
+                        assert!(
+                            matches!(drop_res, Ok(0) | Err(_)),
+                            "expected closed connection after ban, got {drop_res:?}"
+                        );
+
+                        let peer_clear_deadline = Instant::now() + Duration::from_secs(2);
+                        while handle.resolve_bridged_peer(lan_outbound_port).is_some()
+                            && Instant::now() < peer_clear_deadline
+                        {
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        assert_eq!(handle.resolve_bridged_peer(lan_outbound_port), None);
+
+                        if let Ok(Ok(mut blocked_client)) = timeout(
+                            Duration::from_secs(1),
+                            TcpStream::connect((lan_ip, host_port)),
+                        )
+                        .await
+                        {
+                            let _ = blocked_client.write_all(b"PING").await;
+                            let blocked_read =
+                                timeout(Duration::from_secs(1), blocked_client.read(&mut drop_buf))
+                                    .await
+                                    .expect("banned reconnect must close immediately");
+                            assert!(
+                                matches!(blocked_read, Ok(0) | Err(_)),
+                                "banned reconnect must not succeed, got {blocked_read:?}"
+                            );
+                        }
+                        assert!(
+                            timeout(Duration::from_millis(120), peer_port_rx.recv())
+                                .await
+                                .is_err(),
+                            "banned peer must be rejected before connecting upstream"
+                        );
+
+                        handle.set_banned_ips(std::iter::empty::<IpAddr>());
+                        let mut unbanned_client = timeout(
+                            Duration::from_secs(2),
+                            TcpStream::connect((lan_ip, host_port)),
+                        )
+                        .await
+                        .expect("unbanned connect timeout")
+                        .expect("unbanned client must connect");
+                        unbanned_client.write_all(b"PING").await.unwrap();
+                        unbanned_client.read_exact(&mut reply).await.unwrap();
+                        assert_eq!(&reply, b"PONG");
+                        drop(unbanned_client);
+                        let _ = timeout(Duration::from_secs(1), peer_port_rx.recv()).await;
+
+                        stop_direct_host_and_wait(&handle).await;
+
+                        let probe_free_2 =
+                            TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+                        let host_port_2 = probe_free_2.local_addr().unwrap().port();
+                        drop(probe_free_2);
+
+                        let mapped_ban = match peer_ip {
+                            IpAddr::V4(v4) => IpAddr::V6(v4.to_ipv6_mapped()),
+                            other => other,
+                        };
+                        let handle_2 = start_direct_port_host(
+                            &tokio::runtime::Handle::current(),
+                            DirectHostConfig {
+                                local_target_port: upstream_port,
+                                host_port: host_port_2,
+                                bind_ipv4: None,
+                                try_upnp: false,
+                                initial_banned_ips: vec![mapped_ban],
+                            },
+                            crate::server_manager::egui_repaint::RepaintHandle::default(),
+                        );
+                        let _running_2 = wait_for_direct_host_running(&handle_2).await;
+
+                        if let Ok(Ok(mut init_blocked)) = timeout(
+                            Duration::from_secs(1),
+                            TcpStream::connect((lan_ip, host_port_2)),
+                        )
+                        .await
+                        {
+                            let _ = init_blocked.write_all(b"PING").await;
+                            let init_read =
+                                timeout(Duration::from_secs(1), init_blocked.read(&mut drop_buf))
+                                    .await
+                                    .expect("initial_banned_ips must drop peer immediately");
+                            assert!(
+                                matches!(init_read, Ok(0) | Err(_)),
+                                "initial_banned_ips must reject peer, got {init_read:?}"
+                            );
+                        }
+                        assert!(
+                            timeout(Duration::from_millis(120), peer_port_rx.recv())
+                                .await
+                                .is_err(),
+                            "initial_banned_ips must block peer before upstream connect"
+                        );
+                        stop_direct_host_and_wait(&handle_2).await;
+                        return;
+                    }
+                }
+            }
+
+            stop_direct_host_and_wait(&handle).await;
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_port_host_same_port_skips_redundant_ipv4_bridge_when_already_listening() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let upstream = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+            let server_port = upstream.local_addr().unwrap().port();
+            let probe_ip = detect_primary_lan_ipv4().unwrap_or(Ipv4Addr::LOCALHOST);
+
+            let handle = start_direct_port_host(
+                &tokio::runtime::Handle::current(),
+                DirectHostConfig {
+                    local_target_port: server_port,
+                    host_port: server_port,
+                    bind_ipv4: Some(probe_ip),
+                    try_upnp: false,
+                    initial_banned_ips: Vec::new(),
+                },
+                crate::server_manager::egui_repaint::RepaintHandle::default(),
+            );
+
+            let info = wait_for_direct_host_running(&handle).await;
+            assert!(!info.bridging_tcp);
+
+            let (client_res, accept_res) = tokio::join!(
+                timeout(
+                    Duration::from_secs(2),
+                    TcpStream::connect((probe_ip, server_port))
+                ),
+                timeout(Duration::from_secs(2), upstream.accept())
+            );
+            let _client = client_res
+                .expect("connect timeout")
+                .expect("direct connect must succeed");
+            let (_server_sock, peer_addr) = accept_res
+                .expect("accept timeout")
+                .expect("upstream accept must succeed");
+            assert_eq!(peer_addr.ip(), IpAddr::V4(probe_ip));
+
+            stop_direct_host_and_wait(&handle).await;
+        });
+    }
+
+    #[test]
+    fn direct_port_host_stop_and_wait_synchronizes_upnp_cleanup() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let invalid_handle = start_direct_port_host(
+            rt.handle(),
+            DirectHostConfig {
+                local_target_port: 0,
+                host_port: 0,
+                bind_ipv4: None,
+                try_upnp: false,
+                initial_banned_ips: Vec::new(),
+            },
+            crate::server_manager::egui_repaint::RepaintHandle::default(),
+        );
+        let started = Instant::now();
+        invalid_handle.stop_and_wait(Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        let live_handle = DirectPortHostHandle {
+            cancel: CancellationToken::new(),
+            status: Arc::new(RwLock::new(DirectHostStatus::Idle)),
+            banned_ips: Arc::new(RwLock::new(HashSet::new())),
+            bridge_peers: Arc::new(RwLock::new(HashMap::new())),
+            has_upnp_lease: Arc::new(AtomicBool::new(true)),
+            cleanup_done: Arc::new((Mutex::new(false), Condvar::new())),
+        };
+        let cleanup_clone = Arc::clone(&live_handle.cleanup_done);
+        let cancel_clone = live_handle.cancel.clone();
+        let releaser = std::thread::spawn(move || {
+            while !cancel_clone.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+            let (lock, cvar) = &*cleanup_clone;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
+            cvar.notify_all();
+        });
+
+        let wait_started = Instant::now();
+        live_handle.stop_and_wait(Duration::from_secs(2));
+        let elapsed = wait_started.elapsed();
+        assert!(live_handle.cancel.is_cancelled());
+        assert!(elapsed >= Duration::from_millis(30));
+        assert!(elapsed < Duration::from_secs(1));
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn upnp_add_port_mapping_payload_and_lease_fallback_work() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let service_type = "urn:schemas-upnp-org:service:WANIPConnection:1";
+        let local_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let body_zero = build_upnp_add_port_mapping_body(service_type, 7777, 7777, local_ip, 0);
+        assert!(body_zero.contains("<NewLeaseDuration>0</NewLeaseDuration>"));
+        assert!(body_zero.contains("<NewExternalPort>7777</NewExternalPort>"));
+        assert!(body_zero.contains("<NewInternalClient>192.168.1.10</NewInternalClient>"));
+        assert!(body_zero.contains("<NewProtocol>TCP</NewProtocol>"));
+
+        let body_timed = build_upnp_add_port_mapping_body(service_type, 7777, 7777, local_ip, 3600);
+        assert!(body_timed.contains("<NewLeaseDuration>3600</NewLeaseDuration>"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let control_url = format!("http://127.0.0.1:{port}/ctl/IPConn");
+
+            let server_task = tokio::spawn(async move {
+                let mut seen_bodies = Vec::new();
+                for idx in 0..3 {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let header_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        assert!(n > 0, "unexpected EOF reading HTTP headers");
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_len {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let req_body =
+                        String::from_utf8_lossy(&buf[header_end..header_end + content_len])
+                            .to_string();
+                    seen_bodies.push(req_body);
+
+                    let resp = if idx == 0 {
+                        let err_xml = "<errorCode>725</errorCode><errorDescription>OnlyPermanentLeasesSupported</errorDescription>";
+                        format!(
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_xml}",
+                            err_xml.len()
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                    let _ = sock.shutdown().await;
+                }
+                seen_bodies
+            });
+
+            let client = build_lan_upnp_client().unwrap();
+            let negotiated = add_port_mapping_with_lease_fallback(
+                &client,
+                &control_url,
+                service_type,
+                7777,
+                7777,
+                local_ip,
+            )
+            .await
+            .unwrap();
+            assert_eq!(negotiated, 3600);
+
+            send_upnp_add_port_mapping(
+                &client,
+                &control_url,
+                service_type,
+                7777,
+                7777,
+                local_ip,
+                1800,
+            )
+            .await
+            .unwrap();
+
+            let captured = server_task.await.unwrap();
+            assert_eq!(captured.len(), 3);
+            assert!(captured[0].contains("<NewLeaseDuration>0</NewLeaseDuration>"));
+            assert!(captured[1].contains("<NewLeaseDuration>3600</NewLeaseDuration>"));
+            assert!(captured[2].contains("<NewLeaseDuration>1800</NewLeaseDuration>"));
         });
     }
 }

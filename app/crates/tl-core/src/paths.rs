@@ -84,7 +84,7 @@ impl LauncherPaths {
     }
 
     pub fn tml_modpacks_dir(&self) -> PathBuf {
-        self.tml_saves_dir.join("ModPacks")
+        self.tml_mods_dir().join("ModPacks")
     }
 
     pub fn tml_enabled_json(&self) -> PathBuf {
@@ -114,24 +114,91 @@ impl LauncherPaths {
         ] {
             std::fs::create_dir_all(dir)?;
         }
+
+        let modpacks_dir = self.tml_modpacks_dir();
+        let legacy_modpacks = self.tml_saves_dir.join("ModPacks");
+        if legacy_modpacks.is_dir() && legacy_modpacks != modpacks_dir {
+            for entry in std::fs::read_dir(&legacy_modpacks)? {
+                let entry = entry?;
+                let src = entry.path();
+                let dst = modpacks_dir.join(entry.file_name());
+                if dst.exists() {
+                    continue;
+                }
+                if std::fs::rename(&src, &dst).is_err() {
+                    if src.is_dir() {
+                        if let Err(err) = copy_dir_recursive(&src, &dst) {
+                            let _ = std::fs::remove_dir_all(&dst);
+                            return Err(err);
+                        }
+                        std::fs::remove_dir_all(&src)?;
+                    } else if src.is_file() {
+                        std::fs::copy(&src, &dst)?;
+                        std::fs::remove_file(&src)?;
+                    }
+                }
+            }
+            if std::fs::read_dir(&legacy_modpacks)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_dir(&legacy_modpacks);
+            }
+        }
+
         Ok(())
     }
 }
 
-fn detect_base_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the launcher root directory for a given executable path, falling back to `C:\TerrariaLauncher`.
+pub fn detect_base_dir_for_exe(exe: Option<&Path>) -> PathBuf {
+    if let Some(exe) = exe {
         if let Some(parent) = exe.parent() {
-            if parent.join("Terraria").is_dir() || parent.join("tModLoader").is_dir() {
+            if parent.join("Terraria").is_dir()
+                || parent.join("tModLoader").is_dir()
+                || parent.join("data").is_dir()
+            {
                 return parent.to_path_buf();
             }
             if let Some(grand) = parent.parent().and_then(Path::parent).and_then(Path::parent) {
-                if grand.join("Terraria").is_dir() || grand.join("tModLoader").is_dir() {
+                if grand.join("Terraria").is_dir()
+                    || grand.join("tModLoader").is_dir()
+                    || grand.join("app").join("Cargo.toml").is_file()
+                {
                     return grand.to_path_buf();
                 }
+            }
+            if exe
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.to_ascii_lowercase().starts_with("terrarialauncher"))
+                && parent.is_dir()
+            {
+                return parent.to_path_buf();
             }
         }
     }
     PathBuf::from(r"C:\TerrariaLauncher")
+}
+
+fn detect_base_dir() -> PathBuf {
+    detect_base_dir_for_exe(std::env::current_exe().ok().as_deref())
 }
 
 /// Verified status of required game binaries and runtime dependencies.
@@ -176,15 +243,8 @@ pub fn is_xna_framework_installed() -> bool {
         .any(|entry| entry.path().join("Microsoft.Xna.Framework.dll").is_file())
 }
 
-pub fn detect_dotnet8_runtime(paths: &LauncherPaths) -> Option<String> {
-    let local_dotnet = paths.tmodloader_dir.join("dotnet").join("dotnet.exe");
-    let cmd_bin = if local_dotnet.is_file() {
-        local_dotnet.as_os_str().to_os_string()
-    } else {
-        std::ffi::OsString::from("dotnet")
-    };
-
-    let mut cmd = Command::new(cmd_bin);
+fn query_dotnet8_runtime_bin(bin: &std::ffi::OsStr) -> Option<String> {
+    let mut cmd = Command::new(bin);
     cmd.arg("--list-runtimes");
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -209,6 +269,72 @@ pub fn detect_dotnet8_runtime(paths: &LauncherPaths) -> Option<String> {
         .next_back()
 }
 
+/// Queries the bundled `.NET 8` runtime inside `tModLoader\dotnet\dotnet.exe` if present.
+pub fn query_local_dotnet8_runtime(paths: &LauncherPaths) -> Option<String> {
+    let local_dotnet = paths.tmodloader_dir.join("dotnet").join("dotnet.exe");
+    if !local_dotnet.is_file() {
+        return None;
+    }
+    query_dotnet8_runtime_bin(local_dotnet.as_os_str())
+}
+
+/// Queries the system-installed `.NET 8` runtime via `dotnet` on `PATH`.
+pub fn query_system_dotnet8_runtime() -> Option<String> {
+    query_dotnet8_runtime_bin(std::ffi::OsStr::new("dotnet"))
+}
+
+pub fn detect_dotnet8_runtime(paths: &LauncherPaths) -> Option<String> {
+    query_local_dotnet8_runtime(paths).or_else(query_system_dotnet8_runtime)
+}
+
+fn parse_version_triplet(raw: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = raw.trim().split('.');
+    let parse_part = |s: Option<&str>| -> Option<u64> {
+        let token = s?.trim();
+        let digits_end = token
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(token.len());
+        if digits_end == 0 {
+            return None;
+        }
+        token[..digits_end].parse::<u64>().ok()
+    };
+    let major = parse_part(parts.next())?;
+    let minor = parse_part(parts.next())?;
+    let patch = parse_part(parts.next())?;
+    Some((major, minor, patch))
+}
+
+/// Returns `true` when `installed` matches `required` major.minor and has patch >= `required` patch.
+pub fn version_at_least_patch(installed: &str, required: &str) -> bool {
+    let Some((ins_maj, ins_min, ins_patch)) = parse_version_triplet(installed) else {
+        return false;
+    };
+    let Some((req_maj, req_min, req_patch)) = parse_version_triplet(required) else {
+        return false;
+    };
+    ins_maj == req_maj && ins_min == req_min && ins_patch >= req_patch
+}
+
+pub fn detect_exact_bundled_dotnet_runtime(paths: &LauncherPaths, required_version: &str) -> bool {
+    let required = required_version.trim();
+    if required.is_empty()
+        || required == "."
+        || required == ".."
+        || required.contains(['/', '\\'])
+    {
+        return false;
+    }
+    let dotnet_dir = paths.tmodloader_dir.join("dotnet");
+    dotnet_dir.join("dotnet.exe").is_file()
+        && dotnet_dir.join("host").join("fxr").is_dir()
+        && dotnet_dir
+            .join("shared")
+            .join("Microsoft.NETCore.App")
+            .join(required)
+            .is_dir()
+}
+
 pub fn find_steamcmd(paths: &LauncherPaths, custom: Option<&str>) -> Option<PathBuf> {
     if let Some(custom_str) = custom.map(str::trim).filter(|s| !s.is_empty()) {
         let p = PathBuf::from(custom_str);
@@ -229,13 +355,27 @@ pub fn find_steamcmd(paths: &LauncherPaths, custom: Option<&str>) -> Option<Path
     }
 
     if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-        let winget_link = PathBuf::from(&local_app)
-            .join("Microsoft")
-            .join("WinGet")
-            .join("Links")
-            .join("steamcmd.exe");
+        let winget_root = PathBuf::from(&local_app).join("Microsoft").join("WinGet");
+        let winget_link = winget_root.join("Links").join("steamcmd.exe");
         if winget_link.is_file() {
             return Some(winget_link);
+        }
+        let packages_dir = winget_root.join("Packages");
+        if let Ok(entries) = std::fs::read_dir(&packages_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.to_ascii_lowercase().starts_with("valve.steamcmd_"))
+                {
+                    let exe = path.join("steamcmd.exe");
+                    if exe.is_file() {
+                        return Some(exe);
+                    }
+                }
+            }
         }
     }
 
@@ -249,4 +389,174 @@ pub fn find_steamcmd(paths: &LauncherPaths, custom: Option<&str>) -> Option<Path
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_paths_under(root: &Path) -> LauncherPaths {
+        let data_dir = root.join("data");
+        let saves_dir = data_dir.join("Saves");
+        LauncherPaths {
+            base_dir: root.to_path_buf(),
+            terraria_dir: root.join("Terraria"),
+            tmodloader_dir: root.join("tModLoader"),
+            vanilla_saves_dir: saves_dir.join("Vanilla"),
+            tml_saves_dir: saves_dir.join("tModLoader"),
+            servers_dir: data_dir.join("Servers"),
+            backups_dir: data_dir.join("Backups"),
+            steamcmd_dir: data_dir.join("SteamCMD"),
+            config_path: data_dir.join("config.json"),
+            data_dir,
+        }
+    }
+
+    #[test]
+    fn tml_modpacks_dir_matches_tmodloader_mods_layout_and_migrates_legacy() {
+        let root = std::env::temp_dir().join(format!("tl_core_paths_{}", uuid::Uuid::new_v4()));
+        let paths = test_paths_under(&root);
+        assert_eq!(
+            paths.tml_modpacks_dir(),
+            paths.tml_saves_dir.join("Mods").join("ModPacks")
+        );
+
+        let legacy_dir = paths.tml_saves_dir.join("ModPacks");
+        let legacy_pack_a = legacy_dir.join("PackA").join("Mods");
+        std::fs::create_dir_all(&legacy_pack_a).unwrap();
+        std::fs::write(legacy_pack_a.join("enabled.json"), r#"["ModA"]"#).unwrap();
+
+        let legacy_conflict = legacy_dir.join("ConflictPack").join("Mods");
+        std::fs::create_dir_all(&legacy_conflict).unwrap();
+        std::fs::write(legacy_conflict.join("enabled.json"), r#"["OldVersion"]"#).unwrap();
+
+        let dest_conflict = paths.tml_modpacks_dir().join("ConflictPack").join("Mods");
+        std::fs::create_dir_all(&dest_conflict).unwrap();
+        std::fs::write(dest_conflict.join("enabled.json"), r#"["NewVersion"]"#).unwrap();
+
+        paths.ensure_dirs().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(
+                paths
+                    .tml_modpacks_dir()
+                    .join("PackA")
+                    .join("Mods")
+                    .join("enabled.json")
+            )
+            .unwrap(),
+            r#"["ModA"]"#
+        );
+        assert!(!legacy_dir.join("PackA").exists());
+        assert_eq!(
+            std::fs::read_to_string(dest_conflict.join("enabled.json")).unwrap(),
+            r#"["NewVersion"]"#
+        );
+        assert!(legacy_dir.join("ConflictPack").exists());
+
+        std::fs::remove_dir_all(legacy_dir.join("ConflictPack")).unwrap();
+        paths.ensure_dirs().unwrap();
+        assert!(!legacy_dir.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exact_bundled_dotnet_runtime_checks_required_layout() {
+        let root = std::env::temp_dir().join(format!("tl_core_dotnet_{}", uuid::Uuid::new_v4()));
+        let paths = test_paths_under(&root);
+        let dotnet_dir = paths.tmodloader_dir.join("dotnet");
+        std::fs::create_dir_all(&dotnet_dir).unwrap();
+
+        assert!(!detect_exact_bundled_dotnet_runtime(&paths, ""));
+        assert!(!detect_exact_bundled_dotnet_runtime(&paths, "   "));
+        assert!(!detect_exact_bundled_dotnet_runtime(&paths, "8.0.15"));
+
+        std::fs::write(dotnet_dir.join("dotnet.exe"), b"MZ").unwrap();
+        assert!(!detect_exact_bundled_dotnet_runtime(&paths, "8.0.15"));
+
+        std::fs::create_dir_all(dotnet_dir.join("host").join("fxr")).unwrap();
+        assert!(!detect_exact_bundled_dotnet_runtime(&paths, "8.0.15"));
+
+        std::fs::create_dir_all(
+            dotnet_dir
+                .join("shared")
+                .join("Microsoft.NETCore.App")
+                .join("8.0.10"),
+        )
+        .unwrap();
+        assert!(!detect_exact_bundled_dotnet_runtime(&paths, "8.0.15"));
+        assert!(detect_exact_bundled_dotnet_runtime(&paths, " 8.0.10 "));
+
+        std::fs::create_dir_all(
+            dotnet_dir
+                .join("shared")
+                .join("Microsoft.NETCore.App")
+                .join("8.0.15"),
+        )
+        .unwrap();
+        assert!(detect_exact_bundled_dotnet_runtime(&paths, "8.0.15"));
+        assert!(!detect_exact_bundled_dotnet_runtime(&paths, ".."));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_base_dir_for_exe_handles_portable_cargo_and_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("tl_core_basedir_{}", uuid::Uuid::new_v4()));
+
+        let clean_portable = root.join("CleanPortable");
+        std::fs::create_dir_all(&clean_portable).unwrap();
+        assert_eq!(
+            detect_base_dir_for_exe(Some(&clean_portable.join("TerrariaLauncher.exe"))),
+            clean_portable
+        );
+        assert_eq!(
+            detect_base_dir_for_exe(Some(&clean_portable.join("TerrariaLauncher_v1.2.exe"))),
+            clean_portable
+        );
+        assert_eq!(
+            detect_base_dir_for_exe(Some(&clean_portable.join("other_tool.exe"))),
+            PathBuf::from(r"C:\TerrariaLauncher")
+        );
+
+        let data_portable = root.join("DataPortable");
+        std::fs::create_dir_all(data_portable.join("data")).unwrap();
+        assert_eq!(
+            detect_base_dir_for_exe(Some(&data_portable.join("CustomName.exe"))),
+            data_portable
+        );
+
+        let cargo_repo = root.join("RepoRoot");
+        let cargo_target_debug = cargo_repo.join("app").join("target").join("debug");
+        std::fs::create_dir_all(&cargo_target_debug).unwrap();
+        std::fs::write(cargo_repo.join("app").join("Cargo.toml"), "[workspace]\n").unwrap();
+        assert_eq!(
+            detect_base_dir_for_exe(Some(&cargo_target_debug.join("tl-app.exe"))),
+            cargo_repo
+        );
+
+        assert_eq!(
+            detect_base_dir_for_exe(Some(Path::new("TerrariaLauncher.exe"))),
+            PathBuf::from(r"C:\TerrariaLauncher")
+        );
+        assert_eq!(
+            detect_base_dir_for_exe(None),
+            PathBuf::from(r"C:\TerrariaLauncher")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn version_at_least_patch_enforces_same_major_minor_and_patch_floor() {
+        assert!(version_at_least_patch("8.0.15", "8.0.0"));
+        assert!(version_at_least_patch("8.0.15", "8.0.15"));
+        assert!(version_at_least_patch("8.0.15-preview.1", "8.0.15"));
+        assert!(!version_at_least_patch("8.0.2", "8.0.15"));
+        assert!(!version_at_least_patch("9.0.0", "8.0.0"));
+        assert!(!version_at_least_patch("8.1.0", "8.0.0"));
+        assert!(!version_at_least_patch("invalid", "8.0.0"));
+    }
 }

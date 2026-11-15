@@ -68,7 +68,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     let direct_open = matches!(
         state.active_direct_host_status(),
         DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
-    ) || state.pending_auto_direct_host_profile_id.is_some();
+    ) || state.is_active_profile_pending_direct_host();
 
     ui.horizontal_wrapped(|ui| {
         if rpg_selectable_button(
@@ -150,7 +150,8 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
         .is_some_and(|s| s.is_active());
     let showing_ext = state.showing_external_server();
     let active_id = state.config.active_server_id.clone();
-    let profile_busy = is_active || showing_ext || state.is_profile_running(&active_id);
+    let profile_busy =
+        is_active || showing_ext || state.is_profile_busy_or_direct_hosted(&active_id);
 
     if profile_busy && state.confirm_delete_profile_id.as_deref() == Some(active_id.as_str()) {
         state.confirm_delete_profile_id = None;
@@ -254,7 +255,7 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                         )
                     })
                     .inner
-                    .on_disabled_hover_text("Tắt server của hồ sơ này trước khi xóa")
+                    .on_disabled_hover_text("Tắt server và đóng Online của hồ sơ này trước khi xóa")
                     .clicked()
                 {
                     state.confirm_delete_profile_id = Some(active_id.clone());
@@ -367,7 +368,7 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
             DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
         );
         let direct_open_or_pending =
-            direct_running_or_starting || state.pending_auto_direct_host_profile_id.is_some();
+            direct_running_or_starting || state.is_active_profile_pending_direct_host();
 
         ui.horizontal_wrapped(|ui| {
             let status_color = state.badge_color_for_server();
@@ -450,7 +451,7 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                     state.notify_ok(format!("Đã sao chép {ep}"));
                 }
             } else if matches!(direct_status, DirectHostStatus::Starting { .. })
-                || state.pending_auto_direct_host_profile_id.is_some()
+                || state.is_active_profile_pending_direct_host()
             {
                 status_pill(ui, "Đang mở cổng Online...", p.accent_cyan);
                 ui.spinner();
@@ -520,9 +521,15 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                     state.force_kill_server();
                 }
 
+                let can_join = !state.install_busy && !state.is_game_running();
+                let join_hint = if state.install_busy {
+                    "Đang cài đặt thành phần..."
+                } else {
+                    "Đóng cửa sổ game đang mở trước"
+                };
                 if is_running
                     && ui
-                        .add_enabled_ui(!state.is_game_running(), |ui| {
+                        .add_enabled_ui(can_join, |ui| {
                             rpg_button(
                                 ui,
                                 assets.as_ref(),
@@ -533,7 +540,7 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                             )
                         })
                         .inner
-                        .on_disabled_hover_text("Đóng cửa sổ game đang mở trước")
+                        .on_disabled_hover_text(join_hint)
                         .clicked()
                 {
                     state.join_own_hosted_server();
@@ -553,7 +560,8 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                         if direct_running_or_starting {
                             state.toggle_direct_host();
                         } else {
-                            state.pending_auto_direct_host_profile_id = None;
+                            let current_id = state.config.active_server_id.clone();
+                            state.cancel_pending_auto_direct_host(&current_id);
                             state.notify_ok("Đã hủy tự mở cổng Online.");
                         }
                     }
@@ -585,9 +593,15 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                     state.stop_external_server();
                 }
 
+                let can_join = !state.install_busy && !state.is_game_running();
+                let join_hint = if state.install_busy {
+                    "Đang cài đặt thành phần..."
+                } else {
+                    "Đóng cửa sổ game đang mở trước"
+                };
                 if !ext_starting
                     && ui
-                        .add_enabled_ui(!state.is_game_running(), |ui| {
+                        .add_enabled_ui(can_join, |ui| {
                             rpg_button(
                                 ui,
                                 assets.as_ref(),
@@ -598,7 +612,7 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                             )
                         })
                         .inner
-                        .on_disabled_hover_text("Đóng cửa sổ game đang mở trước")
+                        .on_disabled_hover_text(join_hint)
                         .clicked()
                 {
                     state.join_own_hosted_server();
@@ -618,7 +632,8 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                         if direct_running_or_starting {
                             state.toggle_direct_host();
                         } else {
-                            state.pending_auto_direct_host_profile_id = None;
+                            let current_id = state.config.active_server_id.clone();
+                            state.cancel_pending_auto_direct_host(&current_id);
                             state.notify_ok("Đã hủy tự mở cổng Online.");
                         }
                     }
@@ -636,28 +651,39 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                     state.server_tab = ServerSubTab::Network;
                 }
             } else {
-                if rpg_button(
-                    ui,
-                    assets.as_ref(),
-                    p,
-                    ButtonSkin::Cyan,
-                    UiIcon::Play,
-                    "Khởi chạy Server",
-                )
-                .clicked()
+                let can_launch_server = !state.install_busy;
+                if ui
+                    .add_enabled_ui(can_launch_server, |ui| {
+                        rpg_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Cyan,
+                            UiIcon::Play,
+                            "Khởi chạy Server",
+                        )
+                    })
+                    .inner
+                    .on_disabled_hover_text("Đang cài đặt thành phần...")
+                    .clicked()
                 {
                     state.start_selected_server();
                     state.server_tab = ServerSubTab::Console;
                 }
-                if rpg_button(
-                    ui,
-                    assets.as_ref(),
-                    p,
-                    ButtonSkin::Emerald,
-                    UiIcon::Host,
-                    "Khởi chạy & Mở Online",
-                )
-                .clicked()
+                if ui
+                    .add_enabled_ui(can_launch_server, |ui| {
+                        rpg_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Emerald,
+                            UiIcon::Host,
+                            "Khởi chạy & Mở Online",
+                        )
+                    })
+                    .inner
+                    .on_disabled_hover_text("Đang cài đặt thành phần...")
+                    .clicked()
                 {
                     state.start_self_host_online();
                     state.server_tab = ServerSubTab::Network;
@@ -768,16 +794,31 @@ fn render_other_running_servers(state: &mut AppState, ui: &mut egui::Ui, p: Them
                     ui.label(RichText::new(snap.edition.label()).size(12.0).color(p.text_muted));
                     status_pill(ui, snap.state.label(), lifecycle_color(&snap.state, p));
 
+                    let snap_stopping = matches!(snap.state, ServerLifecycleState::Stopping)
+                        || state
+                            .server_supervisors
+                            .get(profile_id)
+                            .is_some_and(|s| s.is_stopping());
+                    let stop_label = if snap_stopping {
+                        "Đang lưu..."
+                    } else {
+                        "Lưu & Tắt"
+                    };
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if rpg_compact_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            ButtonSkin::Amber,
-                            Some(UiIcon::Stop),
-                            "Lưu & Tắt",
-                        )
-                        .clicked()
+                        if ui
+                            .add_enabled_ui(!snap_stopping, |ui| {
+                                rpg_compact_button(
+                                    ui,
+                                    assets.as_ref(),
+                                    p,
+                                    ButtonSkin::Amber,
+                                    Some(UiIcon::Stop),
+                                    stop_label,
+                                )
+                            })
+                            .inner
+                            .clicked()
                         {
                             stop_profile = Some(profile_id.clone());
                         }
@@ -930,6 +971,20 @@ fn open_in_explorer(path: &std::path::Path) {
     let _ = open::that(path);
 }
 
+fn sanitize_world_stem(worldname: &str) -> String {
+    let sanitized: String = worldname
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '_' || *c == '-')
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        "World".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
     let Some(profile_edition) = state.config.active_server().map(|prof| prof.edition) else {
         return;
@@ -951,6 +1006,10 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
 
     let mut save_clicked = false;
     let mut port_edited = false;
+    let mut backup_clicked = false;
+    let mut clear_missing_modpack = false;
+    let mut upnp_synced: Option<bool> = None;
+    let modpacks_dir = state.paths.tml_modpacks_dir();
 
     {
         let modpacks = &state.modpacks;
@@ -1013,24 +1072,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                         .eq_ignore_ascii_case(&profile.config.world)
                             });
                             if !matches_selected_existing {
-                                let sanitized: String = profile
-                                    .config
-                                    .worldname
-                                    .chars()
-                                    .filter(|c| {
-                                        c.is_alphanumeric()
-                                            || *c == ' '
-                                            || *c == '_'
-                                            || *c == '-'
-                                    })
-                                    .collect::<String>()
-                                    .trim()
-                                    .to_string();
-                                let file_stem = if sanitized.is_empty() {
-                                    "World"
-                                } else {
-                                    sanitized.as_str()
-                                };
+                                let file_stem = sanitize_world_stem(&profile.config.worldname);
                                 profile.config.world = edition_worlds_dir
                                     .join(format!("{file_stem}.wld"))
                                     .to_string_lossy()
@@ -1040,10 +1082,58 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                             }
                         }
 
+                        let matched_existing = existing_worlds.iter().find(|w| {
+                            profile
+                                .config
+                                .world
+                                .eq_ignore_ascii_case(&w.file_path.to_string_lossy())
+                        });
+                        let world_file_exists = !profile.config.world.trim().is_empty()
+                            && std::path::Path::new(&profile.config.world).is_file();
+                        let selected_world_text = if let Some(w) = matched_existing {
+                            w.world_name.clone()
+                        } else if world_file_exists {
+                            std::path::Path::new(&profile.config.world)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "Thế giới (.wld)".to_string())
+                        } else {
+                            "Tạo file mới (.wld)".to_string()
+                        };
+
                         egui::ComboBox::from_id_salt("srv_pick_wld")
-                            .selected_text("Chọn thế giới có sẵn")
+                            .selected_text(selected_world_text)
                             .width(156.0)
                             .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        !world_file_exists && matched_existing.is_none(),
+                                        "Tạo file thế giới mới (.wld)",
+                                    )
+                                    .clicked()
+                                {
+                                    let stem = sanitize_world_stem(&profile.config.worldname);
+                                    let mut candidate =
+                                        edition_worlds_dir.join(format!("{stem}.wld"));
+                                    if candidate.exists() {
+                                        candidate =
+                                            edition_worlds_dir.join(format!("{stem}_Moi.wld"));
+                                        let mut idx = 2usize;
+                                        while candidate.exists() {
+                                            candidate = edition_worlds_dir
+                                                .join(format!("{stem}_{idx}.wld"));
+                                            idx += 1;
+                                        }
+                                    }
+                                    profile.config.world =
+                                        candidate.to_string_lossy().into_owned();
+                                    profile.config.worldpath =
+                                        edition_worlds_dir.to_string_lossy().into_owned();
+                                }
+                                if !existing_worlds.is_empty() {
+                                    ui.separator();
+                                }
                                 if existing_worlds.is_empty() {
                                     ui.label(
                                         RichText::new("Chưa có thế giới lưu sẵn")
@@ -1085,6 +1175,24 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                         .clicked()
                         {
                             open_in_explorer(&edition_worlds_dir);
+                        }
+
+                        if ui
+                            .add_enabled_ui(world_file_exists, |ui| {
+                                rpg_compact_button(
+                                    ui,
+                                    assets.as_ref(),
+                                    p,
+                                    ButtonSkin::Amber,
+                                    Some(UiIcon::Download),
+                                    "Sao lưu",
+                                )
+                            })
+                            .inner
+                            .on_disabled_hover_text("File .wld chưa được tạo trên ổ đĩa")
+                            .clicked()
+                        {
+                            backup_clicked = true;
                         }
                     });
                     ui.end_row();
@@ -1257,28 +1365,66 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
 
                     if profile.edition == GameEdition::TModLoader {
                         ui.label(RichText::new("Gói ModPack:").color(p.text_muted));
-                        let mp_label = if profile.config.modpack.is_empty() {
-                            "Mặc định (Mod đang bật)".to_string()
-                        } else {
-                            profile.config.modpack.clone()
-                        };
-                        egui::ComboBox::from_id_salt("srv_modpack")
-                            .selected_text(mp_label)
-                            .width(220.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut profile.config.modpack,
-                                    String::new(),
-                                    "Mặc định (Mod đang bật)",
-                                );
-                                for pack in modpacks {
+                        let pack_trimmed = profile.config.modpack.trim().to_string();
+                        let has_pack = !pack_trimmed.is_empty();
+                        let legacy_json_exists = has_pack
+                            && tl_core::is_safe_single_dir_component(&pack_trimmed)
+                            && modpacks_dir.join(format!("{pack_trimmed}.json")).is_file();
+                        let pack_exists = !has_pack
+                            || modpacks
+                                .iter()
+                                .any(|pack| pack.name.eq_ignore_ascii_case(&pack_trimmed))
+                            || legacy_json_exists;
+
+                        ui.vertical(|ui| {
+                            let mp_label = if !has_pack {
+                                "Mặc định (Mod đang bật)".to_string()
+                            } else {
+                                profile.config.modpack.clone()
+                            };
+                            egui::ComboBox::from_id_salt("srv_modpack")
+                                .selected_text(mp_label)
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut profile.config.modpack,
-                                        pack.name.clone(),
-                                        &pack.name,
+                                        String::new(),
+                                        "Mặc định (Mod đang bật)",
                                     );
-                                }
-                            });
+                                    for pack in modpacks {
+                                        ui.selectable_value(
+                                            &mut profile.config.modpack,
+                                            pack.name.clone(),
+                                            &pack.name,
+                                        );
+                                    }
+                                });
+
+                            if !pack_exists {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new(
+                                            "Gói Mod đã chọn không còn trong danh sách (khi chạy sẽ dùng Mod đang bật)",
+                                        )
+                                        .size(11.8)
+                                        .color(p.accent_amber),
+                                    );
+                                    if rpg_compact_button(
+                                        ui,
+                                        assets.as_ref(),
+                                        p,
+                                        ButtonSkin::Slate,
+                                        None,
+                                        "Xóa chọn",
+                                    )
+                                    .clicked()
+                                    {
+                                        profile.config.modpack.clear();
+                                        clear_missing_modpack = true;
+                                    }
+                                });
+                            }
+                        });
                         ui.end_row();
                     }
 
@@ -1286,7 +1432,12 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                     ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut profile.auto_restart, "Tự khởi động lại nếu sập");
                         ui.checkbox(&mut profile.config.secure, "Chống gian lận");
-                        ui.checkbox(&mut profile.config.upnp, "Tự mở cổng UPnP");
+                        if ui
+                            .checkbox(&mut profile.config.upnp, "Tự mở cổng UPnP")
+                            .changed()
+                        {
+                            upnp_synced = Some(profile.config.upnp);
+                        }
                         if profile.edition == GameEdition::Vanilla {
                             ui.checkbox(&mut profile.config.slowliquids, "Giảm tải nước chảy");
                             ui.horizontal(|ui| {
@@ -1311,10 +1462,20 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
         });
     }
 
+    if let Some(upnp_val) = upnp_synced {
+        state.direct_try_upnp = upnp_val;
+    }
+    if backup_clicked {
+        state.backup_active_server_world();
+    }
+
     if port_edited && !direct_host_active {
         let port_str = state.active_server_port().to_string();
         state.port_probe_port = port_str.clone();
         state.direct_host_port_input = port_str;
+    }
+    if clear_missing_modpack && !save_clicked {
+        state.save_config();
     }
     if save_clicked {
         state.save_config();
@@ -1353,11 +1514,18 @@ fn render_console_lines(
 
 fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
     let assets = state.assets.clone();
-    let sup_active = state
+    let sup_stdin = state
         .active_server_supervisor()
-        .is_some_and(|s| s.is_active());
-    let snap_state = state.active_server_snapshot().map(|s| &s.state);
-    let has_stdin = sup_active && matches!(snap_state, Some(ServerLifecycleState::Running));
+        .is_some_and(|s| s.is_active() && s.has_stdin());
+    let snap_state = state.active_server_snapshot().map(|s| s.state.clone());
+    let is_starting = matches!(snap_state, Some(ServerLifecycleState::Starting));
+    let can_quick_world_cmd =
+        sup_stdin && matches!(snap_state, Some(ServerLifecycleState::Running));
+    let can_send_stdin = sup_stdin
+        && matches!(
+            snap_state,
+            Some(ServerLifecycleState::Starting | ServerLifecycleState::Running)
+        );
 
     rpg_card(ui, assets.as_ref(), p, |ui| {
         ui.horizontal(|ui| {
@@ -1380,7 +1548,7 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
         });
 
         ui.add_space(6.0);
-        ui.add_enabled_ui(has_stdin, |ui| {
+        ui.add_enabled_ui(can_quick_world_cmd, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (label, cmd, skin, icon) in [
                     ("Lưu thế giới", "save", ButtonSkin::Amber, UiIcon::Download),
@@ -1441,10 +1609,12 @@ fn render_console_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
         ui.add_space(8.0);
         let input_hint = if state.showing_external_server() {
             "Server phiên trước chỉ xem log — khởi chạy lại để gửi lệnh"
+        } else if is_starting {
+            "Server đang khởi động — nhập trả lời nếu được hỏi (vd: số thứ tự World)..."
         } else {
             "Nhập lệnh server (vd: say Xin chao!, save, kick Ten)..."
         };
-        ui.add_enabled_ui(has_stdin, |ui| {
+        ui.add_enabled_ui(can_send_stdin, |ui| {
             ui.horizontal(|ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut state.console_input)

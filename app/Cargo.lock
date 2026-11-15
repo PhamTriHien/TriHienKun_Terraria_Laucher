@@ -4152,7 +4152,7 @@ dependencies = [
 
 [[package]]
 name = "tl-app"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "eframe",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "tl-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -4191,7 +4191,7 @@ dependencies = [
 
 [[package]]
 name = "tl-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "futures-util",

@@ -120,33 +120,41 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     selected_modpack.clone()
                 };
                 let mut modpack_changed = false;
-                egui::ComboBox::from_id_salt("play_modpack_combo")
-                    .selected_text(selected_label)
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_value(
-                                &mut selected_modpack,
-                                String::new(),
-                                "Mặc định (Mod đang bật)",
-                            )
-                            .changed()
-                        {
-                            modpack_changed = true;
-                        }
-                        for pack in &state.modpacks {
+                let tml_locked = state.is_tml_mods_locked();
+                ui.add_enabled_ui(!tml_locked, |ui| {
+                    egui::ComboBox::from_id_salt("play_modpack_combo")
+                        .selected_text(selected_label)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
                             if ui
                                 .selectable_value(
                                     &mut selected_modpack,
-                                    pack.name.clone(),
-                                    format!("{} ({} mod)", pack.name, pack.enabled_mods.len()),
+                                    String::new(),
+                                    "Mặc định (Mod đang bật)",
                                 )
                                 .changed()
                             {
                                 modpack_changed = true;
                             }
-                        }
-                    });
+                            for pack in &state.modpacks {
+                                if ui
+                                    .selectable_value(
+                                        &mut selected_modpack,
+                                        pack.name.clone(),
+                                        format!("{} ({} mod)", pack.name, pack.enabled_mods.len()),
+                                    )
+                                    .changed()
+                                {
+                                    modpack_changed = true;
+                                }
+                            }
+                        })
+                })
+                .inner
+                .response
+                .on_disabled_hover_text(
+                    "Không thể đổi ModPack khi tModLoader hoặc tModLoader Server đang chạy.",
+                );
                 if modpack_changed {
                     let trimmed = selected_modpack.trim();
                     let pack_to_activate = (!trimmed.is_empty()
@@ -160,6 +168,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     .flatten();
                     if let Some(pack) = pack_to_activate {
                         state.activate_selected_modpack(&pack);
+                        state.save_config();
                     } else {
                         state.config.active_modpack = selected_modpack;
                         state.save_config();
@@ -388,7 +397,8 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
         if !state.config.saved_join_servers.is_empty() {
             ui.add_space(8.0);
-            let mut join_target = None;
+            let mut join_idx = None;
+            let mut edit_idx = None;
             let mut remove_idx = None;
             for (idx, srv) in state.config.saved_join_servers.iter().enumerate() {
                 let srv_ready = is_edition_ready(state, srv.edition);
@@ -411,6 +421,9 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         };
                         ui.label(RichText::new(ep_text).monospace().color(p.text_muted));
                         status_pill(ui, srv.edition.label(), p.accent_cyan);
+                        if !srv.modpack.trim().is_empty() {
+                            status_pill(ui, srv.modpack.trim(), p.accent_amber);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if rpg_compact_button(
                                 ui,
@@ -423,6 +436,18 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                             .clicked()
                             {
                                 remove_idx = Some(idx);
+                            }
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Slate,
+                                Some(UiIcon::Key),
+                                "Sửa",
+                            )
+                            .clicked()
+                            {
+                                edit_idx = Some(idx);
                             }
                             if ui
                                 .add_enabled_ui(can_join_saved, |ui| {
@@ -439,12 +464,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                                 .on_disabled_hover_text(saved_disabled_hint)
                                 .clicked()
                             {
-                                join_target = Some((
-                                    srv.edition,
-                                    srv.host.clone(),
-                                    srv.port,
-                                    srv.password.clone(),
-                                ));
+                                join_idx = Some(idx);
                             }
                         });
                     });
@@ -454,13 +474,10 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             if let Some(idx) = remove_idx {
                 state.config.saved_join_servers.remove(idx);
                 state.save_config();
-            }
-            if let Some((edition, host, port, pass)) = join_target {
-                if !state.is_game_running() {
-                    state.config.active_edition = edition;
-                    state.refresh_worlds_and_backups();
-                }
-                state.launch_selected_game(Some((host, port, pass)));
+            } else if let Some(idx) = edit_idx {
+                state.load_saved_join_server_to_form(idx);
+            } else if let Some(idx) = join_idx {
+                state.join_saved_server(idx);
             }
         }
     });
@@ -552,9 +569,23 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         for bak in &backups {
                             let is_confirming =
                                 state.confirm_restore_backup.as_ref() == Some(&bak.file_path);
+                            let restore_gate = state.can_restore_world_backup(bak);
+                            let can_restore = restore_gate.is_ok();
+                            let restore_disabled_hint = restore_gate.err().unwrap_or("");
                             rpg_subcard(ui, assets.as_ref(), p, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(&bak.file_name).monospace().size(12.5));
+                                    if let Some(ed) = bak.detected_edition {
+                                        status_pill(
+                                            ui,
+                                            ed.label(),
+                                            if ed == state.config.active_edition {
+                                                p.accent_cyan
+                                            } else {
+                                                p.accent_red
+                                            },
+                                        );
+                                    }
                                     ui.label(
                                         RichText::new(format!(
                                             "{}  •  {}",
@@ -580,27 +611,37 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                                                 {
                                                     cancel_confirm = true;
                                                 }
-                                                if rpg_compact_button(
-                                                    ui,
-                                                    assets.as_ref(),
-                                                    p,
-                                                    ButtonSkin::Amber,
-                                                    Some(UiIcon::Refresh),
-                                                    "Ghi đè",
-                                                )
-                                                .clicked()
+                                                if ui
+                                                    .add_enabled_ui(can_restore, |ui| {
+                                                        rpg_compact_button(
+                                                            ui,
+                                                            assets.as_ref(),
+                                                            p,
+                                                            ButtonSkin::Amber,
+                                                            Some(UiIcon::Refresh),
+                                                            "Ghi đè",
+                                                        )
+                                                    })
+                                                    .inner
+                                                    .on_disabled_hover_text(restore_disabled_hint)
+                                                    .clicked()
                                                 {
                                                     restore_target = Some(bak.clone());
                                                 }
-                                            } else if rpg_compact_button(
-                                                ui,
-                                                assets.as_ref(),
-                                                p,
-                                                ButtonSkin::Amber,
-                                                Some(UiIcon::Refresh),
-                                                "Khôi phục",
-                                            )
-                                            .clicked()
+                                            } else if ui
+                                                .add_enabled_ui(can_restore, |ui| {
+                                                    rpg_compact_button(
+                                                        ui,
+                                                        assets.as_ref(),
+                                                        p,
+                                                        ButtonSkin::Amber,
+                                                        Some(UiIcon::Refresh),
+                                                        "Khôi phục",
+                                                    )
+                                                })
+                                                .inner
+                                                .on_disabled_hover_text(restore_disabled_hint)
+                                                .clicked()
                                             {
                                                 ask_confirm = Some(bak.file_path.clone());
                                             }
@@ -668,9 +709,9 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePa
 
             ui.horizontal_wrapped(|ui| {
                 status_pill(ui, &warnings.join(" • "), p.accent_red);
-                ui.add_enabled_ui(!state.install_busy, |ui| {
-                    if missing_terraria
-                        && rpg_button(
+                if missing_terraria {
+                    ui.add_enabled_ui(!state.install_busy, |ui| {
+                        if rpg_button(
                             ui,
                             assets.as_ref(),
                             p,
@@ -683,22 +724,37 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePa
                             state.effective_terraria_source()
                         ))
                         .clicked()
-                    {
-                        do_terraria_url = true;
-                    }
-                    if missing_xna
-                        && rpg_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            ButtonSkin::Amber,
-                            UiIcon::Download,
-                            "Cài XNA 4.0",
-                        )
+                        {
+                            do_terraria_url = true;
+                        }
+                    });
+                }
+                if missing_xna {
+                    let can_xna = !state.install_busy && state.can_install_edition_ui(None);
+                    let xna_hint = if state.install_busy {
+                        "Đang có tác vụ cài đặt khác đang chạy."
+                    } else {
+                        "Dừng game và server trước khi cài đặt XNA 4.0."
+                    };
+                    if ui
+                        .add_enabled_ui(can_xna, |ui| {
+                            rpg_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Amber,
+                                UiIcon::Download,
+                                "Cài XNA 4.0",
+                            )
+                        })
+                        .inner
+                        .on_disabled_hover_text(xna_hint)
                         .clicked()
                     {
                         do_xna = true;
                     }
+                }
+                ui.add_enabled_ui(!state.install_busy, |ui| {
                     if missing_tml {
                         let tml_btn_label = if missing_dotnet {
                             "Cài tModLoader + .NET 8"

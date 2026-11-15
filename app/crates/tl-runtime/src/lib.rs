@@ -11,16 +11,17 @@ pub use game_installer::{
     install_dotnet8_portable, install_steamcmd_with_progress, install_terraria_from_local_zip,
     install_terraria_from_source, install_tmodloader_release, load_installed_terraria_receipt,
     parse_dotnet_runtime_version, parse_github_branch_spec, parse_github_release_spec,
-    sanitize_winget_stream_line, InstallProgress, InstallTarget, InstalledTerrariaReceipt,
-    ProgressCallback, TerrariaBranchManifest, TerrariaManifestPart, TmodLoaderReleaseInfo,
-    STEAMCMD_OFFICIAL_ZIP_URL, TERRARIA_MANIFEST_FILENAME, TMODLOADER_GITHUB_REPO,
-    XNA_40_OFFICIAL_MSI_URL,
+    read_required_tml_dotnet_version, sanitize_winget_stream_line, InstallProgress, InstallTarget,
+    InstalledTerrariaReceipt, ProgressCallback, TerrariaBranchManifest, TerrariaManifestPart,
+    TmodLoaderReleaseInfo, STEAMCMD_OFFICIAL_ZIP_URL, TERRARIA_MANIFEST_FILENAME,
+    TMODLOADER_GITHUB_REPO, XNA_40_OFFICIAL_MSI_URL,
 };
 
 pub use game_runner::{
     apply_dotnet_std_env, apply_dotnet_tokio_env, detect_existing_game_process,
-    install_xna_framework_elevated, launch_game, resolve_dotnet_launch, ActiveGameProcess,
-    DotnetLaunchSpec, GameLaunchOptions, RunningGameSnapshot, RuntimeTuning,
+    install_xna_framework_elevated, launch_game, resolve_dotnet_launch,
+    terminate_game_process_by_pid, ActiveGameProcess, DotnetLaunchSpec, GameLaunchOptions,
+    RunningGameSnapshot, RuntimeTuning,
 };
 pub use modpack_sync::{
     build_modpack_share_preview, inspect_share_key_against_local, load_mod_sources,
@@ -31,11 +32,13 @@ pub use modpack_sync::{
 };
 pub use mods_manager::{
     browse_workshop_mods, delete_installed_mod, delete_staged_workshop_mod,
-    download_and_install_tmod_url, download_and_install_tmod_url_with_source,
-    download_workshop_mod_via_steamcmd, fetch_github_latest_tmod, fetch_workshop_details,
+    detect_installed_tml_year_month, download_and_install_tmod_url,
+    download_and_install_tmod_url_with_source, download_workshop_mod_via_steamcmd,
+    enable_mod_and_installed_deps, fetch_github_latest_tmod, fetch_workshop_details,
     fetch_workshop_image_bytes, format_unix_timestamp, import_local_mod_files,
     install_steamcmd_via_winget, load_workshop_manifest, parse_workshop_browse_html,
-    parse_workshop_id, pick_best_workshop_tmod, record_workshop_install, scan_installed_mods,
+    parse_workshop_id, pick_best_workshop_tmod, pick_best_workshop_tmods,
+    record_workshop_install, remove_workshop_manifest_entry, scan_installed_mods,
     scan_staged_workshop_mods, set_mod_enabled, strip_steam_bbcode, workshop_manifest_path,
     CuratedModSource, InstalledModEntry, RemoteTmodAsset, StagedWorkshopMod, WorkshopItemDetails,
     WorkshopManifestRecord, WorkshopQueryResult, WorkshopSort, CURATED_GITHUB_MODS,
@@ -50,8 +53,11 @@ pub use network_host::{
     UpnpLeaseInfo, UpnpPortStatus,
 };
 pub use server_manager::{
-    detect_existing_server_processes, egui_repaint::RepaintHandle, load_banlist,
-    read_server_log_summary, save_banlist, start_server, summarize_server_log_lines,
-    terminate_process_by_pid, BanEntry, ConnectedPlayer, ConsoleLogLine, DetectedExternalServer,
-    ExternalServerLogSummary, ServerLifecycleState, ServerRuntimeSnapshot, ServerSupervisor,
+    acquire_single_instance_guard, detect_existing_server_processes,
+    egui_repaint::RepaintHandle, extract_ban_ip_key, focus_existing_launcher_window,
+    is_loopback_ban_target, load_banlist, normalize_ip_addr, read_server_log_summary,
+    resolve_tmodloader_server_modpack_config, save_banlist, start_server,
+    summarize_server_log_lines, terminate_process_by_pid, BanEntry, ConnectedPlayer,
+    ConsoleLogLine, DetectedExternalServer, ExternalServerLogSummary, ServerLifecycleState,
+    ServerRuntimeSnapshot, ServerSupervisor, SingleInstanceGuard,
 };

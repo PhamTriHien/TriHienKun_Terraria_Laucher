@@ -62,6 +62,7 @@ impl Default for RuntimeTuning {
 pub struct DotnetLaunchSpec {
     pub executable: PathBuf,
     pub using_bundled: bool,
+    pub roll_forward: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,8 +296,12 @@ fn build_tmodloader_command(
     }
 
     let terraria_content = paths.terraria_dir.join("Content");
-    let tml_content = paths.tmodloader_dir.join("Content");
-    if !terraria_content.is_dir() && !tml_content.is_dir() {
+    let sibling_content = paths
+        .tmodloader_dir
+        .parent()
+        .map(|p| p.join("Terraria").join("Content").is_dir())
+        .unwrap_or(false);
+    if !terraria_content.is_dir() && !sibling_content {
         return Err(LauncherError::NotFound(format!(
             "Không tìm thấy thư mục tài nguyên Terraria (Content) tại {}. Hãy cài đặt Terraria hoặc chọn đúng thư mục Terraria trong Cài đặt.",
             terraria_content.display()
@@ -317,7 +322,6 @@ fn build_tmodloader_command(
 
     if let Some(driver) = opts.graphics_backend.fna_driver_name() {
         cmd.env(FNA3D_FORCE_DRIVER_ENV, driver);
-        cmd.arg(format!("/gldevice:{driver}"));
     } else {
         cmd.env_remove(FNA3D_FORCE_DRIVER_ENV);
     }
@@ -337,14 +341,17 @@ fn build_tmodloader_command(
 }
 
 fn should_pass_legacy_modpack_arg(paths: &LauncherPaths, modpack: &str) -> bool {
+    let modpacks_dir = paths.tml_modpacks_dir();
     !modpack.is_empty()
         && !modpack.contains(['/', '\\'])
         && modpack != "."
         && modpack != ".."
-        && paths
-            .tml_modpacks_dir()
-            .join(format!("{modpack}.json"))
+        && !modpacks_dir
+            .join(modpack)
+            .join("Mods")
+            .join("enabled.json")
             .is_file()
+        && modpacks_dir.join(format!("{modpack}.json")).is_file()
 }
 
 fn spawn_tracked_game(
@@ -447,16 +454,79 @@ fn spawn_output_collector<R: Read + Send + 'static>(
 }
 
 pub fn resolve_dotnet_launch(paths: &LauncherPaths) -> DotnetLaunchSpec {
+    resolve_dotnet_launch_with(
+        paths,
+        tl_core::detect_exact_bundled_dotnet_runtime,
+        tl_core::query_local_dotnet8_runtime,
+        tl_core::query_system_dotnet8_runtime,
+    )
+}
+
+fn resolve_dotnet_launch_with<FExact, FLocal, FSys>(
+    paths: &LauncherPaths,
+    detect_exact: FExact,
+    query_local: FLocal,
+    query_system: FSys,
+) -> DotnetLaunchSpec
+where
+    FExact: Fn(&LauncherPaths, &str) -> bool,
+    FLocal: Fn(&LauncherPaths) -> Option<String>,
+    FSys: Fn() -> Option<String>,
+{
     let local = paths.tmodloader_dir.join("dotnet").join("dotnet.exe");
+    let req = crate::game_installer::read_declared_tml_dotnet_version(paths);
+
+    if let Some(ref req_ver) = req {
+        if detect_exact(paths, req_ver) {
+            return DotnetLaunchSpec {
+                executable: local,
+                using_bundled: true,
+                roll_forward: Some("Disable"),
+            };
+        }
+    }
+
+    if local.is_file() {
+        if let Some(local_ver) = query_local(paths) {
+            if req
+                .as_deref()
+                .is_none_or(|r| tl_core::version_at_least_patch(&local_ver, r))
+            {
+                return DotnetLaunchSpec {
+                    executable: local,
+                    using_bundled: true,
+                    roll_forward: Some("LatestPatch"),
+                };
+            }
+        }
+    }
+
+    if !local.is_file() || req.is_some() {
+        if let Some(sys_ver) = query_system() {
+            if req
+                .as_deref()
+                .is_none_or(|r| tl_core::version_at_least_patch(&sys_ver, r))
+            {
+                return DotnetLaunchSpec {
+                    executable: PathBuf::from("dotnet"),
+                    using_bundled: false,
+                    roll_forward: None,
+                };
+            }
+        }
+    }
+
     if local.is_file() {
         DotnetLaunchSpec {
             executable: local,
             using_bundled: true,
+            roll_forward: Some("LatestPatch"),
         }
     } else {
         DotnetLaunchSpec {
             executable: PathBuf::from("dotnet"),
             using_bundled: false,
+            roll_forward: None,
         }
     }
 }
@@ -487,8 +557,8 @@ impl ProcessCommandEnv for tokio::process::Command {
 }
 
 fn apply_dotnet_env<C: ProcessCommandEnv>(spec: &DotnetLaunchSpec, cmd: &mut C) {
-    if spec.using_bundled {
-        cmd.set_env_var(DOTNET_ROLL_FORWARD_ENV, OsStr::new("Disable"));
+    if let Some(policy) = spec.roll_forward {
+        cmd.set_env_var(DOTNET_ROLL_FORWARD_ENV, OsStr::new(policy));
     } else {
         cmd.remove_env_var(DOTNET_ROLL_FORWARD_ENV);
     }
@@ -738,6 +808,34 @@ pub fn detect_existing_game_process(
     best.map(|(_, snapshot)| snapshot)
 }
 
+pub fn terminate_game_process_by_pid(sys: &mut System, pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    let spid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet),
+    );
+    let Some(process) = sys.process(spid) else {
+        return false;
+    };
+    let proc_name = process.name().to_string_lossy();
+    let exe_path = process.exe();
+    let args: Vec<String> = process
+        .cmd()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if parse_game_client_cmdline(&proc_name, exe_path, &args).is_none() {
+        return false;
+    }
+    process.kill()
+}
+
 pub fn append_extra_args(cmd: &mut Command, raw: &str) {
     for arg in split_shell_args(raw) {
         cmd.arg(arg);
@@ -856,13 +954,18 @@ pub fn run_elevated_windows(file: &str, params: &str) -> LauncherResult<()> {
             "Tác vụ quyền Administrator vẫn đang chạy quá thời gian chờ".to_string(),
         ));
     }
-    if exit_code != 0 {
+    if !is_elevated_exit_success(exit_code) {
         return Err(LauncherError::Process(format!(
             "Tác vụ quyền Administrator thất bại (mã thoát {exit_code})"
         )));
     }
 
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn is_elevated_exit_success(exit_code: u32) -> bool {
+    exit_code == 0 || exit_code == 3010
 }
 
 #[cfg(not(windows))]
@@ -957,6 +1060,7 @@ mod tests {
         let system_spec = DotnetLaunchSpec {
             executable: PathBuf::from("dotnet"),
             using_bundled: false,
+            roll_forward: None,
         };
         let mut std_cmd = Command::new("dotnet");
         std_cmd.env(DOTNET_ROLL_FORWARD_ENV, "Disable");
@@ -994,6 +1098,7 @@ mod tests {
         let bundled_spec = DotnetLaunchSpec {
             executable: PathBuf::from(r"C:\tModLoader\dotnet\dotnet.exe"),
             using_bundled: true,
+            roll_forward: Some("Disable"),
         };
         let mut bundled_std = Command::new(&bundled_spec.executable);
         apply_dotnet_std_env(&bundled_spec, &mut bundled_std);
@@ -1009,6 +1114,19 @@ mod tests {
         assert_eq!(
             bundled_tokio_envs.get(OsStr::new(DOTNET_ROLL_FORWARD_ENV)),
             Some(&Some(OsStr::new("Disable")))
+        );
+
+        let patch_spec = DotnetLaunchSpec {
+            executable: PathBuf::from(r"C:\tModLoader\dotnet\dotnet.exe"),
+            using_bundled: true,
+            roll_forward: Some("LatestPatch"),
+        };
+        let mut patch_std = Command::new(&patch_spec.executable);
+        apply_dotnet_std_env(&patch_spec, &mut patch_std);
+        let patch_envs: HashMap<_, _> = patch_std.get_envs().collect();
+        assert_eq!(
+            patch_envs.get(OsStr::new(DOTNET_ROLL_FORWARD_ENV)),
+            Some(&Some(OsStr::new("LatestPatch")))
         );
     }
 
@@ -1319,6 +1437,7 @@ mod tests {
         let spec = DotnetLaunchSpec {
             executable: PathBuf::from("dotnet"),
             using_bundled: false,
+            roll_forward: None,
         };
         let err = map_dotnet_spawn_error(
             std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1378,7 +1497,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert!(args.iter().any(|a| a == "/gldevice:Vulkan"));
+        assert!(!args.iter().any(|a| a.starts_with("/gldevice:")));
 
         let envs: HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
@@ -1474,5 +1593,95 @@ mod tests {
             Err(LauncherError::NotFound(_)) => assert!(!is_xna_framework_installed()),
             Err(other) => panic!("unexpected build_vanilla_command error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_dotnet_launch_handles_exact_patch_and_system_fallback() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_dotnet_roll_forward");
+        let local_dotnet = paths.tmodloader_dir.join("dotnet").join("dotnet.exe");
+        fs::create_dir_all(local_dotnet.parent().unwrap()).unwrap();
+        fs::write(&local_dotnet, b"MZ").unwrap();
+        fs::write(
+            paths.tmodloader_dir.join("tModLoader.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0.23"}}}"#,
+        )
+        .unwrap();
+
+        let exact = resolve_dotnet_launch_with(
+            &paths,
+            |_, req| req == "8.0.23",
+            |_| Some("8.0.23".to_string()),
+            || Some("8.0.24".to_string()),
+        );
+        assert!(exact.using_bundled);
+        assert_eq!(exact.executable, local_dotnet);
+        assert_eq!(exact.roll_forward, Some("Disable"));
+
+        let newer_local = resolve_dotnet_launch_with(
+            &paths,
+            |_, _| false,
+            |_| Some("8.0.25".to_string()),
+            || Some("8.0.24".to_string()),
+        );
+        assert!(newer_local.using_bundled);
+        assert_eq!(newer_local.executable, local_dotnet);
+        assert_eq!(newer_local.roll_forward, Some("LatestPatch"));
+
+        let system_fallback = resolve_dotnet_launch_with(
+            &paths,
+            |_, _| false,
+            |_| Some("8.0.14".to_string()),
+            || Some("8.0.24".to_string()),
+        );
+        assert!(!system_fallback.using_bundled);
+        assert_eq!(system_fallback.executable, PathBuf::from("dotnet"));
+        assert_eq!(system_fallback.roll_forward, None);
+
+        let local_when_no_sys = resolve_dotnet_launch_with(
+            &paths,
+            |_, _| false,
+            |_| Some("8.0.14".to_string()),
+            || Some("8.0.10".to_string()),
+        );
+        assert!(local_when_no_sys.using_bundled);
+        assert_eq!(local_when_no_sys.roll_forward, Some("LatestPatch"));
+    }
+
+    #[test]
+    fn build_tmodloader_command_requires_vanilla_or_sibling_content() {
+        let (_guard, mut paths) = make_temp_paths("tl_runtime_tml_content_guard");
+        fs::write(paths.tmodloader_dll(), b"DLL").unwrap();
+        fs::create_dir_all(paths.tmodloader_dir.join("Content")).unwrap();
+
+        let err = build_tmodloader_command(&paths, &GameLaunchOptions::default()).unwrap_err();
+        assert!(matches!(err, LauncherError::NotFound(_)));
+
+        let custom_terraria = paths.data_dir.join("CustomTerraria");
+        fs::create_dir_all(&custom_terraria).unwrap();
+        paths.terraria_dir = custom_terraria;
+        fs::create_dir_all(paths.tmodloader_dir.parent().unwrap().join("Terraria").join("Content"))
+            .unwrap();
+
+        assert!(build_tmodloader_command(&paths, &GameLaunchOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn should_pass_legacy_modpack_arg_skips_when_folder_modpack_exists() {
+        let (_guard, paths) = make_temp_paths("tl_runtime_modpack_collision");
+        let modpacks_dir = paths.tml_modpacks_dir();
+        let pack_mods = modpacks_dir.join("DualPack").join("Mods");
+        fs::create_dir_all(&pack_mods).unwrap();
+        fs::write(pack_mods.join("enabled.json"), b"[]").unwrap();
+        fs::write(modpacks_dir.join("DualPack.json"), b"{}").unwrap();
+
+        assert!(!should_pass_legacy_modpack_arg(&paths, "DualPack"));
+    }
+
+    #[test]
+    fn elevated_exit_code_accepts_zero_and_3010_reboot_required() {
+        assert!(is_elevated_exit_success(0));
+        assert!(is_elevated_exit_success(3010));
+        assert!(!is_elevated_exit_success(1603));
+        assert!(!is_elevated_exit_success(1));
     }
 }

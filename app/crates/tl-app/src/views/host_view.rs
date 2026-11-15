@@ -26,7 +26,7 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
         matches!(srv_state, Some(ServerLifecycleState::Stopping)) || srv_stopping_sup;
     let server_ready = srv_running || state.network_snapshot.local_port_listening;
     let server_unstarted = !srv_active && !has_ext && !server_ready;
-    let pending_auto = state.pending_auto_direct_host_profile_id.is_some();
+    let pending_auto = state.is_active_profile_pending_direct_host();
 
     let direct_status = state.active_direct_host_status();
     let direct_running = matches!(direct_status, DirectHostStatus::Running(_));
@@ -290,7 +290,9 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
             ui.add_enabled_ui(!direct_busy, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Mạng:").color(p.text_muted));
-                    let selected_nic_text = match state.direct_bind_ip {
+                    let prev_bind_ip = state.active_direct_bind_ip();
+                    let mut bind_ip = prev_bind_ip;
+                    let selected_nic_text = match bind_ip {
                         None => "Tất cả mạng đang kết nối".to_string(),
                         Some(ip) => state
                             .network_snapshot
@@ -314,14 +316,17 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                         .truncate()
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
-                                &mut state.direct_bind_ip,
+                                &mut bind_ip,
                                 None,
                                 "Tất cả mạng đang kết nối",
                             );
                             for (ipv4, label) in &selectable_ifaces {
-                                ui.selectable_value(&mut state.direct_bind_ip, Some(*ipv4), label);
+                                ui.selectable_value(&mut bind_ip, Some(*ipv4), label);
                             }
                         });
+                    if bind_ip != prev_bind_ip {
+                        state.set_active_direct_bind_ip(bind_ip);
+                    }
 
                     ui.label(RichText::new("Cổng mở:").color(p.text_muted));
                     ui.add(
@@ -330,10 +335,18 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                             .hint_text(port.to_string()),
                     );
 
-                    ui.checkbox(
-                        &mut state.direct_try_upnp,
-                        "Tự động mở cổng UPnP trên Modem",
-                    );
+                    if ui
+                        .checkbox(
+                            &mut state.direct_try_upnp,
+                            "Tự động mở cổng UPnP trên Modem",
+                        )
+                        .changed()
+                    {
+                        if let Some(prof) = state.config.active_server_mut() {
+                            prof.config.upnp = state.direct_try_upnp;
+                        }
+                        state.save_config();
+                    }
                 });
             });
         }
@@ -363,11 +376,17 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                         )
                         .clicked()
                         {
-                            state.pending_auto_direct_host_profile_id = None;
+                            let active_profile_id = state.config.active_server_id.clone();
+                            state.cancel_pending_auto_direct_host(&active_profile_id);
                         }
                     } else if server_unstarted {
+                        let launch_hint = if state.install_busy {
+                            "Đang cài đặt thành phần..."
+                        } else {
+                            "Cổng server phải lớn hơn 0"
+                        };
                         if ui
-                            .add_enabled_ui(port > 0, |ui| {
+                            .add_enabled_ui(!state.install_busy && port > 0, |ui| {
                                 rpg_button(
                                     ui,
                                     assets.as_ref(),
@@ -378,6 +397,7 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                                 )
                             })
                             .inner
+                            .on_disabled_hover_text(launch_hint)
                             .clicked()
                         {
                             ask_start_self_host = true;
@@ -571,18 +591,47 @@ pub(super) fn render_players_and_banlist_card(
     p: ThemePalette,
 ) {
     let assets = state.assets.clone();
+    let is_ext_readonly = state.showing_external_server();
+    let can_refresh_players = !is_ext_readonly
+        && state
+            .active_server_supervisor()
+            .is_some_and(|s| s.is_active() && s.has_stdin())
+        && matches!(
+            state.active_server_snapshot().map(|s| &s.state),
+            Some(ServerLifecycleState::Running)
+        );
 
     rpg_card(ui, assets.as_ref(), p, |ui| {
-        rpg_section_heading(
-            ui,
-            assets.as_ref(),
-            p,
-            UiIcon::Server,
-            "Người chơi đang kết nối & Danh sách cấm",
-        );
+        ui.horizontal(|ui| {
+            rpg_section_heading(
+                ui,
+                assets.as_ref(),
+                p,
+                UiIcon::Server,
+                "Người chơi đang kết nối & Danh sách cấm",
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled_ui(can_refresh_players, |ui| {
+                        rpg_compact_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Slate,
+                            Some(UiIcon::Refresh),
+                            "Làm mới",
+                        )
+                    })
+                    .inner
+                    .clicked()
+                {
+                    state.refresh_online_players();
+                }
+            });
+        });
         ui.add_space(8.0);
 
-        let players = if state.showing_external_server() {
+        let players = if is_ext_readonly {
             state
                 .active_external_log_summary()
                 .map(|s| s.players.clone())
@@ -607,7 +656,8 @@ pub(super) fn render_players_and_banlist_card(
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&player.name).strong());
                         if let Some(ip) = &player.ip {
-                            ui.label(RichText::new(ip).monospace().color(p.text_muted));
+                            let display_ip = state.format_player_ip_for_active(ip);
+                            ui.label(RichText::new(&display_ip).monospace().color(p.text_muted));
                         }
                         ui.label(
                             RichText::new(format!("Vào lúc {}", player.joined_at))
@@ -615,29 +665,27 @@ pub(super) fn render_players_and_banlist_card(
                                 .color(p.text_muted),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if rpg_compact_button(
-                                ui,
-                                assets.as_ref(),
-                                p,
-                                ButtonSkin::Red,
-                                Some(UiIcon::Trash),
-                                "Ban",
-                            )
-                            .clicked()
-                            {
-                                ban_target = Some(player.name.clone());
-                            }
-                            if rpg_compact_button(
-                                ui,
-                                assets.as_ref(),
-                                p,
-                                ButtonSkin::Amber,
-                                Some(UiIcon::Stop),
-                                "Kick",
-                            )
-                            .clicked()
-                            {
-                                kick_target = Some(player.name.clone());
+                            for (skin, icon, label, target) in [
+                                (ButtonSkin::Red, UiIcon::Trash, "Ban", &mut ban_target),
+                                (ButtonSkin::Amber, UiIcon::Stop, "Kick", &mut kick_target),
+                            ] {
+                                if ui
+                                    .add_enabled_ui(!is_ext_readonly, |ui| {
+                                        rpg_compact_button(
+                                            ui,
+                                            assets.as_ref(),
+                                            p,
+                                            skin,
+                                            Some(icon),
+                                            label,
+                                        )
+                                    })
+                                    .inner
+                                    .on_disabled_hover_text("Server phiên trước chỉ hỗ trợ xem log")
+                                    .clicked()
+                                {
+                                    *target = Some(player.name.clone());
+                                }
                             }
                         });
                     });

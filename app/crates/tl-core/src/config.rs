@@ -220,7 +220,7 @@ impl Default for ServerConfigData {
             motd: "Chao mung den voi Terraria Server!".to_string(),
             worldpath: String::new(),
             worldrollbackstokeep: 2,
-            banlist: "banlist.txt".to_string(),
+            banlist: String::new(),
             secure: true,
             language: "en-US".to_string(),
             upnp: true,
@@ -479,6 +479,8 @@ pub struct SavedJoinServer {
     pub port: u16,
     pub password: String,
     pub edition: GameEdition,
+    #[serde(default)]
+    pub modpack: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,25 +586,62 @@ impl Default for LauncherConfig {
 }
 
 impl LauncherConfig {
-    pub fn load_or_default(paths: &LauncherPaths) -> Self {
-        let Ok(raw) = std::fs::read_to_string(&paths.config_path) else {
-            return Self::default();
-        };
-        let mut parsed: Self = serde_json::from_str(&raw).unwrap_or_default();
-        if parsed.terraria_install_source.trim().is_empty() {
-            parsed.terraria_install_source = DEFAULT_TERRARIA_INSTALL_SOURCE.to_string();
+    fn normalized(mut self, _paths: &LauncherPaths) -> Self {
+        if self.terraria_install_source.trim().is_empty() {
+            self.terraria_install_source = DEFAULT_TERRARIA_INSTALL_SOURCE.to_string();
         }
-        if parsed.servers.is_empty() {
-            parsed.servers = Self::default().servers;
+        if self.servers.is_empty() {
+            self.servers = Self::default().servers;
         }
-        if !parsed
+        if !self
             .servers
             .iter()
-            .any(|s| s.id == parsed.active_server_id)
+            .any(|s| s.id == self.active_server_id)
         {
-            parsed.active_server_id = parsed.servers[0].id.clone();
+            self.active_server_id = self.servers[0].id.clone();
         }
-        parsed
+        self
+    }
+
+    pub fn load_or_default(paths: &LauncherPaths) -> Self {
+        if !paths.config_path.exists() {
+            return Self::default().normalized(paths);
+        }
+        let raw = match std::fs::read_to_string(&paths.config_path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                tracing::warn!(
+                    path = %paths.config_path.display(),
+                    error = %err,
+                    "Failed to read config.json; backing up corrupt file and using defaults"
+                );
+                let backup = paths.config_path.with_file_name("config.json.corrupt.bak");
+                let _ = std::fs::copy(&paths.config_path, &backup);
+                return Self::default().normalized(paths);
+            }
+        };
+        if raw.trim().is_empty() {
+            return Self::default().normalized(paths);
+        }
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(parsed) => parsed.normalized(paths),
+            Err(err) => {
+                tracing::warn!(
+                    path = %paths.config_path.display(),
+                    error = %err,
+                    "Failed to parse config.json; backing up corrupt file and using defaults"
+                );
+                let backup = paths.config_path.with_file_name("config.json.corrupt.bak");
+                if let Err(copy_err) = std::fs::copy(&paths.config_path, &backup) {
+                    tracing::warn!(
+                        backup = %backup.display(),
+                        error = %copy_err,
+                        "Failed to preserve corrupt config.json backup"
+                    );
+                }
+                Self::default().normalized(paths)
+            }
+        }
     }
 
     pub fn save(&self, paths: &LauncherPaths) -> LauncherResult<()> {
@@ -631,10 +670,21 @@ impl LauncherConfig {
     }
 }
 
-pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("data");
+    let tmp = parent.join(format!(".{file_name}.tl_atomic"));
+    if let Err(err) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -719,5 +769,87 @@ mod tests {
         let legacy_raw = "port=7777\r\npassword=100%\r\n";
         let parsed_legacy = ServerConfigData::parse(legacy_raw);
         assert_eq!(parsed_legacy.password, "100%");
+    }
+
+    #[test]
+    fn saved_join_server_defaults_and_roundtrips_modpack() {
+        let legacy_json =
+            r#"{"name":"Srv","host":"127.0.0.1","port":7777,"password":"","edition":"Vanilla"}"#;
+        let parsed: SavedJoinServer = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.modpack, "");
+
+        let with_pack = SavedJoinServer {
+            modpack: "Calamity".to_string(),
+            ..parsed
+        };
+        let encoded = serde_json::to_string(&with_pack).unwrap();
+        let roundtrip: SavedJoinServer = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(roundtrip.modpack, "Calamity");
+    }
+
+    #[test]
+    fn load_or_default_preserves_corrupt_config_backup_and_skips_blank() {
+        let root = std::env::temp_dir().join(format!("tl_core_cfg_{}", uuid::Uuid::new_v4()));
+        let paths = LauncherPaths {
+            base_dir: root.clone(),
+            terraria_dir: root.join("Terraria"),
+            tmodloader_dir: root.join("tModLoader"),
+            data_dir: root.join("data"),
+            vanilla_saves_dir: root.join("data/Saves/Vanilla"),
+            tml_saves_dir: root.join("data/Saves/tModLoader"),
+            servers_dir: root.join("data/Servers"),
+            backups_dir: root.join("data/Backups"),
+            steamcmd_dir: root.join("data/SteamCMD"),
+            config_path: root.join("data/config.json"),
+        };
+        std::fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+
+        std::fs::write(&paths.config_path, "   \n\t ").unwrap();
+        let blank_loaded = LauncherConfig::load_or_default(&paths);
+        assert!(!blank_loaded.servers.is_empty());
+        assert!(!paths
+            .config_path
+            .with_file_name("config.json.corrupt.bak")
+            .exists());
+
+        let corrupt_raw = "{ corrupt json !!!";
+        std::fs::write(&paths.config_path, corrupt_raw).unwrap();
+        let corrupt_loaded = LauncherConfig::load_or_default(&paths);
+        assert_eq!(
+            corrupt_loaded.terraria_install_source,
+            DEFAULT_TERRARIA_INSTALL_SOURCE
+        );
+        let backup_path = paths.config_path.with_file_name("config.json.corrupt.bak");
+        assert!(backup_path.is_file());
+        assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), corrupt_raw);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_atomic_avoids_tmp_extension_and_cleans_up_on_error() {
+        let root = std::env::temp_dir().join(format!("tl_core_atomic_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let target = root.join("enabled.json");
+        write_atomic(&target, br#"["ModA"]"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"["ModA"]"#);
+
+        write_atomic(&target, br#"["ModB"]"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"["ModB"]"#);
+
+        let entries: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["enabled.json"]);
+
+        let dir_target = root.join("existing_dir");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        assert!(write_atomic(&dir_target, b"data").is_err());
+        assert!(!root.join(".existing_dir.tl_atomic").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

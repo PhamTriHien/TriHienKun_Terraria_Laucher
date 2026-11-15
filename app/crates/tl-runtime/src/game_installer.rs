@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tl_core::paths::{detect_dotnet8_runtime, find_steamcmd};
+use tl_core::paths::{detect_dotnet8_runtime, detect_exact_bundled_dotnet_runtime, find_steamcmd};
 use tl_core::{LauncherError, LauncherPaths, LauncherResult};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -270,15 +270,21 @@ async fn download_to_part_file(
 
 pub async fn fetch_tmodloader_releases(
     proxy_url: Option<&str>,
+    github_token: Option<&str>,
 ) -> LauncherResult<Vec<TmodLoaderReleaseInfo>> {
     let client = build_http_client(proxy_url)?;
     let url = format!(
         "https://api.github.com/repos/{TMODLOADER_GITHUB_REPO}/releases?per_page=10"
     );
 
-    let resp = client
+    let mut req = client
         .get(&url)
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/vnd.github+json");
+    if let Some(tok) = github_token.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(tok);
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| LauncherError::Network(format!("Lỗi kết nối GitHub API: {e}")))?;
@@ -424,6 +430,46 @@ pub fn parse_dotnet_runtime_version(runtimeconfig_json: &str) -> LauncherResult<
     Ok(trimmed.to_string())
 }
 
+pub(crate) fn read_declared_tml_dotnet_version(paths: &LauncherPaths) -> Option<String> {
+    let runtimeconfig_path = paths.tmodloader_dir.join("tModLoader.runtimeconfig.json");
+    fs::read_to_string(runtimeconfig_path)
+        .ok()
+        .and_then(|json| parse_dotnet_runtime_version(&json).ok())
+}
+
+pub fn read_required_tml_dotnet_version(paths: &LauncherPaths) -> String {
+    read_declared_tml_dotnet_version(paths).unwrap_or_else(|| "8.0.0".to_string())
+}
+
+fn tmodloader_needs_dotnet8_install_with<FExact, FSys, FAny>(
+    paths: &LauncherPaths,
+    detect_exact: FExact,
+    query_system: FSys,
+    detect_any: FAny,
+) -> bool
+where
+    FExact: Fn(&LauncherPaths, &str) -> bool,
+    FSys: Fn() -> Option<String>,
+    FAny: Fn(&LauncherPaths) -> bool,
+{
+    match read_declared_tml_dotnet_version(paths) {
+        Some(req) => {
+            !detect_exact(paths, &req)
+                && !query_system().is_some_and(|v| tl_core::version_at_least_patch(&v, &req))
+        }
+        None => !detect_any(paths),
+    }
+}
+
+fn tmodloader_needs_dotnet8_install(paths: &LauncherPaths) -> bool {
+    tmodloader_needs_dotnet8_install_with(
+        paths,
+        detect_exact_bundled_dotnet_runtime,
+        tl_core::query_system_dotnet8_runtime,
+        |p| detect_dotnet8_runtime(p).is_some(),
+    )
+}
+
 pub async fn install_dotnet8_portable(
     paths: &LauncherPaths,
     proxy_url: Option<&str>,
@@ -546,6 +592,8 @@ pub async fn install_tmodloader_release(
     )
     .await?;
 
+    verify_zip_contains_required_file_blocking(part_path.clone(), "tmodloader.dll").await?;
+
     let extracted_top = extract_zip_safely_blocking(
         part_path,
         paths.tmodloader_dir.clone(),
@@ -562,7 +610,7 @@ pub async fn install_tmodloader_release(
         )));
     }
 
-    if also_install_dotnet && detect_dotnet8_runtime(paths).is_none() {
+    if also_install_dotnet && tmodloader_needs_dotnet8_install(paths) {
         let dotnet_msg = install_dotnet8_portable(paths, proxy_url, on_progress).await?;
         return Ok(format!(
             "Đã cài đặt tModLoader {} ({dotnet_msg})",
@@ -1068,6 +1116,24 @@ fn validate_branch_manifest(manifest: &TerrariaBranchManifest) -> LauncherResult
         }
     }
 
+    if !manifest.parts.is_empty() {
+        let sum = manifest
+            .parts
+            .iter()
+            .try_fold(0u64, |acc, p| acc.checked_add(p.size))
+            .ok_or_else(|| {
+                LauncherError::InvalidFormat(
+                    "Tổng kích thước các phần trong manifest vượt quá giới hạn u64.".to_string(),
+                )
+            })?;
+        if sum != manifest.total_size {
+            return Err(LauncherError::InvalidFormat(format!(
+                "Tổng kích thước các phần trong manifest ({sum} byte) không khớp với total_size ({} byte).",
+                manifest.total_size
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -1327,6 +1393,8 @@ where
 
     let full_sha256 =
         assemble_multipart_stream(manifest, &part_path, &on_progress, open_part_stream).await?;
+
+    verify_zip_contains_required_file_blocking(part_path.clone(), "terraria.exe").await?;
 
     let version = manifest.version.trim();
     let extracted_top = extract_zip_safely_blocking(
@@ -1612,6 +1680,8 @@ pub async fn install_terraria_from_source(
     )
     .await?;
 
+    verify_zip_contains_required_file_blocking(part_path.clone(), "terraria.exe").await?;
+
     let extracted_top = extract_zip_safely_blocking(
         part_path,
         paths.terraria_dir.clone(),
@@ -1641,6 +1711,8 @@ pub fn install_terraria_from_local_zip(
             zip_path.display()
         )));
     }
+
+    verify_zip_contains_required_file(zip_path, "terraria.exe")?;
 
     let extracted_top = extract_zip_safely(
         zip_path,
@@ -1863,8 +1935,19 @@ async fn read_winget_stream_lines<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+fn winget_http_proxy(proxy_url: Option<&str>) -> Option<String> {
+    let norm = proxy_url.and_then(normalize_proxy_url)?;
+    let lower = norm.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(norm)
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn run_winget_install_steamcmd(
     on_line: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    proxy_url: Option<&str>,
 ) -> LauncherResult<String> {
     let mut cmd = Command::new("winget");
     cmd.args([
@@ -1876,6 +1959,10 @@ pub(crate) async fn run_winget_install_steamcmd(
         "--accept-package-agreements",
         "--accept-source-agreements",
     ]);
+    if let Some(norm) = winget_http_proxy(proxy_url) {
+        cmd.arg("--proxy").arg(&norm);
+        cmd.env("HTTP_PROXY", &norm).env("HTTPS_PROXY", &norm);
+    }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdin(Stdio::null())
@@ -2122,33 +2209,74 @@ pub async fn install_steamcmd_with_progress(
         );
     });
 
-    match run_winget_install_steamcmd(Some(stream_cb)).await {
+    match run_winget_install_steamcmd(Some(stream_cb), proxy_url).await {
         Ok(winget_output) => {
-            let found_path = find_steamcmd(paths, None);
-            if found_path.is_none() && winget_output_indicates_failure(&winget_output) {
-                return Err(format_steamcmd_combined_error(
-                    &direct_err_msg,
-                    winget_output.trim(),
-                    proxy_url,
-                ));
-            }
-            if let Some(ref exe) = found_path {
-                on_log(format!("Đã cài xong SteamCMD tại {}.", exe.display()));
-            } else {
-                on_log("Đã cài đặt SteamCMD qua winget.".to_string());
-            }
-            emit_progress(
+            resolve_post_winget_steamcmd_inner(
+                &client,
+                STEAMCMD_OFFICIAL_ZIP_URL,
+                paths,
+                proxy_url,
+                &direct_err_msg,
+                &winget_output,
                 &on_progress,
-                InstallTarget::SteamCmd,
-                "Hoàn tất cài đặt SteamCMD",
-                1,
-                Some(1),
-            );
-            Ok("Đã cài đặt SteamCMD qua winget.".to_string())
+                &on_log,
+                || find_steamcmd(paths, None),
+            )
+            .await
         }
         Err(winget_err) => Err(format_steamcmd_combined_error(
             &direct_err_msg,
             &winget_err.to_string(),
+            proxy_url,
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_post_winget_steamcmd_inner<F>(
+    client: &Client,
+    direct_url: &str,
+    paths: &LauncherPaths,
+    proxy_url: Option<&str>,
+    direct_err_msg: &str,
+    winget_output: &str,
+    on_progress: &ProgressCallback,
+    on_log: &Arc<dyn Fn(String) + Send + Sync>,
+    mut lookup_steamcmd: F,
+) -> LauncherResult<String>
+where
+    F: FnMut() -> Option<PathBuf>,
+{
+    let found_path = lookup_steamcmd().or_else(&mut lookup_steamcmd);
+    if let Some(ref exe) = found_path {
+        on_log(format!("Đã cài xong SteamCMD tại {}.", exe.display()));
+        emit_progress(
+            on_progress,
+            InstallTarget::SteamCmd,
+            "Hoàn tất cài đặt SteamCMD",
+            1,
+            Some(1),
+        );
+        return Ok("Đã cài đặt SteamCMD qua winget.".to_string());
+    }
+
+    if winget_output_indicates_failure(winget_output) {
+        return Err(format_steamcmd_combined_error(
+            direct_err_msg,
+            winget_output.trim(),
+            proxy_url,
+        ));
+    }
+
+    on_log(
+        "winget không tạo được lệnh steamcmd khả dụng, đang thử tải gói chính thức vào thư mục Launcher..."
+            .to_string(),
+    );
+    match install_steamcmd_from_direct_url(client, direct_url, paths, on_progress, on_log).await? {
+        Ok(msg) => Ok(msg),
+        Err(err) => Err(format_steamcmd_combined_error(
+            &err.to_string(),
+            "winget hoàn tất nhưng không tìm thấy steamcmd.exe khả dụng trong hệ thống.",
             proxy_url,
         )),
     }
@@ -2263,6 +2391,77 @@ fn inspect_zip_layout<R: std::io::Read + std::io::Seek>(
     Ok((plans, should_strip))
 }
 
+fn verify_zip_contains_required_file(zip_path: &Path, required_suffix: &str) -> LauncherResult<()> {
+    let req_segments: Vec<String> = required_suffix
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    if req_segments.is_empty() {
+        return Err(LauncherError::InvalidFormat(
+            "Tên tệp bắt buộc trong file nén không hợp lệ.".to_string(),
+        ));
+    }
+
+    let file = File::open(zip_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let (plans, should_strip) = inspect_zip_layout(&mut archive)?;
+
+    let mut top_level_set = BTreeSet::new();
+    let mut found = false;
+
+    for plan in &plans {
+        let rel_slice = if should_strip {
+            plan.components.get(1..).unwrap_or(&[])
+        } else {
+            &plan.components[..]
+        };
+        if let Some(first) = rel_slice.first() {
+            top_level_set.insert(first.to_string_lossy().into_owned());
+        } else if let Some(first) = plan.components.first() {
+            top_level_set.insert(first.to_string_lossy().into_owned());
+        }
+
+        if !plan.is_dir && plan.components.len() >= req_segments.len() {
+            let tail = &plan.components[plan.components.len() - req_segments.len()..];
+            let matches = tail
+                .iter()
+                .zip(req_segments.iter())
+                .all(|(comp, req)| comp.to_string_lossy().to_ascii_lowercase() == *req);
+            if matches {
+                found = true;
+            }
+        }
+    }
+
+    if found {
+        return Ok(());
+    }
+
+    let top_level: Vec<String> = top_level_set.into_iter().collect();
+    let preview = format_top_level_preview(&top_level);
+    let display_name = if required_suffix.eq_ignore_ascii_case("terraria.exe") {
+        "Terraria.exe"
+    } else if required_suffix.eq_ignore_ascii_case("tmodloader.dll") {
+        "tModLoader.dll"
+    } else {
+        required_suffix
+    };
+    Err(LauncherError::InvalidFormat(format!(
+        "File nén không chứa {display_name}. Thư mục/tệp gốc trong file nén: {preview}"
+    )))
+}
+
+async fn verify_zip_contains_required_file_blocking(
+    zip_path: PathBuf,
+    required_suffix: &'static str,
+) -> LauncherResult<()> {
+    tokio::task::spawn_blocking(move || verify_zip_contains_required_file(&zip_path, required_suffix))
+        .await
+        .map_err(|e| LauncherError::Process(format!("Lỗi tác vụ kiểm tra file nén: {e}")))?
+}
+
 fn extract_zip_safely(
     zip_path: &Path,
     target_dir: &Path,
@@ -2311,15 +2510,23 @@ fn extract_zip_safely(
 
         let mut entry = archive.by_index(idx)?;
         if plan.is_dir {
+            drop(entry);
             fs::create_dir_all(&dest)?;
         } else {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let mut out = open_output_file(&dest)?;
-            std::io::copy(&mut entry, &mut out)?;
-            use std::io::Write;
-            out.flush()?;
+            let tmp_path = make_extract_temp_path(&dest, idx);
+            let mut cleanup = ExtractTempCleanup::new(tmp_path.clone());
+            {
+                let mut out = File::create(&tmp_path)?;
+                std::io::copy(&mut entry, &mut out)?;
+                use std::io::Write;
+                out.flush()?;
+            }
+            drop(entry);
+            rename_extracted_file(&tmp_path, &dest)?;
+            cleanup.disarm();
         }
 
         if should_emit_entry(idx, total_entries, report_step) {
@@ -2328,6 +2535,37 @@ fn extract_zip_safely(
     }
 
     Ok(top_level_set.into_iter().collect())
+}
+
+struct ExtractTempCleanup(Option<PathBuf>);
+
+impl ExtractTempCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ExtractTempCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn make_extract_temp_path(dest: &Path, idx: usize) -> PathBuf {
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let orig = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("entry");
+    let short_orig: String = orig.chars().take(40).collect();
+    parent.join(format!(".{short_orig}.tl_extract_{}_{idx}", std::process::id()))
 }
 
 fn should_emit_entry(idx: usize, total_entries: u64, report_step: u64) -> bool {
@@ -2353,14 +2591,15 @@ fn clear_readonly_attribute(_dest: &Path) -> bool {
     false
 }
 
-fn open_output_file(dest: &Path) -> std::io::Result<File> {
-    match File::create(dest) {
-        Ok(f) => Ok(f),
+fn rename_extracted_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
         Err(err) => {
-            if err.kind() == std::io::ErrorKind::PermissionDenied && clear_readonly_attribute(dest) {
-                if let Ok(f) = File::create(dest) {
-                    return Ok(f);
-                }
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                && clear_readonly_attribute(dest)
+                && fs::rename(tmp, dest).is_ok()
+            {
+                return Ok(());
             }
             if is_file_locked_error(&err) {
                 return Err(std::io::Error::new(
@@ -2501,6 +2740,41 @@ mod tests {
             r#"{"runtimeOptions": {"framework": {"version": "8.0/../evil"}}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn read_required_tml_dotnet_version_reads_config_or_falls_back() {
+        let guard = TempDirGuard::new("tl_gi_req_dotnet");
+        let paths = guard.paths();
+        fs::create_dir_all(&paths.tmodloader_dir).unwrap();
+
+        assert_eq!(read_required_tml_dotnet_version(&paths), "8.0.0");
+
+        let cfg_path = paths.tmodloader_dir.join("tModLoader.runtimeconfig.json");
+        fs::write(&cfg_path, "{broken json").unwrap();
+        assert_eq!(read_required_tml_dotnet_version(&paths), "8.0.0");
+
+        fs::write(
+            &cfg_path,
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0.15"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_required_tml_dotnet_version(&paths), "8.0.15");
+    }
+
+    #[test]
+    fn winget_http_proxy_normalizes_and_filters_schemes() {
+        assert_eq!(winget_http_proxy(None), None);
+        assert_eq!(winget_http_proxy(Some("   ")), None);
+        assert_eq!(
+            winget_http_proxy(Some(" 127.0.0.1:7890 ")),
+            Some("http://127.0.0.1:7890".to_string())
+        );
+        assert_eq!(
+            winget_http_proxy(Some("https://proxy.example:8443")),
+            Some("https://proxy.example:8443".to_string())
+        );
+        assert_eq!(winget_http_proxy(Some("socks5://127.0.0.1:1080")), None);
     }
 
     #[test]
@@ -2930,6 +3204,13 @@ mod tests {
         bad_part_sha.parts[0].sha256 = "not-valid-hex".to_string();
         assert!(matches!(
             validate_branch_manifest(&bad_part_sha),
+            Err(LauncherError::InvalidFormat(_))
+        ));
+
+        let mut mismatched_sum = valid.clone();
+        mismatched_sum.parts[0].size = 512;
+        assert!(matches!(
+            validate_branch_manifest(&mismatched_sum),
             Err(LauncherError::InvalidFormat(_))
         ));
 
@@ -3416,6 +3697,228 @@ mod tests {
 
             assert_eq!(truncate_stage("abc", 10), "abc");
             assert_eq!(truncate_stage("Đang tải gói SteamCMD rất dài từ máy chủ", 12).chars().count(), 12);
+        });
+    }
+
+    #[test]
+    fn verify_zip_contains_required_file_checks_suffix_case_insensitively() {
+        let guard = TempDirGuard::new("tl_gi_verify_zip");
+        let zip_ok = guard.0.join("ok_tml.zip");
+        write_test_zip(
+            &zip_ok,
+            &[("tModLoader-2026/SubDir/TMODLOADER.DLL", b"DLL-BYTES")],
+        );
+        assert!(verify_zip_contains_required_file(&zip_ok, "tmodloader.dll").is_ok());
+
+        let zip_bad = guard.0.join("bad_tml.zip");
+        write_test_zip(&zip_bad, &[("README.txt", b"not tml")]);
+        let err = verify_zip_contains_required_file(&zip_bad, "tmodloader.dll").unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, LauncherError::InvalidFormat(_)));
+        assert!(msg.contains("tModLoader.dll"));
+        assert!(msg.contains("README.txt"));
+
+        let zip_wrong_terraria = guard.0.join("wrong_terraria.zip");
+        write_test_zip(&zip_wrong_terraria, &[("Other/other.bin", b"X")]);
+        let paths = guard.paths();
+        let (cb, _) = record_progress();
+        let install_err =
+            install_terraria_from_local_zip(&paths, &zip_wrong_terraria, cb).unwrap_err();
+        assert!(matches!(install_err, LauncherError::InvalidFormat(_)));
+        assert!(!paths.terraria_dir.join("Other").exists());
+    }
+
+    #[test]
+    fn extract_zip_safely_preserves_existing_file_on_corrupt_entry_and_cleans_temp() {
+        let guard = TempDirGuard::new("tl_gi_atomic_extract");
+        let target_dir = guard.0.join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+        let dest_file = target_dir.join("Terraria.exe");
+        fs::write(&dest_file, b"ORIGINAL-INTACT").unwrap();
+
+        let zip_path = guard.0.join("corrupt.zip");
+        let payload = b"REPLACEMENT_PAYLOAD_CORRUPTED";
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer.start_file("Terraria.exe", opts).unwrap();
+            writer.write_all(payload).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut bytes = cursor.into_inner();
+        let pos = bytes
+            .windows(payload.len())
+            .position(|w| w == payload)
+            .expect("stored payload present");
+        bytes[pos + 3] ^= 0xFF;
+        fs::write(&zip_path, &bytes).unwrap();
+
+        let (cb, _) = record_progress();
+        let err = extract_zip_safely(&zip_path, &target_dir, InstallTarget::Terraria, "extract", &cb)
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(fs::read(&dest_file).unwrap(), b"ORIGINAL-INTACT");
+
+        let leftovers: Vec<_> = fs::read_dir(&target_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tl_extract_"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover extract temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn read_declared_tml_dotnet_version_and_needs_dotnet_check_sys_fallback() {
+        let guard = TempDirGuard::new("tl_gi_declared_dotnet");
+        let paths = guard.paths();
+        fs::create_dir_all(&paths.tmodloader_dir).unwrap();
+
+        assert_eq!(read_declared_tml_dotnet_version(&paths), None);
+        assert_eq!(read_required_tml_dotnet_version(&paths), "8.0.0");
+
+        assert!(tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |_, _| false,
+            || Some("8.0.25".to_string()),
+            |_| false,
+        ));
+        assert!(!tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |_, _| false,
+            || Some("8.0.25".to_string()),
+            |_| true,
+        ));
+
+        fs::write(
+            paths.tmodloader_dir.join("tModLoader.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0.23"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_declared_tml_dotnet_version(&paths).as_deref(),
+            Some("8.0.23")
+        );
+
+        assert!(!tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |_, req| req == "8.0.23",
+            || None,
+            |_| false,
+        ));
+        assert!(!tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |_, _| false,
+            || Some("8.0.24".to_string()),
+            |_| false,
+        ));
+        assert!(tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |_, _| false,
+            || Some("8.0.14".to_string()),
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn resolve_post_winget_steamcmd_rechecks_and_falls_back_to_direct_zip() {
+        let guard = TempDirGuard::new("tl_gi_post_winget");
+        let paths = guard.paths();
+        let fake_exe = paths.steamcmd_dir.join("winget_steamcmd.exe");
+        fs::create_dir_all(&paths.steamcmd_dir).unwrap();
+        fs::write(&fake_exe, b"MZ-WINGET").unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = build_download_client(None).unwrap();
+            let (cb, _) = record_progress();
+            let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+            let logs_clone = Arc::clone(&logs);
+            let on_log: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |line| logs_clone.lock().unwrap().push(line));
+
+            let mut calls = 0usize;
+            let recheck_msg = resolve_post_winget_steamcmd_inner(
+                &client,
+                "http://127.0.0.1:9/steamcmd.zip",
+                &paths,
+                None,
+                "direct failed",
+                "Successfully installed",
+                &cb,
+                &on_log,
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        None
+                    } else {
+                        Some(fake_exe.clone())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls, 2);
+            assert!(recheck_msg.contains("winget"));
+
+            let failed_err = resolve_post_winget_steamcmd_inner(
+                &client,
+                "http://127.0.0.1:9/steamcmd.zip",
+                &paths,
+                None,
+                "direct failed",
+                "No package found matching input criteria.",
+                &cb,
+                &on_log,
+                || None,
+            )
+            .await
+            .unwrap_err();
+            assert!(!failed_err.to_string().is_empty());
+
+            let zip_path = guard.0.join("steamcmd_direct.zip");
+            write_test_zip(&zip_path, &[("steamcmd.exe", b"MZ-DIRECT-ZIP")]);
+            let zip_bytes = fs::read(&zip_path).unwrap();
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        zip_bytes.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&zip_bytes);
+                }
+            });
+
+            let direct_url = format!("http://{addr}/steamcmd.zip");
+            let fallback_msg = resolve_post_winget_steamcmd_inner(
+                &client,
+                &direct_url,
+                &paths,
+                None,
+                "direct failed",
+                "Successfully installed",
+                &cb,
+                &on_log,
+                || None,
+            )
+            .await
+            .unwrap();
+            server.join().unwrap();
+
+            assert!(fallback_msg.contains("SteamCMD"));
+            assert_eq!(
+                fs::read(paths.steamcmd_dir.join("steamcmd.exe")).unwrap(),
+                b"MZ-DIRECT-ZIP"
+            );
         });
     }
 }

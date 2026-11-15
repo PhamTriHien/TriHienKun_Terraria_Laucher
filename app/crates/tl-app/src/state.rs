@@ -1,45 +1,50 @@
 use crate::assets::LauncherAssets;
 use crate::theme::{format_bytes, palette, ThemePalette};
 use egui::{ColorImage, TextureHandle, TextureOptions};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use tl_core::{
     activate_modpack, backup_unsaved_enabled_mods_as_modpack, backup_world, create_modpack,
-    decode_modpack_share_key, delete_modpack, detect_environment, list_modpacks,
-    list_world_backups, parse_world_file, restore_world_backup, sanitize_modpack_name,
-    write_modpack_install_txt, EnvironmentStatus, GameEdition, LauncherConfig, LauncherPaths,
-    ModPackInfo, SavedJoinServer, ServerConfigData, ServerProfile, SharedModSource, ThemeMode,
-    TmodMetadata, WorldBackupInfo, WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
+    decode_modpack_share_key, delete_modpack, detect_environment,
+    detect_exact_bundled_dotnet_runtime, inspect_world_backup_zip, is_safe_single_dir_component,
+    list_modpacks, list_world_backups, parse_world_file, restore_world_backup,
+    sanitize_modpack_name, sync_active_modpack_from_mods_dir, write_modpack_install_txt,
+    EnvironmentStatus, GameEdition, LauncherConfig, LauncherPaths, ModPackInfo, SavedJoinServer,
+    ServerConfigData, ServerProfile, SharedModSource, ThemeMode, TmodMetadata, WorldBackupInfo,
+    WorldMetadata, DEFAULT_TERRARIA_INSTALL_SOURCE,
 };
 use tl_runtime::{
     browse_workshop_mods, build_modpack_share_preview, check_firewall_rule_exists,
-    delete_installed_mod, detect_existing_game_process,
-    detect_existing_server_processes, download_and_install_tmod_url_with_source,
-    download_and_install_xna, download_workshop_mod_via_steamcmd, ensure_firewall_rule,
-    fetch_github_latest_tmod, fetch_terraria_branch_manifest, fetch_tmodloader_releases,
-    fetch_workshop_details, fetch_workshop_image_bytes, import_local_mod_files,
-    inspect_share_key_against_local, install_dotnet8_portable, install_steamcmd_with_progress,
-    install_terraria_from_local_zip, install_terraria_from_source, install_tmodloader_release,
-    install_xna_framework_elevated, is_local_probe_host, launch_game, load_banlist,
-    load_installed_terraria_receipt, load_mod_sources, load_workshop_manifest,
-    parse_mod_source_input, parse_workshop_id, probe_local_endpoint_listening,
-    probe_local_tcp_listening, probe_network_snapshot, probe_tcp_endpoint,
-    read_server_log_summary, record_workshop_install, remove_firewall_rule,
-    resolve_ipv6_bridge_target, save_banlist, scan_installed_mods, scan_staged_workshop_mods,
-    search_workshop_candidates_for_mod, set_mod_enabled, split_endpoint_host_port,
-    start_direct_port_host, start_ipv4_to_ipv6_client_bridge, start_server,
-    sync_modpack_from_share_key, terminate_process_by_pid, upsert_mod_source, ActiveGameProcess,
-    BanEntry, DetectedExternalServer, DirectHostConfig, DirectHostStatus, DirectPortHostHandle,
+    delete_installed_mod, detect_existing_game_process, detect_existing_server_processes,
+    download_and_install_tmod_url_with_source, download_and_install_xna,
+    download_workshop_mod_via_steamcmd, enable_mod_and_installed_deps, ensure_firewall_rule,
+    extract_ban_ip_key, fetch_github_latest_tmod, fetch_terraria_branch_manifest,
+    fetch_tmodloader_releases, fetch_workshop_details, fetch_workshop_image_bytes,
+    import_local_mod_files, inspect_share_key_against_local, install_dotnet8_portable,
+    install_steamcmd_with_progress, install_terraria_from_local_zip, install_terraria_from_source,
+    install_tmodloader_release, install_xna_framework_elevated, is_local_probe_host,
+    is_loopback_ban_target, launch_game, load_banlist, load_installed_terraria_receipt,
+    load_mod_sources, load_workshop_manifest, normalize_ip_addr, parse_mod_source_input,
+    parse_workshop_id, probe_local_endpoint_listening, probe_local_tcp_listening,
+    probe_network_snapshot, probe_tcp_endpoint, read_required_tml_dotnet_version,
+    read_server_log_summary, record_workshop_install, remove_firewall_rule, remove_mod_source,
+    remove_workshop_manifest_entry, resolve_ipv6_bridge_target, save_banlist, scan_installed_mods,
+    scan_staged_workshop_mods, search_workshop_candidates_for_mod, set_mod_enabled,
+    split_endpoint_host_port, start_direct_port_host, start_ipv4_to_ipv6_client_bridge,
+    start_server, sync_modpack_from_share_key, terminate_game_process_by_pid,
+    terminate_process_by_pid, upsert_mod_source, ActiveGameProcess, BanEntry,
+    DetectedExternalServer, DirectHostConfig, DirectHostStatus, DirectPortHostHandle,
     ExternalServerLogSummary, GameLaunchOptions, InstallProgress, InstallTarget, InstalledModEntry,
     InstalledTerrariaReceipt, LocalClientBridgeHandle, ModPackImportPreview, ModPackSharePreview,
     ModPackSyncProgress, ModPackSyncReport, ModSourceRecord, NetworkSnapshot, ProgressCallback,
     RemoteTmodAsset, RepaintHandle, RunningGameSnapshot, RuntimeTuning, ServerLifecycleState,
     ServerRuntimeSnapshot, ServerSupervisor, StagedWorkshopMod, TerrariaBranchManifest,
-    TmodLoaderReleaseInfo, WorkshopItemDetails, WorkshopManifestRecord, WorkshopQueryResult,
-    WorkshopSort,
+    TmodLoaderReleaseInfo, UpnpPortStatus, WorkshopItemDetails, WorkshopManifestRecord,
+    WorkshopQueryResult, WorkshopSort,
 };
 use tokio::sync::mpsc;
 
@@ -134,10 +139,10 @@ pub enum AppEvent {
     },
     WorkshopLookedUp(Result<WorkshopItemDetails, String>),
     WorkshopLog(String),
-    WorkshopFinished {
-        workshop_id: String,
-        details: Option<WorkshopItemDetails>,
-        result: Result<Vec<TmodMetadata>, String>,
+    WorkshopBatchFinished {
+        primary_id: String,
+        installed: Vec<(String, Option<WorkshopItemDetails>, Vec<TmodMetadata>)>,
+        error: Option<String>,
     },
     SteamCmdInstalled(Result<String, String>),
     TmlReleasesFetched(Result<Vec<TmodLoaderReleaseInfo>, String>),
@@ -147,11 +152,15 @@ pub enum AppEvent {
         target: InstallTarget,
         result: Result<String, String>,
     },
+    XnaInstallFinished(Result<String, String>),
     ModPackSyncProgress(ModPackSyncProgress),
     ModPackSynced(Box<Result<ModPackSyncReport, String>>),
     WorkshopCandidatesLoaded {
         internal_name: String,
         result: Result<Vec<WorkshopItemDetails>, String>,
+    },
+    DelayedBanRefresh {
+        profile_id: String,
     },
 }
 
@@ -177,6 +186,8 @@ pub struct AppState {
     pub running_game: Option<RunningGameSnapshot>,
     pub external_game: Option<RunningGameSnapshot>,
     client_ipv6_bridge: Option<LocalClientBridgeHandle>,
+    pub confirm_close_bridge_modal: bool,
+    close_bridge_allow_exit: bool,
 
     pub server_supervisors: HashMap<String, ServerSupervisor>,
     pub server_snapshots: HashMap<String, ServerRuntimeSnapshot>,
@@ -190,10 +201,10 @@ pub struct AppState {
     pub manual_ban_name: String,
     pub manual_ban_ip: String,
 
-    pub pending_auto_direct_host_profile_id: Option<String>,
-    pub direct_host_handle: Option<DirectPortHostHandle>,
+    pub pending_auto_direct_host_ports: HashMap<String, u16>,
+    pub direct_host_handles: HashMap<String, DirectPortHostHandle>,
     pub direct_host_port_input: String,
-    pub direct_bind_ip: Option<std::net::Ipv4Addr>,
+    pub direct_bind_ips: HashMap<String, Option<std::net::Ipv4Addr>>,
     pub direct_try_upnp: bool,
     pub firewall_busy: bool,
     pub network_snapshot: NetworkSnapshot,
@@ -301,6 +312,7 @@ impl AppState {
             .map(|s| s.config.port)
             .filter(|&p| p > 0)
             .unwrap_or(7777);
+        let default_try_upnp = config.active_server().map(|s| s.config.upnp).unwrap_or(true);
         let quick_join_port_init = if config.quick_join_port > 0 {
             config.quick_join_port
         } else {
@@ -327,6 +339,8 @@ impl AppState {
             running_game: None,
             external_game: None,
             client_ipv6_bridge: None,
+            confirm_close_bridge_modal: false,
+            close_bridge_allow_exit: false,
             server_supervisors: HashMap::new(),
             server_snapshots: HashMap::new(),
             external_servers: Vec::new(),
@@ -338,11 +352,11 @@ impl AppState {
             banlist_entries: Vec::new(),
             manual_ban_name: String::new(),
             manual_ban_ip: String::new(),
-            pending_auto_direct_host_profile_id: None,
-            direct_host_handle: None,
+            pending_auto_direct_host_ports: HashMap::new(),
+            direct_host_handles: HashMap::new(),
             direct_host_port_input: default_port.to_string(),
-            direct_bind_ip: None,
-            direct_try_upnp: true,
+            direct_bind_ips: HashMap::new(),
+            direct_try_upnp: default_try_upnp,
             firewall_busy: false,
             network_snapshot: NetworkSnapshot::default(),
             network_loading: false,
@@ -531,6 +545,90 @@ impl AppState {
             || self.external_server_for_profile(profile_id).is_some()
     }
 
+    fn close_resource_flags(&self) -> (bool, bool, bool, bool) {
+        let has_hosted_server = self.server_supervisors.values().any(|s| s.is_active())
+            || !self.pending_auto_direct_host_ports.is_empty();
+        let mut has_direct_host = false;
+        let mut has_upnp = false;
+        for handle in self.direct_host_handles.values() {
+            match handle.current_status() {
+                DirectHostStatus::Starting { .. } => {
+                    has_direct_host = true;
+                }
+                DirectHostStatus::Running(info) => {
+                    has_direct_host = true;
+                    if matches!(
+                        info.upnp_status,
+                        UpnpPortStatus::Mapped { .. } | UpnpPortStatus::Mapping
+                    ) {
+                        has_upnp = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let has_client_bridge = self.has_active_client_ipv6_bridge();
+        (has_hosted_server, has_direct_host, has_upnp, has_client_bridge)
+    }
+
+    pub fn is_runtime_or_task_busy_for_paths(&self) -> bool {
+        let (has_hosted_server, has_direct_host, has_upnp, has_client_bridge) =
+            self.close_resource_flags();
+        self.install_busy
+            || self.is_steamcmd_busy()
+            || self.is_game_running()
+            || self.any_server_active()
+            || has_hosted_server
+            || has_direct_host
+            || has_upnp
+            || has_client_bridge
+    }
+
+    pub fn is_profile_busy_or_direct_hosted(&self, profile_id: &str) -> bool {
+        if self.is_profile_running(profile_id)
+            || self.pending_auto_direct_host_ports.contains_key(profile_id)
+        {
+            return true;
+        }
+        if self.direct_host_handles.get(profile_id).is_some_and(|h| {
+            matches!(
+                h.current_status(),
+                DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
+            )
+        }) {
+            return true;
+        }
+        let Some(port) = self.profile_effective_port(profile_id).or_else(|| {
+            self.config
+                .servers
+                .iter()
+                .find(|p| p.id == profile_id)
+                .map(|p| p.config.port)
+                .filter(|&p| p > 0)
+        }) else {
+            return false;
+        };
+        self.direct_host_handles
+            .values()
+            .any(|h| match h.current_status() {
+                DirectHostStatus::Starting {
+                    local_port,
+                    host_port,
+                } => local_port == port || host_port == port,
+                DirectHostStatus::Running(info) => {
+                    info.local_port == port
+                        || info.host_port == port
+                        || matches!(
+                            info.upnp_status,
+                            UpnpPortStatus::Mapped { external_port, .. }
+                                | UpnpPortStatus::CarrierGradeNat { external_port, .. }
+                                if external_port == port
+                        )
+                }
+                _ => false,
+            })
+    }
+
     pub fn is_active_external_starting(&self) -> bool {
         self.showing_external_server()
             && self.active_external_log_summary().is_some_and(|summary| {
@@ -571,6 +669,13 @@ impl AppState {
         }
         self.confirm_delete_profile_id = None;
         self.refresh_banlist();
+        if changed {
+            self.direct_try_upnp = self
+                .config
+                .active_server()
+                .map(|s| s.config.upnp)
+                .unwrap_or(true);
+        }
         let cfg_port = self
             .config
             .active_server()
@@ -580,12 +685,11 @@ impl AppState {
         self.server_port_input = cfg_port.to_string();
         let port_str = self.active_server_port().to_string();
         self.port_probe_port = port_str.clone();
-        if !matches!(
-            self.active_direct_host_status(),
-            DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
-        ) {
-            self.direct_host_port_input = port_str;
-        }
+        self.direct_host_port_input = match self.active_direct_host_status() {
+            DirectHostStatus::Running(info) => info.host_port.to_string(),
+            DirectHostStatus::Starting { host_port, .. } => host_port.to_string(),
+            _ => port_str,
+        };
         if changed {
             self.spawn_network_probe();
         }
@@ -624,15 +728,37 @@ impl AppState {
     }
 
     pub fn refresh_environment(&mut self) {
-        self.paths = LauncherPaths::resolve(
+        let candidate_paths = LauncherPaths::resolve(
             non_empty_opt(&self.config.custom_terraria_dir),
             non_empty_opt(&self.config.custom_tmodloader_dir),
         );
+        let paths_changed = candidate_paths.terraria_dir != self.paths.terraria_dir
+            || candidate_paths.tmodloader_dir != self.paths.tmodloader_dir;
+        let requested_steamcmd = non_empty_opt(&self.config.custom_steamcmd_path);
+        let candidate_env = detect_environment(&candidate_paths, requested_steamcmd);
+        let steamcmd_changed = candidate_env.steamcmd_path != self.env.steamcmd_path;
+
+        if paths_changed || (steamcmd_changed && self.is_steamcmd_busy()) {
+            self.scan_external_servers();
+            if self.is_runtime_or_task_busy_for_paths() {
+                self.notify_err(
+                    "Không thể thay đổi đường dẫn game/công cụ khi Game, Server, Cài đặt hoặc Cầu nối mạng đang chạy.",
+                );
+                self.terraria_installed_receipt = load_installed_terraria_receipt(&self.paths);
+                self.refresh_worlds_and_backups();
+                self.refresh_mods_and_packs();
+                self.refresh_banlist();
+                return;
+            }
+        }
+
+        self.paths = candidate_paths;
         let _ = self.paths.ensure_dirs();
-        self.env = detect_environment(
-            &self.paths,
-            non_empty_opt(&self.config.custom_steamcmd_path),
-        );
+        self.env = if paths_changed {
+            candidate_env
+        } else {
+            detect_environment(&self.paths, non_empty_opt(&self.config.custom_steamcmd_path))
+        };
         self.terraria_installed_receipt = load_installed_terraria_receipt(&self.paths);
         self.refresh_worlds_and_backups();
         self.refresh_mods_and_packs();
@@ -712,6 +838,7 @@ impl AppState {
         };
         let ban_path = self.resolve_profile_banlist_path(profile);
         self.banlist_entries = load_banlist(&ban_path);
+        self.sync_banlist_to_direct_host();
     }
 
     pub fn resolve_profile_banlist_path(&self, profile: &ServerProfile) -> PathBuf {
@@ -792,6 +919,7 @@ impl AppState {
                     self.github_busy = false;
                     match *boxed_res {
                         Ok(meta) => {
+                            self.sync_active_modpack_if_needed(None);
                             self.refresh_mods_and_packs();
                             self.notify_ok(format!(
                                 "Đã cài đặt mod {} v{}",
@@ -853,38 +981,39 @@ impl AppState {
                 AppEvent::WorkshopLog(line) => {
                     self.push_workshop_log(line);
                 }
-                AppEvent::WorkshopFinished {
-                    workshop_id,
-                    details,
-                    result,
+                AppEvent::WorkshopBatchFinished {
+                    primary_id,
+                    installed,
+                    error,
                 } => {
                     self.workshop_busy = false;
                     self.workshop_downloading_id = None;
-                    match result {
-                        Ok(mods) => {
-                            if let Err(e) = record_workshop_install(
-                                &self.paths,
-                                details.as_ref(),
-                                &workshop_id,
-                                &mods,
-                            ) {
-                                self.refresh_mods_and_packs();
-                                self.notify_err(format!(
-                                    "Đã tải {} mod nhưng lỗi lưu lịch sử Workshop: {e}",
-                                    mods.len()
-                                ));
-                            } else {
-                                self.refresh_mods_and_packs();
-                                self.notify_ok(format!(
-                                    "Đã tải và cài {} mod từ Workshop (ID {workshop_id}).",
-                                    mods.len()
-                                ));
-                            }
+                    let mut total_mods = 0usize;
+                    let mut manifest_err: Option<String> = None;
+                    for (wid, details_opt, mods) in &installed {
+                        total_mods += mods.len();
+                        if let Err(e) =
+                            record_workshop_install(&self.paths, details_opt.as_ref(), wid, mods)
+                        {
+                            manifest_err = Some(e.to_string());
                         }
-                        Err(e) => {
-                            self.refresh_mods_and_packs();
-                            self.notify_err(e);
-                        }
+                    }
+                    if !installed.is_empty() {
+                        self.sync_active_modpack_if_needed(None);
+                    }
+                    self.refresh_mods_and_packs();
+                    match (error, manifest_err) {
+                        (Some(e), _) => self.notify_err(e),
+                        (None, Some(me)) => self.notify_err(format!(
+                            "Đã tải {total_mods} mod nhưng lỗi lưu lịch sử Workshop: {me}"
+                        )),
+                        (None, None) if installed.len() > 1 => self.notify_ok(format!(
+                            "Đã tải và cài {total_mods} mod ({} mục Workshop, gồm mod phụ thuộc cho ID {primary_id}).",
+                            installed.len()
+                        )),
+                        (None, None) => self.notify_ok(format!(
+                            "Đã tải và cài {total_mods} mod từ Workshop (ID {primary_id})."
+                        )),
                     }
                 }
                 AppEvent::SteamCmdInstalled(res) => {
@@ -984,6 +1113,21 @@ impl AppState {
                         }
                     }
                 }
+                AppEvent::XnaInstallFinished(res) => {
+                    self.install_busy = false;
+                    self.install_progress = None;
+                    self.refresh_environment();
+                    match res {
+                        Ok(msg) => {
+                            self.install_last_error = None;
+                            self.notify_ok(msg);
+                        }
+                        Err(e) => {
+                            self.install_last_error = Some(e.clone());
+                            self.notify_err(e);
+                        }
+                    }
+                }
                 AppEvent::ModPackSyncProgress(prog) => {
                     self.modpack_sync_progress = Some(prog);
                 }
@@ -1029,6 +1173,13 @@ impl AppState {
                         }
                     }
                 }
+                AppEvent::DelayedBanRefresh { profile_id } => {
+                    if self.config.active_server_id == profile_id {
+                        self.refresh_banlist();
+                    } else if let Some(handle) = self.direct_host_handles.get(&profile_id) {
+                        handle.set_banned_ips(self.collect_banlist_ips_for_profile_id(&profile_id));
+                    }
+                }
             }
         }
 
@@ -1039,6 +1190,11 @@ impl AppState {
         }
 
         self.handle_dropped_files(ctx);
+
+        if !self.has_active_close_resources() {
+            self.confirm_close_bridge_modal = false;
+            self.close_bridge_allow_exit = false;
+        }
 
         let now = Instant::now();
         let should_poll_procs = now.duration_since(self.last_poll_at) >= Duration::from_millis(750);
@@ -1106,6 +1262,8 @@ impl AppState {
                 let mut any_banlist_dirty = false;
                 let mut any_just_stopped = false;
                 let mut any_network_dirty = false;
+                let mut stopped_profiles: Vec<(String, u16, bool)> = Vec::new();
+                let mut dirty_ban_profiles: Vec<String> = Vec::new();
 
                 let sup_entries: Vec<(String, ServerSupervisor)> = self
                     .server_supervisors
@@ -1137,24 +1295,66 @@ impl AppState {
                             prev_state,
                             Some(ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_))
                         );
+                        let stopped_port = snap.port;
 
-                        self.server_snapshots.insert(profile_id, snap);
+                        self.server_snapshots.insert(profile_id.clone(), snap);
 
                         if curr_player_count != prev_player_count || just_stopped {
                             any_banlist_dirty = true;
+                            dirty_ban_profiles.push(profile_id.clone());
                         }
                         if just_stopped {
                             any_just_stopped = true;
                             any_network_dirty = true;
-                        }
-                        if just_started_running {
+                            let was_starting =
+                                matches!(prev_state, Some(ServerLifecycleState::Starting));
+                            stopped_profiles.push((profile_id, stopped_port, was_starting));
+                        } else if just_started_running {
                             any_network_dirty = true;
+                        }
+                    }
+                }
+
+                for (profile_id, stopped_port, was_starting) in stopped_profiles {
+                    if self
+                        .pending_auto_direct_host_ports
+                        .remove(&profile_id)
+                        .is_some()
+                        && was_starting
+                    {
+                        self.notify_err("Server đã dừng trước khi kịp mở Port mạng.");
+                    }
+                    if self.direct_host_handles.contains_key(&profile_id) {
+                        self.stop_direct_host_for_profile(&profile_id);
+                    }
+                    if stopped_port > 0 {
+                        self.cleanup_host_for_stopped_port(stopped_port, Some(&profile_id), None);
+                    }
+                    if profile_id == self.config.active_server_id {
+                        if let Some(cfg_port) = self
+                            .config
+                            .active_server()
+                            .map(|p| p.config.port)
+                            .filter(|&p| p > 0)
+                        {
+                            let cfg_port_str = cfg_port.to_string();
+                            self.direct_host_port_input = cfg_port_str.clone();
+                            self.port_probe_port = cfg_port_str;
                         }
                     }
                 }
 
                 if any_banlist_dirty {
                     self.refresh_banlist();
+                    for profile_id in dirty_ban_profiles {
+                        if profile_id != self.config.active_server_id {
+                            if let Some(handle) = self.direct_host_handles.get(&profile_id) {
+                                handle.set_banned_ips(
+                                    self.collect_banlist_ips_for_profile_id(&profile_id),
+                                );
+                            }
+                        }
+                    }
                 }
                 if any_just_stopped {
                     self.refresh_worlds_and_backups();
@@ -1169,29 +1369,50 @@ impl AppState {
             self.scan_external_servers();
         }
 
-        if let Some(target_id) = self.pending_auto_direct_host_profile_id.clone() {
+        let pending_entries: Vec<(String, u16)> = self
+            .pending_auto_direct_host_ports
+            .iter()
+            .map(|(id, port)| (id.clone(), *port))
+            .collect();
+        for (target_id, captured_host_port) in pending_entries {
             let sup_active = self
                 .server_supervisors
                 .get(&target_id)
                 .is_some_and(|s| s.is_active());
             match self.server_snapshots.get(&target_id).map(|s| &s.state) {
                 Some(ServerLifecycleState::Running) => {
-                    self.pending_auto_direct_host_profile_id = None;
-                    let port = self
+                    self.pending_auto_direct_host_ports.remove(&target_id);
+                    let local_port = self
                         .server_snapshots
                         .get(&target_id)
                         .map(|s| s.port)
                         .filter(|&p| p > 0)
+                        .or_else(|| self.profile_effective_port(&target_id))
                         .unwrap_or_else(|| self.active_server_port());
-                    self.start_direct_host_on_port(port);
+                    let host_port = if captured_host_port > 0 {
+                        captured_host_port
+                    } else {
+                        local_port
+                    };
+                    let try_upnp = if target_id == self.config.active_server_id {
+                        self.direct_try_upnp
+                    } else {
+                        self.config
+                            .servers
+                            .iter()
+                            .find(|p| p.id == target_id)
+                            .map(|p| p.config.upnp)
+                            .unwrap_or(true)
+                    };
+                    self.start_direct_host_for_profile(target_id, local_port, host_port, try_upnp);
                 }
                 Some(ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_)) | None => {
-                    self.pending_auto_direct_host_profile_id = None;
+                    self.pending_auto_direct_host_ports.remove(&target_id);
                     self.notify_err("Server đã dừng trước khi kịp mở Port mạng.");
                 }
                 Some(ServerLifecycleState::Starting | ServerLifecycleState::Stopping) => {
                     if !sup_active {
-                        self.pending_auto_direct_host_profile_id = None;
+                        self.pending_auto_direct_host_ports.remove(&target_id);
                         self.notify_err("Server đã dừng trước khi kịp mở Port mạng.");
                     }
                 }
@@ -1211,16 +1432,62 @@ impl AppState {
             || self.network_loading
             || self.tml_releases_busy
             || self.terraria_check_busy
-            || matches!(
-                self.active_direct_host_status(),
-                DirectHostStatus::Starting { .. }
-            );
+            || self
+                .direct_host_handles
+                .values()
+                .any(|h| matches!(h.current_status(), DirectHostStatus::Starting { .. }));
         let repaint_interval = if any_task_busy {
             Duration::from_millis(50)
         } else {
             Duration::from_millis(500)
         };
         ctx.request_repaint_after(repaint_interval);
+    }
+
+    fn worlds_dir_for_edition(&self, edition: GameEdition) -> PathBuf {
+        match edition {
+            GameEdition::Vanilla => self.paths.vanilla_worlds_dir(),
+            GameEdition::TModLoader => self.paths.tml_worlds_dir(),
+        }
+    }
+
+    fn running_game_edition(&self) -> Option<GameEdition> {
+        self.active_game
+            .as_ref()
+            .map(|g| g.edition)
+            .or_else(|| self.current_running_game().map(|g| g.edition))
+    }
+
+    fn is_edition_client_running(&self, edition: GameEdition) -> bool {
+        self.active_game
+            .as_ref()
+            .is_some_and(|g| g.edition == edition)
+            || self
+                .running_game
+                .as_ref()
+                .is_some_and(|g| g.edition == edition)
+            || self
+                .external_game
+                .as_ref()
+                .is_some_and(|g| g.edition == edition)
+    }
+
+    fn clear_stale_mod_provenance(&self, internal_name: &str) {
+        let exact = internal_name.trim();
+        if exact.is_empty() {
+            return;
+        }
+        let matching_names: Vec<String> = self
+            .mod_sources
+            .iter()
+            .filter(|r| r.internal_name.eq_ignore_ascii_case(exact))
+            .map(|r| r.internal_name.clone())
+            .collect();
+        for name in matching_names {
+            let _ = remove_mod_source(&self.paths, &name);
+        }
+        let _ = remove_mod_source(&self.paths, exact);
+        let _ = remove_workshop_manifest_entry(&self.paths, exact);
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -1232,34 +1499,233 @@ impl AppState {
         if paths.is_empty() {
             return;
         }
-        match import_local_mod_files(&paths, &self.paths, true) {
-            Ok(imported) if !imported.is_empty() => {
-                self.refresh_mods_and_packs();
-                self.active_tab = NavTab::Mods;
-                self.mods_tab = ModsSubTab::Installed;
-                self.notify_ok(format!("Đã nhập và bật {} mod.", imported.len()));
+
+        let mut mod_tmod_paths = Vec::new();
+        let mut candidate_mod_zips = Vec::new();
+        let mut world_paths = Vec::new();
+        let mut backup_zip_paths = Vec::new();
+        let mut unsupported_labels = Vec::new();
+
+        for path in paths {
+            if !path.is_file() {
+                let label = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| path.display().to_string());
+                unsupported_labels.push(label);
+                continue;
             }
-            Ok(_) => self.notify_err("Không tìm thấy file .tmod hợp lệ trong các file vừa kéo thả."),
-            Err(e) => self.notify_err(format!("Lỗi nhập mod: {e}")),
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match ext.as_str() {
+                "tmod" => mod_tmod_paths.push(path),
+                "wld" | "twld" => world_paths.push(path),
+                "zip" => {
+                    let (detected_ed, primary_wld, _) = inspect_world_backup_zip(&path);
+                    if detected_ed.is_some() && primary_wld.is_some() {
+                        backup_zip_paths.push(path);
+                    } else {
+                        candidate_mod_zips.push(path);
+                    }
+                }
+                _ => {
+                    let label = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| ext.clone());
+                    unsupported_labels.push(label);
+                }
+            }
+        }
+
+        let mut ok_parts = Vec::new();
+        let mut err_parts = Vec::new();
+        let mut imported_mods_total = 0usize;
+
+        if !mod_tmod_paths.is_empty() || !candidate_mod_zips.is_empty() {
+            if self.is_tml_mods_locked_by_runtime() {
+                err_parts.push(
+                    "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi nhập mod."
+                        .to_string(),
+                );
+            } else {
+                if !mod_tmod_paths.is_empty() {
+                    match import_local_mod_files(&mod_tmod_paths, &self.paths, true) {
+                        Ok(imported) => {
+                            for meta in &imported {
+                                self.clear_stale_mod_provenance(&meta.internal_name);
+                            }
+                            imported_mods_total += imported.len();
+                        }
+                        Err(e) => err_parts.push(format!("Lỗi nhập mod: {e}")),
+                    }
+                }
+                for zip_path in candidate_mod_zips {
+                    let zip_name = zip_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("archive.zip")
+                        .to_string();
+                    match import_local_mod_files(&[zip_path], &self.paths, true) {
+                        Ok(imported) if !imported.is_empty() => {
+                            for meta in &imported {
+                                self.clear_stale_mod_provenance(&meta.internal_name);
+                            }
+                            imported_mods_total += imported.len();
+                        }
+                        Ok(_) => err_parts.push(format!(
+                            "File .zip '{zip_name}' không chứa .tmod hoặc bản sao lưu thế giới hợp lệ."
+                        )),
+                        Err(e) => err_parts.push(format!("Lỗi nhập '{zip_name}': {e}")),
+                    }
+                }
+                if imported_mods_total > 0 {
+                    self.sync_active_modpack_if_needed(None);
+                    self.refresh_mods_and_packs();
+                    self.active_tab = NavTab::Mods;
+                    self.mods_tab = ModsSubTab::Installed;
+                    ok_parts.push(format!("Đã nhập và bật {imported_mods_total} mod"));
+                }
+            }
+        }
+
+        if !world_paths.is_empty() {
+            self.scan_external_servers();
+            let active_ed = self.config.active_edition;
+            if self.install_busy {
+                err_parts.push(
+                    "Đang có tiến trình cài đặt chạy, không thể nhập thế giới lúc này.".to_string(),
+                );
+            } else if self.is_edition_client_running(active_ed)
+                || self.has_running_server_for_edition(active_ed)
+            {
+                err_parts.push(format!(
+                    "Vui lòng đóng Game và tắt Server {} đang chạy trước khi nhập tệp thế giới.",
+                    active_ed.label()
+                ));
+            } else {
+                let target_dir = self.worlds_dir_for_edition(active_ed);
+                if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                    err_parts.push(format!("Không tạo được thư mục Worlds: {e}"));
+                } else {
+                    let mut copied = 0usize;
+                    for src in world_paths {
+                        let Some(fname) = src.file_name() else {
+                            continue;
+                        };
+                        let dest = target_dir.join(fname);
+                        if normalize_world_path_key(&src) != normalize_world_path_key(&dest) {
+                            if let Err(e) = std::fs::copy(&src, &dest) {
+                                err_parts.push(format!(
+                                    "Không thể sao chép '{}': {e}",
+                                    fname.to_string_lossy()
+                                ));
+                                continue;
+                            }
+                        }
+                        copied += 1;
+                    }
+                    if copied > 0 {
+                        self.refresh_worlds_and_backups();
+                        if imported_mods_total == 0 {
+                            self.active_tab = NavTab::Play;
+                        }
+                        ok_parts.push(format!(
+                            "Đã nhập {copied} tệp thế giới vào {}",
+                            active_ed.label()
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !backup_zip_paths.is_empty() {
+            if self.install_busy {
+                err_parts.push(
+                    "Đang có tiến trình cài đặt chạy, không thể nhập bản sao lưu lúc này."
+                        .to_string(),
+                );
+            } else if let Err(e) = std::fs::create_dir_all(&self.paths.backups_dir) {
+                err_parts.push(format!("Không tạo được thư mục Backups: {e}"));
+            } else {
+                let mut copied = 0usize;
+                for src in backup_zip_paths {
+                    let Some(fname) = src.file_name() else {
+                        continue;
+                    };
+                    let mut dest = self.paths.backups_dir.join(fname);
+                    if normalize_world_path_key(&src) != normalize_world_path_key(&dest) {
+                        if dest.exists() {
+                            let stem = src
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("backup");
+                            let mut idx = 2usize;
+                            loop {
+                                let candidate =
+                                    self.paths.backups_dir.join(format!("{stem}_{idx}.zip"));
+                                if !candidate.exists()
+                                    || normalize_world_path_key(&src)
+                                        == normalize_world_path_key(&candidate)
+                                {
+                                    dest = candidate;
+                                    break;
+                                }
+                                idx += 1;
+                            }
+                        }
+                        if normalize_world_path_key(&src) != normalize_world_path_key(&dest) {
+                            if let Err(e) = std::fs::copy(&src, &dest) {
+                                err_parts.push(format!(
+                                    "Không thể sao chép bản sao lưu '{}': {e}",
+                                    fname.to_string_lossy()
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    copied += 1;
+                }
+                if copied > 0 {
+                    self.refresh_worlds_and_backups();
+                    if imported_mods_total == 0 {
+                        self.active_tab = NavTab::Play;
+                    }
+                    ok_parts.push(format!("Đã nhập {copied} bản sao lưu thế giới"));
+                }
+            }
+        }
+
+        if !unsupported_labels.is_empty() {
+            err_parts.push(format!(
+                "Định dạng không hỗ trợ: {}",
+                unsupported_labels.join(", ")
+            ));
+        }
+
+        if !err_parts.is_empty() && !ok_parts.is_empty() {
+            self.notify_err(format!("{}. {}", ok_parts.join("; "), err_parts.join(" ")));
+        } else if !err_parts.is_empty() {
+            self.notify_err(err_parts.join(" "));
+        } else if !ok_parts.is_empty() {
+            self.notify_ok(format!("{}.", ok_parts.join("; ")));
         }
     }
 
     pub fn active_server_port(&self) -> u16 {
-        let port = if self
+        let sup_active = self
             .active_server_supervisor()
-            .is_some_and(|s| s.is_active())
-        {
-            self.active_server_snapshot()
-                .map(|s| s.port)
-                .or_else(|| self.config.active_server().map(|p| p.config.port))
-        } else {
-            self.config
-                .active_server()
-                .map(|p| p.config.port)
-                .filter(|&p| p > 0)
-                .or_else(|| self.active_external_server().and_then(|e| e.port))
-        };
-        port.filter(|&p| p > 0).unwrap_or(7777)
+            .is_some_and(|s| s.is_active());
+        let snap_port = self.active_server_snapshot().map(|s| s.port);
+        let showing_ext = self.showing_external_server();
+        let ext_port = self.active_external_server().and_then(|e| e.port);
+        let cfg_port = self.config.active_server().map(|p| p.config.port);
+        resolve_active_server_port_value(sup_active, snap_port, showing_ext, ext_port, cfg_port)
     }
 
     pub fn mod_icon_texture(
@@ -1296,13 +1762,63 @@ impl AppState {
         self.save_config();
     }
 
+    pub fn has_active_client_ipv6_bridge(&self) -> bool {
+        self.client_ipv6_bridge.is_some() && self.is_game_running()
+    }
+
+    fn has_active_close_resources(&self) -> bool {
+        let (has_hosted_server, has_direct_host, has_upnp, has_client_bridge) =
+            self.close_resource_flags();
+        has_hosted_server || has_direct_host || has_upnp || has_client_bridge
+    }
+
+    pub fn close_confirm_message(&self) -> &'static str {
+        let (has_hosted_server, has_direct_host, has_upnp, has_client_bridge) =
+            self.close_resource_flags();
+        format_close_confirm_message(
+            has_hosted_server,
+            has_direct_host,
+            has_upnp,
+            has_client_bridge,
+        )
+    }
+
+    pub fn should_block_close_for_active_bridge(&mut self) -> bool {
+        let has_active = self.has_active_close_resources();
+        let (should_block, newly_opened) = should_block_close_transition(
+            self.close_bridge_allow_exit,
+            has_active,
+            &mut self.confirm_close_bridge_modal,
+        );
+        if newly_opened {
+            self.notify_err(self.close_confirm_message());
+        }
+        should_block
+    }
+
+    pub fn confirm_close_bridge_and_exit(&mut self, ctx: &egui::Context) {
+        self.close_bridge_allow_exit = true;
+        self.confirm_close_bridge_modal = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    pub fn cancel_close_bridge_modal(&mut self) {
+        self.confirm_close_bridge_modal = false;
+    }
+
     fn stop_client_ipv6_bridge(&mut self) {
         if let Some(bridge) = self.client_ipv6_bridge.take() {
             bridge.stop();
         }
+        self.confirm_close_bridge_modal = false;
+        self.close_bridge_allow_exit = false;
     }
 
     pub fn launch_selected_game(&mut self, join_server: Option<(String, u16, String)>) {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt chạy, không thể mở Game lúc này.");
+            return;
+        }
         if self.active_game.is_some() {
             self.notify_err("Game đang chạy. Hãy đóng phiên hiện tại trước khi mở mới.");
             return;
@@ -1319,19 +1835,24 @@ impl AppState {
         self.stop_client_ipv6_bridge();
         if self.config.active_edition == GameEdition::TModLoader {
             let selected_pack = self.config.active_modpack.trim().to_string();
-            if !selected_pack.is_empty()
-                && self
-                    .paths
-                    .tml_modpacks_dir()
-                    .join(&selected_pack)
-                    .join("Mods")
-                    .is_dir()
-            {
-                let _ = activate_modpack(
-                    &self.paths.tml_modpacks_dir().join(&selected_pack),
-                    &self.paths.tml_mods_dir(),
-                    true,
-                );
+            if !selected_pack.is_empty() {
+                let pack_dir = self.paths.tml_modpacks_dir().join(&selected_pack);
+                if is_safe_single_dir_component(&selected_pack) && pack_dir.join("Mods").is_dir() {
+                    match activate_modpack(&pack_dir, &self.paths.tml_mods_dir(), true) {
+                        Ok(_) => self.refresh_mods_and_packs(),
+                        Err(e) => {
+                            self.notify_err(format!(
+                                "Không thể kích hoạt ModPack '{selected_pack}': {e}"
+                            ));
+                            return;
+                        }
+                    }
+                } else if !is_existing_valid_modpack(&self.paths, &selected_pack) {
+                    self.notify_err(format!(
+                        "ModPack '{selected_pack}' không tồn tại hoặc không hợp lệ."
+                    ));
+                    return;
+                }
             }
         }
         let (join_host, join_port, join_password) = match join_server {
@@ -1366,10 +1887,7 @@ impl AppState {
             None
         };
         let (effective_join_host, effective_join_port) = if let Some(v6_target) = resolved_v6 {
-            match self
-                .rt
-                .block_on(start_ipv4_to_ipv6_client_bridge(v6_target, target_port))
-            {
+            match self.rt.block_on(start_ipv4_to_ipv6_client_bridge(v6_target)) {
                 Ok(bridge) => {
                     let local_port = bridge.local_port();
                     self.client_ipv6_bridge = Some(bridge);
@@ -1425,7 +1943,7 @@ impl AppState {
             let killed = self
                 .sys
                 .as_mut()
-                .is_some_and(|sys| terminate_process_by_pid(sys, ext.pid));
+                .is_some_and(|sys| terminate_game_process_by_pid(sys, ext.pid));
             if killed {
                 self.notify_ok("Đã đóng tiến trình game.");
             } else {
@@ -1452,43 +1970,57 @@ impl AppState {
         })
     }
 
+    fn has_running_server_for_edition(&self, edition: GameEdition) -> bool {
+        let supervised_conflict = self.server_supervisors.iter().any(|(id, sup)| {
+            if !sup.is_active() {
+                return false;
+            }
+            let running_edition = self
+                .server_snapshots
+                .get(id)
+                .map(|s| s.edition)
+                .or_else(|| {
+                    self.config
+                        .servers
+                        .iter()
+                        .find(|p| p.id == *id)
+                        .map(|p| p.edition)
+                });
+            running_edition == Some(edition)
+        });
+        let external_conflict = self
+            .external_servers
+            .iter()
+            .any(|ext| ext.edition == edition);
+        supervised_conflict || external_conflict
+    }
+
+    fn check_install_edition_ready(&self, edition: Option<GameEdition>) -> Result<(), &'static str> {
+        let running_game_ed = match edition {
+            Some(GameEdition::TModLoader) if self.is_edition_client_running(GameEdition::TModLoader) => {
+                Some(GameEdition::TModLoader)
+            }
+            None if self.is_edition_client_running(GameEdition::Vanilla) => Some(GameEdition::Vanilla),
+            _ => self.running_game_edition(),
+        };
+        check_install_edition_ready_flags(
+            self.install_busy,
+            self.is_steamcmd_busy(),
+            running_game_ed,
+            self.has_running_server_for_edition(GameEdition::Vanilla),
+            self.has_running_server_for_edition(GameEdition::TModLoader),
+            edition,
+        )
+    }
+
+    pub fn can_install_edition_ui(&self, edition: Option<GameEdition>) -> bool {
+        self.check_install_edition_ready(edition).is_ok()
+    }
+
     fn can_start_install(&mut self, overwriting_edition: Option<GameEdition>) -> bool {
-        if let Some(edition) = overwriting_edition {
-            if self.is_game_running() {
-                self.notify_err("Vui lòng đóng game trước khi cài đặt/cập nhật.");
-                return false;
-            }
-            let supervised_conflict = self.server_supervisors.iter().any(|(id, sup)| {
-                if !sup.is_active() {
-                    return false;
-                }
-                let running_edition = self
-                    .server_snapshots
-                    .get(id)
-                    .map(|s| s.edition)
-                    .or_else(|| {
-                        self.config
-                            .servers
-                            .iter()
-                            .find(|p| p.id == *id)
-                            .map(|p| p.edition)
-                    });
-                running_edition == Some(edition)
-            });
-            let external_conflict = self
-                .external_servers
-                .iter()
-                .any(|ext| ext.edition == edition);
-            if supervised_conflict || external_conflict {
-                self.notify_err(format!(
-                    "Vui lòng tắt server {} đang chạy trước khi cài đặt/cập nhật.",
-                    edition.label()
-                ));
-                return false;
-            }
-        }
-        if self.install_busy {
-            self.notify_err("Đang có tiến trình cài đặt khác đang chạy, vui lòng chờ.");
+        self.scan_external_servers();
+        if let Err(msg) = self.check_install_edition_ready(overwriting_edition) {
+            self.notify_err(msg);
             return false;
         }
         true
@@ -1500,10 +2032,11 @@ impl AppState {
         }
         self.tml_releases_busy = true;
         let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+        let token = non_empty_opt(&self.config.github_release_token).map(ToString::to_string);
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn(async move {
-            let res = fetch_tmodloader_releases(proxy.as_deref())
+            let res = fetch_tmodloader_releases(proxy.as_deref(), token.as_deref())
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::TmlReleasesFetched(res));
@@ -1515,7 +2048,16 @@ impl AppState {
         if !self.can_start_install(Some(GameEdition::TModLoader)) {
             return;
         }
-        let also_install_dotnet = self.env.dotnet8_version.is_none();
+        let required_dotnet = read_required_tml_dotnet_version(&self.paths);
+        let bundled_exact = detect_exact_bundled_dotnet_runtime(&self.paths, &required_dotnet);
+        let also_install_dotnet = !bundled_exact
+            && (self.env.dotnet8_version.is_none()
+                || self
+                    .paths
+                    .tmodloader_dir
+                    .join("dotnet")
+                    .join("dotnet.exe")
+                    .is_file());
         let selected_release = if self.tml_releases.is_empty() {
             None
         } else {
@@ -1541,6 +2083,7 @@ impl AppState {
 
         let paths = self.paths.clone();
         let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+        let token = non_empty_opt(&self.config.github_release_token).map(ToString::to_string);
         let selected_tag = self.selected_tml_tag.trim().to_string();
         let cb = self.make_progress_callback();
         let tx = self.event_tx.clone();
@@ -1557,7 +2100,7 @@ impl AppState {
                 )
                 .await
                 .map_err(|e| e.to_string()),
-                None => match fetch_tmodloader_releases(proxy.as_deref()).await {
+                None => match fetch_tmodloader_releases(proxy.as_deref(), token.as_deref()).await {
                     Ok(releases) => {
                         let chosen = if !selected_tag.is_empty() {
                             releases
@@ -1598,7 +2141,7 @@ impl AppState {
     }
 
     pub fn install_dotnet8(&mut self) {
-        if !self.can_start_install(None) {
+        if !self.can_start_install(Some(GameEdition::TModLoader)) {
             return;
         }
         self.install_busy = true;
@@ -1698,6 +2241,9 @@ impl AppState {
         else {
             return;
         };
+        if !self.can_start_install(Some(GameEdition::Vanilla)) {
+            return;
+        }
         self.install_busy = true;
         self.install_last_error = None;
         self.install_progress = Some(InstallProgress {
@@ -1722,17 +2268,31 @@ impl AppState {
     }
 
     pub fn install_xna(&mut self) {
-        let msi = self.paths.xna_msi_path();
-        if msi.is_file() {
-            match install_xna_framework_elevated(&msi) {
-                Ok(()) => self.notify_ok(
-                    "Đã mở trình cài đặt XNA 4.0. Nhấn 'Làm mới kiểm tra' sau khi cài xong.",
-                ),
-                Err(e) => self.notify_err(e.to_string()),
-            }
+        if !self.can_start_install(None) {
             return;
         }
-        if !self.can_start_install(None) {
+        let msi = self.paths.xna_msi_path();
+        if msi.is_file() {
+            self.install_busy = true;
+            self.install_last_error = None;
+            self.install_progress = Some(InstallProgress {
+                target: InstallTarget::Xna40,
+                stage: "Đang chạy trình cài đặt XNA 4.0...".to_string(),
+                current: 0,
+                total: None,
+            });
+            let tx = self.event_tx.clone();
+            let wake = self.repaint.clone();
+            self.rt.spawn_blocking(move || {
+                let result = install_xna_framework_elevated(&msi)
+                    .map(|()| {
+                        "Đã chạy trình cài đặt XNA 4.0. Nhấn 'Làm mới kiểm tra' sau khi cài xong."
+                            .to_string()
+                    })
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(AppEvent::XnaInstallFinished(result));
+                wake.wake();
+            });
             return;
         }
         self.install_busy = true;
@@ -1765,6 +2325,11 @@ impl AppState {
     }
 
     pub fn start_selected_server(&mut self) {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt chạy, không thể bật Server lúc này.");
+            return;
+        }
+        self.scan_external_servers();
         let Some(profile) = self.config.active_server().cloned() else {
             self.notify_err("Chưa có cấu hình server nào.");
             return;
@@ -1789,6 +2354,8 @@ impl AppState {
             self.notify_err("Cổng TCP Server phải từ 1 đến 65535");
             return;
         }
+        let active_direct_ports =
+            active_direct_host_ports(&self.direct_host_handles, Some(&profile.id));
         let port_used_by_other = self.server_supervisors.iter().any(|(id, sup)| {
             id != &profile.id
                 && sup.is_active()
@@ -1796,7 +2363,8 @@ impl AppState {
         }) || self
             .external_servers
             .iter()
-            .any(|ext| ext.port == Some(profile.config.port));
+            .any(|ext| ext.port == Some(profile.config.port))
+            || active_direct_ports.contains(&profile.config.port);
         if port_used_by_other || self.rt.block_on(probe_local_tcp_listening(profile.config.port)) {
             self.scan_external_servers();
             self.notify_err(format!(
@@ -1806,12 +2374,37 @@ impl AppState {
             return;
         }
 
+        let active_sup_ids: HashSet<&str> = self
+            .server_supervisors
+            .iter()
+            .filter(|(_, sup)| sup.is_active())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if let Some(conflict_name) = find_conflicting_world_profile_name(
+            &self.paths,
+            &profile,
+            &self.config.servers,
+            &active_sup_ids,
+            &self.server_snapshots,
+            &self.external_servers,
+        ) {
+            self.notify_err(format!(
+                "Thế giới này đang được sử dụng bởi hồ sơ server '{conflict_name}' đang chạy. Không thể chạy 2 server chung 1 tệp .wld cùng lúc!"
+            ));
+            return;
+        }
+
         let handle = self.rt.handle().clone();
+        let managed_by_direct_host = is_server_managed_by_direct_host(
+            &profile.id,
+            &self.pending_auto_direct_host_ports,
+            &self.direct_host_handles,
+        );
         let tuning = RuntimeTuning {
             tiered_pgo: self.config.dotnet_tiered_pgo,
             server_gc: self.config.dotnet_server_gc,
             process_priority: self.config.game_process_priority,
-            disable_builtin_upnp: true,
+            disable_builtin_upnp: managed_by_direct_host,
         };
         let profile_id = profile.id.clone();
         let profile_name = profile.name.clone();
@@ -1942,7 +2535,7 @@ impl AppState {
             return false;
         }
         let used_by_supervised = self.server_supervisors.iter().any(|(id, sup)| {
-            if ignore_profile_id == Some(id.as_str()) || !sup.is_active() {
+            if ignore_profile_id == Some(id.as_str()) || !sup.is_active() || sup.is_stopping() {
                 return false;
             }
             let snap = self.server_snapshots.get(id);
@@ -1992,23 +2585,70 @@ impl AppState {
 
     fn cleanup_host_for_stopped_port(
         &mut self,
-        port: u16,
-        ignore_profile_id: Option<&str>,
-        ignore_ext_pid: Option<u32>,
+        stopped_port: u16,
+        stopped_profile_id: Option<&str>,
+        stopped_pid: Option<u32>,
     ) {
-        if self.is_port_used_by_other_active_server(port, ignore_profile_id, ignore_ext_pid) {
+        if let Some(pid) = stopped_profile_id {
+            let another_active_same_profile = if stopped_pid.is_some() {
+                self.server_supervisors
+                    .get(pid)
+                    .is_some_and(|s| s.is_active() && !s.is_stopping())
+                    || self.external_servers.iter().any(|ext| {
+                        stopped_pid != Some(ext.pid) && ext.profile_id.as_deref() == Some(pid)
+                    })
+            } else {
+                self.external_servers
+                    .iter()
+                    .any(|ext| ext.profile_id.as_deref() == Some(pid))
+            };
+
+            if !another_active_same_profile {
+                let handle_port =
+                    self.direct_host_handles
+                        .get(pid)
+                        .and_then(|h| match h.current_status() {
+                            DirectHostStatus::Starting { local_port, .. } => Some(local_port),
+                            DirectHostStatus::Running(info) => Some(info.local_port),
+                            DirectHostStatus::Stopped
+                            | DirectHostStatus::Error(_)
+                            | DirectHostStatus::Idle => None,
+                        });
+                let port_still_used = handle_port.is_some_and(|hp| {
+                    self.is_port_used_by_other_active_server(hp, Some(pid), stopped_pid)
+                });
+                if !port_still_used {
+                    self.stop_direct_host_for_profile(pid);
+                }
+            }
+        }
+
+        if stopped_port == 0
+            || self.is_port_used_by_other_active_server(
+                stopped_port,
+                stopped_profile_id,
+                stopped_pid,
+            )
+        {
             return;
         }
-        let stop_direct = match self.active_direct_host_status() {
-            DirectHostStatus::Starting { local_port, .. } => local_port == port,
-            DirectHostStatus::Running(info) => info.local_port == port,
-            DirectHostStatus::Stopped | DirectHostStatus::Error(_) => {
-                self.direct_host_handle.is_some()
-            }
-            DirectHostStatus::Idle => false,
-        };
-        if stop_direct {
-            self.stop_direct_host();
+
+        let matching_ids: Vec<String> = self
+            .direct_host_handles
+            .iter()
+            .filter_map(|(id, handle)| match handle.current_status() {
+                DirectHostStatus::Starting { local_port, .. } if local_port == stopped_port => {
+                    Some(id.clone())
+                }
+                DirectHostStatus::Running(info) if info.local_port == stopped_port => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        for id in matching_ids {
+            self.stop_direct_host_for_profile(&id);
         }
     }
 
@@ -2039,11 +2679,7 @@ impl AppState {
             None => false,
         };
         if let Some(ref ext_profile_id) = ext.profile_id {
-            if self.pending_auto_direct_host_profile_id.as_deref()
-                == Some(ext_profile_id.as_str())
-            {
-                self.pending_auto_direct_host_profile_id = None;
-            }
+            self.pending_auto_direct_host_ports.remove(ext_profile_id);
         }
         if killed {
             self.external_servers.retain(|e| e.pid != ext.pid);
@@ -2088,9 +2724,7 @@ impl AppState {
     }
 
     pub fn stop_server_profile(&mut self, profile_id: &str) {
-        if self.pending_auto_direct_host_profile_id.as_deref() == Some(profile_id) {
-            self.pending_auto_direct_host_profile_id = None;
-        }
+        self.pending_auto_direct_host_ports.remove(profile_id);
         let is_sup_active = self
             .server_supervisors
             .get(profile_id)
@@ -2115,9 +2749,9 @@ impl AppState {
                 .map(|p| p.name.as_str())
                 .unwrap_or("server");
             if was_stopping {
-                self.notify_ok(format!(
-                    "Server chưa thoát kịp, đã buộc dừng {name}."
-                ));
+                self.notify_ok(
+                    "Đang lưu thế giới & chờ server dừng — dùng nút 'Buộc dừng' nếu cần tắt ngay.",
+                );
             } else {
                 self.notify_ok(format!("Đang lưu thế giới & tắt {name}..."));
             }
@@ -2143,9 +2777,7 @@ impl AppState {
     }
 
     pub fn force_kill_server_profile(&mut self, profile_id: &str) {
-        if self.pending_auto_direct_host_profile_id.as_deref() == Some(profile_id) {
-            self.pending_auto_direct_host_profile_id = None;
-        }
+        self.pending_auto_direct_host_ports.remove(profile_id);
         let is_sup_active = self
             .server_supervisors
             .get(profile_id)
@@ -2175,7 +2807,7 @@ impl AppState {
     }
 
     pub fn stop_all_servers(&mut self) {
-        self.pending_auto_direct_host_profile_id = None;
+        self.pending_auto_direct_host_ports.clear();
         let mut stopped_supervised = 0usize;
         for sup in self.server_supervisors.values() {
             if sup.is_active() {
@@ -2218,26 +2850,41 @@ impl AppState {
         }
 
         if failed_ext_pids.is_empty() {
-            self.stop_direct_host();
+            self.stop_all_direct_hosts();
         } else {
             self.scan_external_servers();
-            let check_port = match self.active_direct_host_status() {
-                DirectHostStatus::Starting { local_port, .. } => local_port,
-                DirectHostStatus::Running(info) => info.local_port,
-                _ => self.active_server_port(),
-            };
-            let still_used = self.external_servers.iter().any(|ext| {
-                ext.port
-                    .or_else(|| {
-                        ext.profile_id
-                            .as_deref()
-                            .and_then(|pid| self.config.servers.iter().find(|p| p.id == pid))
-                            .map(|p| p.config.port)
-                    })
-                    == Some(check_port)
-            });
-            if !still_used {
-                self.stop_direct_host();
+            let to_stop: Vec<String> = self
+                .direct_host_handles
+                .iter()
+                .filter_map(|(id, handle)| {
+                    let target_port = match handle.current_status() {
+                        DirectHostStatus::Starting { local_port, .. } => Some(local_port),
+                        DirectHostStatus::Running(info) => Some(info.local_port),
+                        _ => None,
+                    };
+                    let still_used = target_port.is_some_and(|p| {
+                        self.external_servers.iter().any(|ext| {
+                            ext.port
+                                .or_else(|| {
+                                    ext.profile_id
+                                        .as_deref()
+                                        .and_then(|pid| {
+                                            self.config.servers.iter().find(|s| s.id == pid)
+                                        })
+                                        .map(|s| s.config.port)
+                                })
+                                == Some(p)
+                        })
+                    });
+                    if !still_used {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for id in to_stop {
+                self.stop_direct_host_for_profile(&id);
             }
         }
 
@@ -2303,35 +2950,140 @@ impl AppState {
     }
 
     pub fn kick_player(&mut self, name: &str) {
-        self.send_server_command(&format!("kick {name}"));
+        let safe_name = sanitize_server_console_arg(name);
+        if safe_name.is_empty() {
+            return;
+        }
+        self.send_server_command(&format!("kick {safe_name}"));
+    }
+
+    fn schedule_delayed_ban_refresh(&self, profile_id: String) {
+        if profile_id.trim().is_empty() {
+            return;
+        }
+        let tx = self.event_tx.clone();
+        let wake = self.repaint.clone();
+        self.rt.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let _ = tx.send(AppEvent::DelayedBanRefresh { profile_id });
+            wake.wake();
+        });
     }
 
     pub fn ban_player(&mut self, name: &str) {
-        self.send_server_command(&format!("ban {name}"));
-        self.refresh_banlist();
+        let target_name = name.trim();
+        let safe_name = sanitize_server_console_arg(target_name);
+        if safe_name.is_empty() {
+            return;
+        }
+        let sup_active = self
+            .active_server_supervisor()
+            .is_some_and(|s| s.is_active());
+        if !sup_active {
+            self.send_server_command(&format!("ban {safe_name}"));
+            return;
+        }
+
+        let player_ip_raw = self.active_server_snapshot().and_then(|snap| {
+            snap.players
+                .iter()
+                .find(|p| p.name.trim() == target_name)
+                .or_else(|| snap.players.iter().find(|p| p.name == name))
+                .and_then(|p| p.ip.clone())
+        });
+
+        let resolution = resolve_player_ban_target(player_ip_raw.as_deref(), |port| {
+            self.active_direct_host_handle()
+                .and_then(|h| h.resolve_bridged_peer(port))
+        });
+
+        match resolution {
+            PlayerBanResolution::RefuseLoopback => {
+                self.notify_err(
+                    "Không thể ban kết nối nội bộ (127.0.0.1 / ::1). Hãy dùng Kick nếu muốn ngắt kết nối.",
+                );
+            }
+            PlayerBanResolution::BridgedRealIp(real_ip) => {
+                let Some(profile) = self.config.active_server().cloned() else {
+                    return;
+                };
+                let ban_path = self.resolve_profile_banlist_path(&profile);
+                let mut entries = load_banlist(&ban_path);
+                let already_banned = entries
+                    .iter()
+                    .any(|e| extract_ban_ip_key(&e.ip).map(normalize_ip_addr) == Some(real_ip));
+                if !already_banned {
+                    entries.push(BanEntry {
+                        label: format!("Player: {safe_name}"),
+                        ip: real_ip.to_string(),
+                    });
+                    if let Err(e) = save_banlist(&ban_path, &entries) {
+                        self.notify_err(format!("Không lưu được banlist: {e}"));
+                        return;
+                    }
+                }
+                self.banlist_entries = entries;
+                self.sync_banlist_to_direct_host();
+                self.send_server_command(&format!("kick {safe_name}"));
+                self.notify_ok(format!("Đã cấm {safe_name} ({real_ip})."));
+            }
+            PlayerBanResolution::DirectIp(direct_ip) => {
+                self.send_server_command(&format!("ban {safe_name}"));
+                self.refresh_banlist();
+                if let Some(handle) = self.active_direct_host_handle() {
+                    let mut ips = self.collect_banlist_ips_for_active();
+                    if !ips.contains(&direct_ip) {
+                        ips.push(direct_ip);
+                    }
+                    handle.set_banned_ips(ips);
+                }
+                self.schedule_delayed_ban_refresh(self.config.active_server_id.clone());
+            }
+            PlayerBanResolution::UnknownIp => {
+                self.send_server_command(&format!("ban {safe_name}"));
+                self.refresh_banlist();
+                self.schedule_delayed_ban_refresh(self.config.active_server_id.clone());
+            }
+        }
+    }
+
+    pub fn refresh_online_players(&mut self) {
+        let cmd_res = self
+            .active_server_supervisor()
+            .filter(|sup| sup.is_active() && sup.has_stdin())
+            .map(|sup| sup.send_silent_command("playing"));
+        if let Some(Err(e)) = cmd_res {
+            self.notify_err(format!("Không làm mới được danh sách người chơi: {e}"));
+        }
     }
 
     pub fn remove_ban_entry(&mut self, idx: usize) {
         let Some(profile) = self.config.active_server().cloned() else {
             return;
         };
-        if idx < self.banlist_entries.len() {
-            self.banlist_entries.remove(idx);
-            let path = self.resolve_profile_banlist_path(&profile);
-            if let Err(e) = save_banlist(&path, &self.banlist_entries) {
-                self.notify_err(format!("Không lưu được banlist: {e}"));
-            } else {
-                self.notify_ok("Đã cập nhật danh sách cấm.");
-            }
+        let Some(target) = self.banlist_entries.get(idx).cloned() else {
+            return;
+        };
+        let path = self.resolve_profile_banlist_path(&profile);
+        let mut disk_entries = load_banlist(&path);
+        remove_ban_entry_from_disk_list(&mut disk_entries, &target);
+        if let Err(e) = save_banlist(&path, &disk_entries) {
+            self.notify_err(format!("Không lưu được banlist: {e}"));
+        } else {
+            self.banlist_entries = disk_entries;
+            self.sync_banlist_to_direct_host();
+            self.notify_ok("Đã cập nhật danh sách cấm.");
         }
     }
 
     pub fn add_manual_ban(&mut self) {
-        let ip = self.manual_ban_ip.trim().to_string();
-        if ip.is_empty() {
-            self.notify_err("Nhập địa chỉ IP cần cấm.");
-            return;
-        }
+        let norm_ip = match validate_and_normalize_manual_ban_ip(&self.manual_ban_ip) {
+            Ok(ip) => ip,
+            Err(msg) => {
+                self.notify_err(msg);
+                return;
+            }
+        };
         let Some(profile) = self.config.active_server().cloned() else {
             return;
         };
@@ -2340,14 +3092,59 @@ impl AppState {
         } else {
             self.manual_ban_name.trim().to_string()
         };
-        self.banlist_entries.push(BanEntry { label, ip });
         let path = self.resolve_profile_banlist_path(&profile);
-        if let Err(e) = save_banlist(&path, &self.banlist_entries) {
-            self.notify_err(format!("Không lưu được banlist: {e}"));
+        let mut next_entries = load_banlist(&path);
+        let added = merge_manual_ban_entry(&mut next_entries, label, norm_ip);
+        if added {
+            if let Err(e) = save_banlist(&path, &next_entries) {
+                self.notify_err(format!("Không lưu được banlist: {e}"));
+                return;
+            }
+        }
+        self.banlist_entries = next_entries;
+        self.manual_ban_name.clear();
+        self.manual_ban_ip.clear();
+        self.sync_banlist_to_direct_host();
+
+        let sup_active = self
+            .active_server_supervisor()
+            .is_some_and(|s| s.is_active());
+        if sup_active {
+            let matching_players: Vec<String> = self
+                .active_server_snapshot()
+                .map(|snap| {
+                    snap.players
+                        .iter()
+                        .filter_map(|p| {
+                            let resolved = resolve_player_ban_target(p.ip.as_deref(), |port| {
+                                self.active_direct_host_handle()
+                                    .and_then(|h| h.resolve_bridged_peer(port))
+                            });
+                            let matches = matches!(
+                                resolved,
+                                PlayerBanResolution::DirectIp(ip)
+                                    | PlayerBanResolution::BridgedRealIp(ip)
+                                    if ip == norm_ip
+                            );
+                            if matches {
+                                let safe = sanitize_server_console_arg(&p.name);
+                                (!safe.is_empty()).then_some(safe)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for safe_name in matching_players {
+                self.send_server_command(&format!("kick {safe_name}"));
+            }
+        }
+
+        if added {
+            self.notify_ok(format!("Đã thêm {norm_ip} vào banlist.txt."));
         } else {
-            self.manual_ban_name.clear();
-            self.manual_ban_ip.clear();
-            self.notify_ok("Đã thêm vào banlist.txt.");
+            self.notify_ok(format!("IP {norm_ip} đã có sẵn trong danh sách cấm."));
         }
     }
 
@@ -2397,11 +3194,76 @@ impl AppState {
         });
     }
 
+    pub fn active_direct_host_handle(&self) -> Option<&DirectPortHostHandle> {
+        self.direct_host_handles.get(&self.config.active_server_id)
+    }
+
     pub fn active_direct_host_status(&self) -> DirectHostStatus {
-        self.direct_host_handle
-            .as_ref()
+        self.active_direct_host_handle()
             .map(DirectPortHostHandle::current_status)
             .unwrap_or(DirectHostStatus::Idle)
+    }
+
+    pub fn has_pending_auto_direct_host(&self, profile_id: &str) -> bool {
+        self.pending_auto_direct_host_ports.contains_key(profile_id)
+    }
+
+    pub fn cancel_pending_auto_direct_host(&mut self, profile_id: &str) {
+        self.pending_auto_direct_host_ports.remove(profile_id);
+    }
+
+    pub fn active_direct_bind_ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.direct_bind_ips
+            .get(&self.config.active_server_id)
+            .copied()
+            .flatten()
+    }
+
+    pub fn set_active_direct_bind_ip(&mut self, ip: Option<std::net::Ipv4Addr>) {
+        if let Some(addr) = ip {
+            self.direct_bind_ips
+                .insert(self.config.active_server_id.clone(), Some(addr));
+        } else {
+            self.direct_bind_ips.remove(&self.config.active_server_id);
+        }
+    }
+
+    pub fn is_active_profile_pending_direct_host(&self) -> bool {
+        self.has_pending_auto_direct_host(&self.config.active_server_id)
+    }
+
+    pub fn format_player_ip_for_active(&self, raw: &str) -> String {
+        format_player_ip_with_resolver(raw, |port| {
+            self.active_direct_host_handle()
+                .and_then(|h| h.resolve_bridged_peer(port))
+        })
+    }
+
+    pub fn collect_banlist_ips_for_profile(&self, profile: &ServerProfile) -> Vec<IpAddr> {
+        let entries = load_banlist(&self.resolve_profile_banlist_path(profile));
+        collect_banlist_ips_from_entries(&entries)
+    }
+
+    fn collect_banlist_ips_for_profile_id(&self, profile_id: &str) -> Vec<IpAddr> {
+        self.config
+            .servers
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map(|p| self.collect_banlist_ips_for_profile(p))
+            .unwrap_or_default()
+    }
+
+    fn collect_banlist_ips_for_active(&self) -> Vec<IpAddr> {
+        self.config
+            .active_server()
+            .map(|p| self.collect_banlist_ips_for_profile(p))
+            .unwrap_or_default()
+    }
+
+    pub fn sync_banlist_to_direct_host(&self) {
+        if let Some(handle) = self.direct_host_handles.get(&self.config.active_server_id) {
+            handle.set_banned_ips(self.collect_banlist_ips_for_active());
+        }
     }
 
     pub fn active_online_endpoint(&self) -> Option<String> {
@@ -2411,17 +3273,36 @@ impl AppState {
         None
     }
 
-    pub fn stop_direct_host(&mut self) {
-        if let Some(h) = self.direct_host_handle.take() {
+    pub fn stop_direct_host_for_profile(&mut self, profile_id: &str) {
+        if let Some(h) = self.direct_host_handles.remove(profile_id) {
             h.stop();
         }
     }
 
-    fn start_direct_host_on_port(&mut self, local_target_port: u16) {
-        if matches!(
-            self.active_direct_host_status(),
-            DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
-        ) {
+    pub fn stop_all_direct_hosts(&mut self) {
+        for (_, h) in self.direct_host_handles.drain() {
+            h.stop();
+        }
+    }
+
+    pub fn stop_direct_host(&mut self) {
+        let active_id = self.config.active_server_id.clone();
+        self.stop_direct_host_for_profile(&active_id);
+    }
+
+    fn start_direct_host_for_profile(
+        &mut self,
+        profile_id: String,
+        local_target_port: u16,
+        host_port: u16,
+        try_upnp: bool,
+    ) {
+        if self.direct_host_handles.get(&profile_id).is_some_and(|h| {
+            matches!(
+                h.current_status(),
+                DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
+            )
+        }) {
             self.notify_ok("Port mạng đang mở.");
             return;
         }
@@ -2429,6 +3310,33 @@ impl AppState {
             self.notify_err("Cổng TCP Server phải từ 1 đến 65535");
             return;
         }
+        if !self.firewall_busy && !check_firewall_rule_exists(host_port) {
+            self.ensure_firewall(host_port);
+        }
+        self.stop_direct_host_for_profile(&profile_id);
+        let initial_banned_ips = self.collect_banlist_ips_for_profile_id(&profile_id);
+        let bind_ipv4 = self.direct_bind_ips.get(&profile_id).copied().flatten();
+        let handle = start_direct_port_host(
+            self.rt.handle(),
+            DirectHostConfig {
+                local_target_port,
+                host_port,
+                bind_ipv4,
+                try_upnp,
+                initial_banned_ips,
+            },
+            self.repaint.clone(),
+        );
+        self.direct_host_handles.insert(profile_id, handle);
+        self.notify_ok("Đang mở Port mạng...");
+    }
+
+    fn start_direct_host_on_port(&mut self, local_target_port: u16) {
+        let active_id = self
+            .config
+            .active_server()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| self.config.active_server_id.clone());
         let host_port = self
             .direct_host_port_input
             .trim()
@@ -2436,28 +3344,13 @@ impl AppState {
             .ok()
             .filter(|&p| p > 0)
             .unwrap_or(local_target_port);
-        if !self.firewall_busy && !check_firewall_rule_exists(host_port) {
-            self.ensure_firewall(host_port);
-        }
-        if let Some(prev) = self.direct_host_handle.take() {
-            prev.stop();
-        }
-        let handle = start_direct_port_host(
-            self.rt.handle(),
-            DirectHostConfig {
-                local_target_port,
-                host_port,
-                bind_ipv4: self.direct_bind_ip,
-                try_upnp: self.direct_try_upnp,
-            },
-            self.repaint.clone(),
-        );
-        self.direct_host_handle = Some(handle);
-        self.notify_ok("Đang mở Port mạng...");
+        let try_upnp = self.direct_try_upnp;
+        self.start_direct_host_for_profile(active_id, local_target_port, host_port, try_upnp);
     }
 
     pub fn toggle_direct_host(&mut self) {
-        self.pending_auto_direct_host_profile_id = None;
+        let active_id = self.config.active_server_id.clone();
+        self.pending_auto_direct_host_ports.remove(&active_id);
         if matches!(
             self.active_direct_host_status(),
             DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
@@ -2481,11 +3374,24 @@ impl AppState {
     }
 
     pub fn start_self_host_online(&mut self) {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt chạy, không thể bật Server lúc này.");
+            return;
+        }
         let port = self.active_server_port();
         if port == 0 {
             self.notify_err("Cổng TCP Server phải từ 1 đến 65535");
             return;
         }
+        let trimmed_host_port = self.direct_host_port_input.trim();
+        let desired_host_port = if trimmed_host_port.is_empty() {
+            port
+        } else if let Some(valid) = trimmed_host_port.parse::<u16>().ok().filter(|&p| p > 0) {
+            valid
+        } else {
+            self.notify_err("Cổng mở không hợp lệ (1 - 65535).");
+            return;
+        };
         let active_id = self
             .config
             .active_server()
@@ -2497,7 +3403,7 @@ impl AppState {
         if srv_active {
             match self.active_server_snapshot().map(|s| &s.state) {
                 Some(ServerLifecycleState::Running) => {
-                    self.pending_auto_direct_host_profile_id = None;
+                    self.pending_auto_direct_host_ports.remove(&active_id);
                     self.start_direct_host_on_port(port);
                 }
                 Some(ServerLifecycleState::Stopping) => {
@@ -2510,7 +3416,8 @@ impl AppState {
                     ) {
                         self.notify_ok("Port mạng đang mở.");
                     } else {
-                        self.pending_auto_direct_host_profile_id = Some(active_id);
+                        self.pending_auto_direct_host_ports
+                            .insert(active_id, desired_host_port);
                         self.notify_ok(
                             "Server đang khởi động — sẽ tự mở Port mạng ngay khi sẵn sàng.",
                         );
@@ -2521,24 +3428,31 @@ impl AppState {
         }
 
         if self.rt.block_on(probe_local_tcp_listening(port)) {
-            self.pending_auto_direct_host_profile_id = None;
+            self.pending_auto_direct_host_ports.remove(&active_id);
             self.start_direct_host_on_port(port);
             self.spawn_network_probe();
             return;
         }
 
+        self.pending_auto_direct_host_ports
+            .insert(active_id.clone(), desired_host_port);
         self.start_selected_server();
         if self
             .server_supervisors
             .get(&active_id)
             .is_some_and(|s| s.is_active())
         {
-            self.pending_auto_direct_host_profile_id = Some(active_id);
             self.notify_ok("Đang khởi chạy Server và tự động mở Port mạng...");
+        } else {
+            self.pending_auto_direct_host_ports.remove(&active_id);
         }
     }
 
     pub fn join_own_hosted_server(&mut self) {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt chạy, không thể mở Game lúc này.");
+            return;
+        }
         if self.active_game.is_some() {
             self.notify_err("Game đang chạy. Hãy đóng phiên hiện tại trước khi mở mới.");
             return;
@@ -2555,50 +3469,144 @@ impl AppState {
         let srv_active = self
             .active_server_supervisor()
             .is_some_and(|s| s.is_active());
-        let ext_server = if srv_active {
-            None
-        } else {
-            self.active_external_server()
-        };
-        let matched_profile = ext_server
-            .and_then(|ext| ext.profile_id.as_deref())
-            .and_then(|id| self.config.servers.iter().find(|s| s.id == id))
-            .or_else(|| self.config.active_server());
-        let server_password = matched_profile
-            .map(|s| s.config.password.clone())
-            .unwrap_or_default();
-        let server_edition = if srv_active {
-            self.active_server_snapshot()
+        let (target_port, server_password, server_edition, server_pack) = if srv_active {
+            let snap = self.active_server_snapshot();
+            let active_cfg = self.config.active_server();
+            let port = snap
+                .map(|s| s.port)
+                .filter(|&p| p > 0)
+                .unwrap_or_else(|| self.active_server_port());
+            let password = snap
+                .map(|s| s.effective_password.clone())
+                .unwrap_or_else(|| {
+                    active_cfg
+                        .map(|s| s.config.password.clone())
+                        .unwrap_or_default()
+                });
+            let edition = snap
                 .map(|s| s.edition)
-                .or_else(|| self.config.active_server().map(|s| s.edition))
-                .unwrap_or(self.config.active_edition)
-        } else if let Some(ext) = ext_server {
-            ext.edition
+                .or_else(|| active_cfg.map(|s| s.edition))
+                .unwrap_or(self.config.active_edition);
+            let pack = snap
+                .map(|s| s.effective_modpack.trim().to_string())
+                .unwrap_or_else(|| {
+                    active_cfg
+                        .map(|s| s.config.modpack.trim().to_string())
+                        .unwrap_or_default()
+                });
+            (port, password, edition, pack)
         } else {
-            self.config
-                .active_server()
-                .map(|s| s.edition)
-                .unwrap_or(self.config.active_edition)
-        };
-        let target_port = if srv_active {
-            self.active_server_port()
-        } else {
-            ext_server
+            let ext_server = self.active_external_server();
+            let matched_profile = ext_server
+                .and_then(|ext| ext.profile_id.as_deref())
+                .and_then(|id| self.config.servers.iter().find(|s| s.id == id))
+                .or_else(|| self.config.active_server());
+            let port = ext_server
                 .and_then(|ext| ext.port)
                 .filter(|&p| p > 0)
-                .unwrap_or_else(|| self.active_server_port())
+                .unwrap_or_else(|| self.active_server_port());
+            let password = matched_profile
+                .map(|s| s.config.password.clone())
+                .unwrap_or_default();
+            let edition = ext_server
+                .map(|ext| ext.edition)
+                .or_else(|| matched_profile.map(|s| s.edition))
+                .unwrap_or(self.config.active_edition);
+            let pack = matched_profile
+                .map(|s| s.config.modpack.trim().to_string())
+                .unwrap_or_default();
+            (port, password, edition, pack)
         };
+
+        if server_edition == GameEdition::TModLoader {
+            if !server_pack.is_empty() && !is_existing_valid_modpack(&self.paths, &server_pack) {
+                self.notify_err(format!(
+                    "ModPack '{server_pack}' của server không tồn tại hoặc bị hỏng."
+                ));
+                return;
+            }
+            if self.config.active_modpack != server_pack {
+                self.config.active_modpack = server_pack;
+            }
+        }
         let edition_changed = self.config.active_edition != server_edition;
         self.config.active_edition = server_edition;
         if edition_changed {
             self.refresh_worlds_and_backups();
         }
-        self.config.quick_join_host = "127.0.0.1".to_string();
-        self.config.quick_join_port = target_port;
-        self.quick_join_port_input = target_port.to_string();
-        self.config.quick_join_password = server_password;
         self.save_config();
-        self.launch_selected_game(None);
+        self.launch_selected_game(Some(("127.0.0.1".to_string(), target_port, server_password)));
+    }
+
+    pub fn join_saved_server(&mut self, idx: usize) {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt chạy, không thể mở Game lúc này.");
+            return;
+        }
+        if self.active_game.is_some() {
+            self.notify_err("Game đang chạy. Hãy đóng phiên hiện tại trước khi mở mới.");
+            return;
+        }
+        if let Some(ext) = &self.external_game {
+            let msg = format!(
+                "{} đang mở sẵn (PID {}). Hãy kết nối trực tiếp trong menu Multiplayer của game hoặc nhấn 'Đóng Game' trước khi mở mới.",
+                ext.edition.label(),
+                ext.pid
+            );
+            self.notify_err(msg);
+            return;
+        }
+        let Some(srv) = self.config.saved_join_servers.get(idx).cloned() else {
+            return;
+        };
+        let mut modpack_cleared = false;
+        let pack_trimmed = srv.modpack.trim();
+        if pack_trimmed.is_empty() {
+            if !self.config.active_modpack.is_empty() {
+                self.config.active_modpack.clear();
+                modpack_cleared = true;
+            }
+        } else if srv.edition == GameEdition::TModLoader {
+            if !is_existing_valid_modpack(&self.paths, pack_trimmed) {
+                self.notify_err(format!(
+                    "ModPack '{pack_trimmed}' của server đã lưu không còn tồn tại trên máy."
+                ));
+                return;
+            }
+            self.config.active_modpack = pack_trimmed.to_string();
+        }
+        let edition_changed = self.config.active_edition != srv.edition;
+        self.config.active_edition = srv.edition;
+        if edition_changed {
+            self.refresh_worlds_and_backups();
+        }
+        if modpack_cleared {
+            self.refresh_mods_and_packs();
+        }
+        self.save_config();
+        self.launch_selected_game(Some((srv.host, srv.port, srv.password)));
+    }
+
+    pub fn load_saved_join_server_to_form(&mut self, idx: usize) {
+        let Some((edition_changed, missing_pack)) = apply_saved_join_server_to_config(
+            &self.paths,
+            &mut self.config,
+            &mut self.quick_join_port_input,
+            idx,
+        ) else {
+            return;
+        };
+        if edition_changed {
+            self.refresh_worlds_and_backups();
+        }
+        self.save_config();
+        if let Some(missing) = missing_pack {
+            self.notify_err(format!(
+                "Đã nạp thông tin server vào form, nhưng ModPack '{missing}' không còn tồn tại."
+            ));
+        } else {
+            self.notify_ok("Đã nạp thông tin server vào form.");
+        }
     }
 
     pub fn probe_port(&mut self) {
@@ -2666,31 +3674,160 @@ impl AppState {
         });
     }
 
+    pub fn is_steamcmd_busy(&self) -> bool {
+        self.steamcmd_busy || self.workshop_busy || self.modpack_sync_busy
+    }
+
+    fn sync_active_modpack_if_needed(&mut self, deleted_mod: Option<&str>) {
+        let active_pack = self.config.active_modpack.trim();
+        if active_pack.is_empty() || !is_safe_single_dir_component(active_pack) {
+            return;
+        }
+        let _ = sync_active_modpack_from_mods_dir(
+            &self.paths.tml_modpacks_dir(),
+            &self.paths.tml_mods_dir(),
+            active_pack,
+            deleted_mod,
+        );
+    }
+
+    fn is_tml_client_running(&self) -> bool {
+        self.is_edition_client_running(GameEdition::TModLoader)
+    }
+
+    fn has_active_tml_server_matching_pack(&self, pack_matches: impl Fn(&str) -> bool) -> bool {
+        let supervised_match = self.server_supervisors.iter().any(|(id, sup)| {
+            if !sup.is_active() {
+                return false;
+            }
+            if let Some(snap) = self.server_snapshots.get(id) {
+                return snap.edition == GameEdition::TModLoader
+                    && pack_matches(snap.effective_modpack.trim());
+            }
+            self.config.servers.iter().find(|p| p.id == *id).is_some_and(
+                |p| p.edition == GameEdition::TModLoader && pack_matches(p.config.modpack.trim()),
+            )
+        });
+        if supervised_match {
+            return true;
+        }
+        self.external_servers.iter().any(|ext| {
+            if ext.edition != GameEdition::TModLoader {
+                return false;
+            }
+            let ext_pack = ext
+                .profile_id
+                .as_deref()
+                .and_then(|pid| self.config.servers.iter().find(|p| p.id == pid))
+                .map(|p| p.config.modpack.trim())
+                .unwrap_or("");
+            pack_matches(ext_pack)
+        })
+    }
+
+    pub fn is_tml_mods_locked(&self) -> bool {
+        if self.is_tml_client_running() {
+            return true;
+        }
+        let active_pack = self.config.active_modpack.trim();
+        self.has_active_tml_server_matching_pack(|srv_pack| {
+            srv_pack.is_empty() || (!active_pack.is_empty() && srv_pack == active_pack)
+        })
+    }
+
+    pub fn is_tml_mods_locked_by_runtime(&mut self) -> bool {
+        self.scan_external_servers();
+        self.is_tml_mods_locked()
+    }
+
     pub fn import_mods_dialog(&mut self) {
-        if let Some(files) = rfd::FileDialog::new()
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi nhập mod.",
+            );
+            return;
+        }
+        let Some(files) = rfd::FileDialog::new()
             .add_filter("tModLoader Mods", &["tmod", "zip"])
             .pick_files()
-        {
-            match import_local_mod_files(&files, &self.paths, true) {
-                Ok(imported) => {
-                    self.refresh_mods_and_packs();
-                    self.notify_ok(format!("Đã nhập và bật {} mod.", imported.len()));
+        else {
+            return;
+        };
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi nhập mod.",
+            );
+            return;
+        }
+        match import_local_mod_files(&files, &self.paths, true) {
+            Ok(imported) => {
+                for meta in &imported {
+                    self.clear_stale_mod_provenance(&meta.internal_name);
                 }
-                Err(e) => self.notify_err(e.to_string()),
+                self.sync_active_modpack_if_needed(None);
+                self.refresh_mods_and_packs();
+                self.notify_ok(format!("Đã nhập và bật {} mod.", imported.len()));
             }
+            Err(e) => self.notify_err(e.to_string()),
         }
     }
 
     pub fn toggle_mod(&mut self, internal_name: &str, enable: bool) {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi bật/tắt mod.",
+            );
+            return;
+        }
         match set_mod_enabled(&self.paths, internal_name, enable) {
-            Ok(_) => self.refresh_mods_and_packs(),
+            Ok(_) => {
+                self.sync_active_modpack_if_needed(None);
+                self.refresh_mods_and_packs();
+            }
+            Err(e) => self.notify_err(e.to_string()),
+        }
+    }
+
+    pub fn enable_mod_with_deps(&mut self, internal_name: &str) {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi bật mod.",
+            );
+            return;
+        }
+        match enable_mod_and_installed_deps(&self.paths, internal_name) {
+            Ok(newly_enabled) => {
+                self.sync_active_modpack_if_needed(None);
+                self.refresh_mods_and_packs();
+                if newly_enabled.len() > 1 {
+                    self.notify_ok(format!(
+                        "Đã bật {} mod (bao gồm phụ thuộc): {}.",
+                        newly_enabled.len(),
+                        newly_enabled.join(", ")
+                    ));
+                } else if newly_enabled.len() == 1 {
+                    self.notify_ok(format!("Đã bật mod {}.", newly_enabled[0]));
+                } else {
+                    self.notify_ok(format!(
+                        "Mod {internal_name} và các phụ thuộc đã được bật sẵn."
+                    ));
+                }
+            }
             Err(e) => self.notify_err(e.to_string()),
         }
     }
 
     pub fn delete_mod(&mut self, mod_path: &std::path::Path, internal_name: &str) {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi xóa mod.",
+            );
+            return;
+        }
         match delete_installed_mod(&self.paths, mod_path, internal_name) {
             Ok(()) => {
+                self.clear_stale_mod_provenance(internal_name);
+                self.sync_active_modpack_if_needed(Some(internal_name));
                 self.refresh_mods_and_packs();
                 self.notify_ok(format!("Đã xóa mod {internal_name}."));
             }
@@ -2698,11 +3835,36 @@ impl AppState {
         }
     }
 
+    pub fn deactivate_modpack(&mut self) {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi tắt Gói Mod.",
+            );
+            return;
+        }
+        self.config.active_modpack.clear();
+        self.save_config();
+        self.refresh_mods_and_packs();
+        self.notify_ok("Đã tắt chế độ Gói Mod cố định.");
+    }
+
     pub fn create_new_modpack(&mut self) {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi tạo ModPack.",
+            );
+            return;
+        }
         let _ = self.create_modpack_internal();
     }
 
     fn create_modpack_internal(&mut self) -> Option<ModPackInfo> {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi tạo ModPack.",
+            );
+            return None;
+        }
         let enabled = self.enabled_mod_names();
         let metas: Vec<TmodMetadata> = self
             .installed_mods
@@ -2740,6 +3902,16 @@ impl AppState {
     }
 
     pub fn activate_selected_modpack(&mut self, pack: &ModPackInfo) {
+        if self.is_tml_mods_locked_by_runtime()
+            || self.has_active_tml_server_matching_pack(|srv_pack| {
+                srv_pack.is_empty() || srv_pack == pack.name
+            })
+        {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi chuyển Gói Mod.",
+            );
+            return;
+        }
         let metas: Vec<TmodMetadata> = self
             .installed_mods
             .iter()
@@ -2768,10 +3940,31 @@ impl AppState {
     }
 
     pub fn remove_modpack(&mut self, pack: &ModPackInfo) {
+        self.scan_external_servers();
+        if self.is_tml_client_running() && self.config.active_modpack.trim() == pack.name {
+            self.notify_err("Không thể xóa Gói Mod đang được tModLoader sử dụng. Hãy đóng game trước.");
+            return;
+        }
+        if self.has_active_tml_server_matching_pack(|srv_pack| srv_pack == pack.name) {
+            self.notify_err(
+                "Không thể xóa Gói Mod đang được Server tModLoader sử dụng. Hãy tắt server trước.",
+            );
+            return;
+        }
         match delete_modpack(&pack.path) {
             Ok(()) => {
+                let mut config_changed = false;
                 if self.config.active_modpack == pack.name {
                     self.config.active_modpack.clear();
+                    config_changed = true;
+                }
+                for srv in &mut self.config.servers {
+                    if srv.config.modpack.trim() == pack.name {
+                        srv.config.modpack.clear();
+                        config_changed = true;
+                    }
+                }
+                if config_changed {
                     self.save_config();
                 }
                 self.refresh_mods_and_packs();
@@ -2819,7 +4012,14 @@ impl AppState {
     }
 
     pub fn sync_modpack_from_key(&mut self) {
-        if self.modpack_sync_busy {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi đồng bộ ModPack.",
+            );
+            return;
+        }
+        if self.is_steamcmd_busy() {
+            self.notify_err("Đang có tác vụ SteamCMD/Workshop/ModPack khác chạy, vui lòng chờ xong.");
             return;
         }
         let payload = match decode_modpack_share_key(&self.share_key_input) {
@@ -2829,6 +4029,15 @@ impl AppState {
                 return;
             }
         };
+        let desired_pack_name = self.share_import_pack_name.trim().to_string();
+        if !desired_pack_name.is_empty()
+            && self.has_active_tml_server_matching_pack(|srv_pack| srv_pack == desired_pack_name)
+        {
+            self.notify_err(
+                "Vui lòng tắt Server tModLoader đang dùng ModPack này trước khi đồng bộ.",
+            );
+            return;
+        }
 
         self.modpack_sync_busy = true;
         self.modpack_sync_report = None;
@@ -2851,8 +4060,8 @@ impl AppState {
             });
         let paths = self.paths.clone();
         let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+        let token = non_empty_opt(&self.config.github_release_token).map(ToString::to_string);
         let active_modpack = self.config.active_modpack.clone();
-        let desired_pack_name = self.share_import_pack_name.trim().to_string();
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         let prog_tx = tx.clone();
@@ -2865,6 +4074,7 @@ impl AppState {
                 &paths,
                 steamcmd_exe.as_deref(),
                 proxy.as_deref(),
+                token.as_deref(),
                 &active_modpack,
                 &payload,
                 &desired_pack_name,
@@ -3113,12 +4323,13 @@ impl AppState {
         }
         let repo = repo_raw.trim().to_string();
         let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
+        let token = non_empty_opt(&self.config.github_release_token).map(ToString::to_string);
         self.github_repo_input = repo.clone();
         self.github_busy = true;
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn(async move {
-            let result = fetch_github_latest_tmod(&repo, proxy.as_deref())
+            let result = fetch_github_latest_tmod(&repo, proxy.as_deref(), token.as_deref())
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::GithubFetched { repo, result });
@@ -3132,6 +4343,12 @@ impl AppState {
         suggested_name: Option<String>,
         github_repo: Option<String>,
     ) {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi tải mod.",
+            );
+            return;
+        }
         if self.github_busy {
             return;
         }
@@ -3228,6 +4445,11 @@ impl AppState {
         self.download_workshop_item(&id, None);
     }
 
+    pub fn is_workshop_id_installed(&self, workshop_id: &str) -> bool {
+        let trimmed = workshop_id.trim();
+        !trimmed.is_empty() && self.workshop_install_status(trimmed, 0).is_some()
+    }
+
     pub fn download_workshop_item(
         &mut self,
         workshop_id: &str,
@@ -3238,55 +4460,203 @@ impl AppState {
             self.notify_err("Workshop ID không hợp lệ.");
             return;
         }
+        let seed_children = details
+            .as_ref()
+            .map(|d| d.child_ids.clone())
+            .unwrap_or_default();
+        self.start_workshop_download_queue(id, seed_children, details);
+    }
+
+    pub fn download_workshop_with_missing_deps(
+        &mut self,
+        workshop_id: String,
+        child_ids: Vec<String>,
+        primary_details: Option<WorkshopItemDetails>,
+    ) {
+        let primary_id = workshop_id.trim().to_string();
+        if primary_id.is_empty() || !primary_id.chars().all(|c| c.is_ascii_digit()) {
+            self.notify_err("Workshop ID không hợp lệ.");
+            return;
+        }
+        self.start_workshop_download_queue(primary_id, child_ids, primary_details);
+    }
+
+    fn collect_installed_workshop_ids(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for rec in &self.workshop_records {
+            let wid = rec.published_file_id.trim();
+            if !wid.is_empty() && self.is_workshop_id_installed(wid) {
+                out.insert(wid.to_string());
+            }
+        }
+        for staged in &self.staged_workshop_mods {
+            let wid = staged.workshop_id.trim();
+            if !wid.is_empty() && self.is_workshop_id_installed(wid) {
+                out.insert(wid.to_string());
+            }
+        }
+        out
+    }
+
+    fn start_workshop_download_queue(
+        &mut self,
+        primary_id: String,
+        seed_child_ids: Vec<String>,
+        primary_details: Option<WorkshopItemDetails>,
+    ) {
+        if self.is_tml_mods_locked_by_runtime() {
+            self.notify_err(
+                "Vui lòng đóng tModLoader và tắt Server đang dùng bộ Mod này trước khi tải mod Workshop.",
+            );
+            return;
+        }
         let Some(steamcmd_exe) = self.env.steamcmd_path.clone() else {
             self.notify_err("Chưa có SteamCMD. Nhấn 'Cài SteamCMD tự động' ở trên.");
             return;
         };
-        if self.workshop_busy {
-            self.notify_err("Đang xử lý tác vụ Workshop khác, vui lòng chờ xong.");
+        if self.is_steamcmd_busy() {
+            self.notify_err("Đang xử lý tác vụ SteamCMD/Workshop/ModPack khác, vui lòng chờ xong.");
             return;
         }
 
-        let resolved_details = details.or_else(|| {
-            self.workshop_details
-                .as_ref()
-                .filter(|d| d.published_file_id == id)
-                .cloned()
-                .or_else(|| {
-                    self.workshop_results
-                        .iter()
-                        .find(|d| d.published_file_id == id)
-                        .cloned()
-                })
-        });
+        let mut preloaded_full: HashMap<String, WorkshopItemDetails> = HashMap::new();
+        let mut fallback_details: HashMap<String, WorkshopItemDetails> = HashMap::new();
+        for item in &self.workshop_results {
+            fallback_details.insert(item.published_file_id.clone(), item.clone());
+        }
+        if let Some(ref d) = self.workshop_details {
+            preloaded_full.insert(d.published_file_id.clone(), d.clone());
+            fallback_details.insert(d.published_file_id.clone(), d.clone());
+        }
+        if let Some(d) = primary_details {
+            let wid = d.published_file_id.clone();
+            if !d.child_ids.is_empty() || !seed_child_ids.is_empty() {
+                preloaded_full.insert(wid.clone(), d.clone());
+            }
+            fallback_details.insert(wid, d);
+        }
+
+        let installed_wids = self.collect_installed_workshop_ids();
 
         self.workshop_busy = true;
-        self.workshop_downloading_id = Some(id.clone());
+        self.workshop_downloading_id = Some(primary_id.clone());
         self.workshop_logs.clear();
 
         let paths = self.paths.clone();
+        let proxy = non_empty_opt(&self.config.proxy_url).map(ToString::to_string);
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
-        let log_tx = tx.clone();
-        let log_wake = wake.clone();
 
         self.rt.spawn(async move {
-            let res = download_workshop_mod_via_steamcmd(
-                &steamcmd_exe,
-                &paths,
-                &id,
-                true,
-                move |line| {
-                    let _ = log_tx.send(AppEvent::WorkshopLog(line));
-                    log_wake.wake();
-                },
-            )
-            .await
-            .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::WorkshopFinished {
-                workshop_id: id,
-                details: resolved_details,
-                result: res,
+            let _ = tx.send(AppEvent::WorkshopLog(format!(
+                "=== Kiểm tra mod phụ thuộc cho Workshop ID {primary_id} ==="
+            )));
+            wake.wake();
+
+            let mut bfs_queue: VecDeque<String> = VecDeque::new();
+            let mut discovered: HashSet<String> = HashSet::new();
+            let mut details_map: HashMap<String, WorkshopItemDetails> = HashMap::new();
+            let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+            let mut hit_cap = false;
+
+            discovered.insert(primary_id.clone());
+            bfs_queue.push_back(primary_id.clone());
+
+            while let Some(curr) = bfs_queue.pop_front() {
+                let details_opt = match preloaded_full.get(&curr).cloned() {
+                    Some(d) => Some(d),
+                    None => fetch_workshop_details(&curr, proxy.as_deref())
+                        .await
+                        .ok()
+                        .or_else(|| fallback_details.get(&curr).cloned()),
+                };
+
+                let mut children: Vec<String> = Vec::new();
+                if let Some(details) = details_opt {
+                    for raw_cid in &details.child_ids {
+                        let cid = raw_cid.trim().to_string();
+                        if is_valid_workshop_child_id(&curr, &cid, &children) {
+                            children.push(cid);
+                        }
+                    }
+                    details_map.insert(curr.clone(), details);
+                }
+                if curr == primary_id {
+                    for raw_cid in &seed_child_ids {
+                        let cid = raw_cid.trim().to_string();
+                        if is_valid_workshop_child_id(&curr, &cid, &children) {
+                            children.push(cid);
+                        }
+                    }
+                }
+
+                let mut next_children = Vec::new();
+                for cid in children {
+                    if discovered.contains(&cid) {
+                        next_children.push(cid);
+                    } else if discovered.len() < MAX_WORKSHOP_QUEUE {
+                        discovered.insert(cid.clone());
+                        bfs_queue.push_back(cid.clone());
+                        next_children.push(cid);
+                    } else {
+                        hit_cap = true;
+                    }
+                }
+                adj.insert(curr, next_children);
+            }
+
+            if hit_cap {
+                let _ = tx.send(AppEvent::WorkshopLog(format!(
+                    "Đã giới hạn hàng đợi tối đa {MAX_WORKSHOP_QUEUE} mục Workshop để tránh vòng phụ thuộc quá lớn."
+                )));
+                wake.wake();
+            }
+
+            let order = resolve_workshop_install_order(&primary_id, &adj, &installed_wids);
+            let total = order.len();
+            let mut installed = Vec::new();
+            let mut error = None;
+
+            for (idx, wid) in order.into_iter().enumerate() {
+                if total > 1 {
+                    let _ = tx.send(AppEvent::WorkshopLog(format!(
+                        "=== Tải Workshop ID {wid} ({}/{total}) ===",
+                        idx + 1
+                    )));
+                    wake.wake();
+                }
+                let details_opt = details_map.get(&wid).cloned();
+                let log_tx = tx.clone();
+                let log_wake = wake.clone();
+                match download_workshop_mod_via_steamcmd(
+                    &steamcmd_exe,
+                    &paths,
+                    &wid,
+                    proxy.as_deref(),
+                    true,
+                    move |line| {
+                        let _ = log_tx.send(AppEvent::WorkshopLog(line));
+                        log_wake.wake();
+                    },
+                )
+                .await
+                {
+                    Ok(mods) => installed.push((wid, details_opt, mods)),
+                    Err(e) => {
+                        error = Some(if total > 1 {
+                            format!("Lỗi tải Workshop ID {wid}: {e}")
+                        } else {
+                            e.to_string()
+                        });
+                        break;
+                    }
+                }
+            }
+
+            let _ = tx.send(AppEvent::WorkshopBatchFinished {
+                primary_id,
+                installed,
+                error,
             });
             wake.wake();
         });
@@ -3375,7 +4745,12 @@ impl AppState {
     }
 
     pub fn install_steamcmd(&mut self) {
-        if self.steamcmd_busy {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt khác đang chạy, vui lòng chờ.");
+            return;
+        }
+        if self.is_steamcmd_busy() {
+            self.notify_err("Đang có tác vụ SteamCMD/Workshop/ModPack khác chạy, vui lòng chờ xong.");
             return;
         }
         self.steamcmd_busy = true;
@@ -3411,8 +4786,49 @@ impl AppState {
         });
     }
 
-    pub fn backup_world_file(&mut self, world: &WorldMetadata) {
-        match backup_world(&world.file_path, &self.paths.backups_dir) {
+    fn is_world_in_use_by_active_server(&self, world_path: &Path) -> bool {
+        let target_key = normalize_world_path_key(world_path);
+        let sup_match = self.server_supervisors.iter().any(|(id, sup)| {
+            if !sup.is_active() {
+                return false;
+            }
+            let snap = self.server_snapshots.get(id);
+            let snap_world = snap
+                .map(|s| s.effective_world.trim())
+                .filter(|s| !s.is_empty());
+            if let Some(profile) = self.config.servers.iter().find(|p| p.id == *id) {
+                resolve_profile_world_path_with_override(&self.paths, profile, snap_world)
+                    .is_some_and(|p| normalize_world_path_key(&p) == target_key)
+            } else {
+                snap.and_then(|s| snap_world.map(|w| (s.edition, w)))
+                    .is_some_and(|(edition, world_str)| {
+                        let p = PathBuf::from(world_str);
+                        let resolved = if p.is_absolute() {
+                            p
+                        } else {
+                            self.worlds_dir_for_edition(edition).join(p)
+                        };
+                        normalize_world_path_key(&resolved) == target_key
+                    })
+            }
+        });
+        if sup_match {
+            return true;
+        }
+        self.external_servers.iter().any(|ext| {
+            ext.profile_id.as_deref().is_some_and(|pid| {
+                self.config
+                    .servers
+                    .iter()
+                    .find(|p| p.id == pid)
+                    .and_then(|p| resolve_profile_world_path(&self.paths, p))
+                    .is_some_and(|p| normalize_world_path_key(&p) == target_key)
+            })
+        })
+    }
+
+    fn backup_world_path(&mut self, world_path: &Path) {
+        match backup_world(world_path, &self.paths.backups_dir) {
             Ok(info) => {
                 self.refresh_worlds_and_backups();
                 self.notify_ok(format!("Đã sao lưu thế giới vào {}", info.file_name));
@@ -3421,11 +4837,96 @@ impl AppState {
         }
     }
 
-    pub fn restore_backup(&mut self, backup: &WorldBackupInfo) {
-        let target_dir = match self.config.active_edition {
-            GameEdition::Vanilla => self.paths.vanilla_worlds_dir(),
-            GameEdition::TModLoader => self.paths.tml_worlds_dir(),
+    pub fn backup_world_file(&mut self, world: &WorldMetadata) {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt chạy, không thể sao lưu lúc này.");
+            return;
+        }
+        self.scan_external_servers();
+        if self.running_game_edition() == Some(self.config.active_edition)
+            || self.is_world_in_use_by_active_server(&world.file_path)
+        {
+            self.notify_err(
+                "Vui lòng đóng Game và tắt Server đang dùng thế giới này trước khi sao lưu.",
+            );
+            return;
+        }
+        self.backup_world_path(&world.file_path);
+    }
+
+    pub fn backup_active_server_world(&mut self) {
+        if self.install_busy {
+            self.notify_err("Đang có tiến trình cài đặt chạy, không thể sao lưu lúc này.");
+            return;
+        }
+        self.scan_external_servers();
+        let Some(profile) = self.config.active_server().cloned() else {
+            self.notify_err("Chưa có cấu hình server nào.");
+            return;
         };
+        let sup_active = self
+            .server_supervisors
+            .get(&profile.id)
+            .is_some_and(|s| s.is_active());
+        let snap_world = if sup_active {
+            self.server_snapshots
+                .get(&profile.id)
+                .map(|s| s.effective_world.as_str())
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+        let Some(world_path) =
+            resolve_profile_world_path_with_override(&self.paths, &profile, snap_world)
+        else {
+            self.notify_err("Hồ sơ server chưa cấu hình file thế giới (.wld).");
+            return;
+        };
+        if self.is_profile_running(&profile.id) {
+            self.notify_err(
+                "Vui lòng tắt Server đang chạy trước khi sao lưu thế giới để tránh hỏng dữ liệu.",
+            );
+            return;
+        }
+        if self.running_game_edition() == Some(profile.edition)
+            || self.is_world_in_use_by_active_server(&world_path)
+        {
+            self.notify_err(
+                "Vui lòng đóng Game và tắt Server đang dùng thế giới này trước khi sao lưu.",
+            );
+            return;
+        }
+        if !world_path.is_file() {
+            self.notify_err(format!(
+                "File thế giới chưa tồn tại ({}). Hãy khởi chạy server để tạo thế giới hoặc chọn thế giới có sẵn.",
+                world_path.display()
+            ));
+            return;
+        }
+        self.backup_world_path(&world_path);
+    }
+
+    pub fn can_restore_world_backup(&self, bak: &WorldBackupInfo) -> Result<(), &'static str> {
+        let active_ed = self.config.active_edition;
+        let running_ed = self
+            .is_edition_client_running(active_ed)
+            .then_some(active_ed);
+        check_restore_world_backup_flags(
+            self.install_busy,
+            active_ed,
+            running_ed,
+            self.has_running_server_for_edition(active_ed),
+            bak.detected_edition,
+        )
+    }
+
+    pub fn restore_backup(&mut self, backup: &WorldBackupInfo) {
+        self.scan_external_servers();
+        if let Err(msg) = self.can_restore_world_backup(backup) {
+            self.notify_err(msg);
+            return;
+        }
+        let target_dir = self.worlds_dir_for_edition(self.config.active_edition);
         match restore_world_backup(&backup.file_path, &target_dir) {
             Ok(files) => {
                 self.refresh_worlds_and_backups();
@@ -3446,15 +4947,12 @@ impl AppState {
         } else {
             name.to_string()
         };
-        let id = format!(
-            "srv-{}",
-            uuid_short()
-        );
+        let id = format!("srv-{}", uuid_short());
         let edition = self.new_profile_edition;
-        let worlds_dir = match edition {
-            GameEdition::Vanilla => self.paths.vanilla_worlds_dir(),
-            GameEdition::TModLoader => self.paths.tml_worlds_dir(),
-        };
+        let worlds_dir = self.worlds_dir_for_edition(edition);
+        let world_stem =
+            generate_unique_profile_world_stem(&self.paths, &worlds_dir, &self.config.servers);
+        let port = next_available_server_port(&self.config.servers);
         let profile = ServerProfile {
             id: id.clone(),
             name: final_name,
@@ -3462,12 +4960,13 @@ impl AppState {
             auto_restart: false,
             extra_args: String::new(),
             config: ServerConfigData {
+                port,
                 worldpath: worlds_dir.to_string_lossy().into_owned(),
                 world: worlds_dir
-                    .join("NewWorld.wld")
+                    .join(format!("{world_stem}.wld"))
                     .to_string_lossy()
                     .into_owned(),
-                worldname: "NewWorld".to_string(),
+                worldname: world_stem,
                 banlist: self
                     .paths
                     .servers_dir
@@ -3489,22 +4988,30 @@ impl AppState {
             self.notify_err("Cần giữ ít nhất 1 cấu hình server.");
             return;
         }
+        self.scan_external_servers();
         let id = self.config.active_server_id.clone();
-        let is_supervised_active = self
-            .server_supervisors
-            .get(&id)
-            .is_some_and(|s| s.is_active());
-        let is_external_active = self.external_server_for_profile(&id).is_some();
-        if is_supervised_active || is_external_active {
-            self.notify_err("Vui lòng tắt server đang chạy của hồ sơ này trước khi xóa.");
+        if self.is_profile_busy_or_direct_hosted(&id) {
+            self.notify_err("Vui lòng tắt server hoặc Port mạng đang chạy của hồ sơ này trước khi xóa.");
             return;
         }
-        self.server_supervisors.remove(&id);
+        if let Some(sup) = self.server_supervisors.remove(&id) {
+            if sup.is_active() {
+                sup.request_graceful_stop();
+            }
+        }
         self.server_snapshots.remove(&id);
         self.external_log_summaries.remove(&id);
         self.cleared_external_log_pids.remove(&id);
-        if self.pending_auto_direct_host_profile_id.as_deref() == Some(id.as_str()) {
-            self.pending_auto_direct_host_profile_id = None;
+        self.stop_direct_host_for_profile(&id);
+        self.pending_auto_direct_host_ports.remove(&id);
+        self.direct_bind_ips.remove(&id);
+        if is_safe_single_dir_component(&id) {
+            let server_profile_dir = self.paths.servers_dir.join(&id);
+            if server_profile_dir.parent() == Some(self.paths.servers_dir.as_path())
+                && server_profile_dir.is_dir()
+            {
+                let _ = std::fs::remove_dir_all(&server_profile_dir);
+            }
         }
         self.config.servers.retain(|s| s.id != id);
         let next_id = self.config.servers[0].id.clone();
@@ -3543,6 +5050,11 @@ impl AppState {
         } else {
             self.new_join_name.trim().to_string()
         };
+        let modpack = if self.config.active_edition == GameEdition::TModLoader {
+            self.config.active_modpack.trim().to_string()
+        } else {
+            String::new()
+        };
         if let Some(existing) = self.config.saved_join_servers.iter_mut().find(|s| {
             s.host.eq_ignore_ascii_case(&host)
                 && s.port == final_port
@@ -3550,6 +5062,7 @@ impl AppState {
         }) {
             existing.name = name;
             existing.password = self.config.quick_join_password.clone();
+            existing.modpack = modpack;
         } else {
             self.config.saved_join_servers.push(SavedJoinServer {
                 name,
@@ -3557,6 +5070,7 @@ impl AppState {
                 port: final_port,
                 password: self.config.quick_join_password.clone(),
                 edition: self.config.active_edition,
+                modpack,
             });
         }
         self.new_join_name.clear();
@@ -3566,9 +5080,19 @@ impl AppState {
 
     pub fn shutdown_all(&mut self) {
         self.save_config();
-        self.pending_auto_direct_host_profile_id = None;
+        self.pending_auto_direct_host_ports.clear();
         self.stop_client_ipv6_bridge();
-        self.stop_direct_host();
+
+        let handles: Vec<DirectPortHostHandle> =
+            self.direct_host_handles.drain().map(|(_, h)| h).collect();
+        for handle in &handles {
+            handle.stop();
+        }
+        let upnp_deadline = Instant::now() + Duration::from_millis(800);
+        for handle in handles {
+            let remaining = upnp_deadline.saturating_duration_since(Instant::now());
+            handle.stop_and_wait(remaining);
+        }
 
         let active_sups: Vec<ServerSupervisor> = self
             .server_supervisors
@@ -3580,7 +5104,7 @@ impl AppState {
             for sup in &active_sups {
                 sup.request_graceful_stop();
             }
-            let deadline = Instant::now() + Duration::from_secs(6);
+            let deadline = Instant::now() + Duration::from_secs(12);
             while Instant::now() < deadline && active_sups.iter().any(|sup| sup.is_active()) {
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -3592,23 +5116,6 @@ impl AppState {
             let kill_deadline = Instant::now() + Duration::from_millis(600);
             while Instant::now() < kill_deadline && active_sups.iter().any(|sup| sup.is_active()) {
                 std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        if self.sys.is_none() {
-            self.sys = System::new().ok();
-        }
-        let mut targets = self.external_servers.clone();
-        if let Some(sys) = self.sys.as_mut() {
-            for ext in detect_existing_server_processes(sys, &self.paths) {
-                if !targets.iter().any(|existing| existing.pid == ext.pid) {
-                    targets.push(ext);
-                }
-            }
-            for ext in targets {
-                if ext.profile_id.is_some() {
-                    let _ = terminate_process_by_pid(sys, ext.pid);
-                }
             }
         }
     }
@@ -3763,9 +5270,599 @@ fn uuid_short() -> String {
     format!("{:x}", now & 0xFFFF_FFFF)
 }
 
+const MAX_WORKSHOP_QUEUE: usize = 32;
+
+fn is_valid_workshop_child_id(parent: &str, cid: &str, existing: &[String]) -> bool {
+    !cid.is_empty()
+        && cid.chars().all(|c| c.is_ascii_digit())
+        && cid != parent
+        && !existing.iter().any(|e| e == cid)
+}
+
+fn collect_workshop_postorder(
+    node: &str,
+    adj: &HashMap<String, Vec<String>>,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    postorder: &mut Vec<String>,
+) {
+    if visited.contains(node) || !visiting.insert(node.to_string()) {
+        return;
+    }
+    if let Some(children) = adj.get(node) {
+        for child in children {
+            collect_workshop_postorder(child, adj, visiting, visited, postorder);
+        }
+    }
+    visiting.remove(node);
+    visited.insert(node.to_string());
+    postorder.push(node.to_string());
+}
+
+fn resolve_workshop_install_order(
+    primary_id: &str,
+    adj: &HashMap<String, Vec<String>>,
+    installed_wids: &HashSet<String>,
+) -> Vec<String> {
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut postorder = Vec::new();
+    collect_workshop_postorder(primary_id, adj, &mut visiting, &mut visited, &mut postorder);
+    postorder
+        .into_iter()
+        .filter(|wid| wid == primary_id || !installed_wids.contains(wid))
+        .collect()
+}
+
+fn format_close_confirm_message(
+    has_hosted_server: bool,
+    has_direct_host: bool,
+    has_upnp: bool,
+    has_client_bridge: bool,
+) -> &'static str {
+    match (
+        has_hosted_server,
+        has_direct_host,
+        has_upnp,
+        has_client_bridge,
+    ) {
+        (true, _, true, true) | (true, true, false, true) => {
+            "Server đang chạy, Port mạng / UPnP và cầu nối IPv6 của game sẽ bị đóng khi thoát Launcher."
+        }
+        (true, _, true, false) => {
+            "Server đang chạy cùng Port mạng và cổng UPnP sẽ bị tắt/gỡ khi thoát Launcher."
+        }
+        (true, true, false, false) => {
+            "Server đang chạy và Port mạng đang mở sẽ bị tắt/ngắt kết nối khi thoát Launcher."
+        }
+        (true, false, false, true) => {
+            "Server đang chạy và cầu nối IPv6 của game sẽ bị tắt/ngắt kết nối khi thoát Launcher."
+        }
+        (true, false, false, false) => {
+            "Server đang chạy sẽ được lưu và tắt khi thoát Launcher."
+        }
+        (false, _, true, true) => {
+            "Port mạng / cổng UPnP đang mở và cầu nối IPv6 của game sẽ bị đóng khi thoát Launcher."
+        }
+        (false, true, false, true) => {
+            "Port mạng đang mở và cầu nối IPv6 của game sẽ bị ngắt kết nối khi thoát Launcher."
+        }
+        (false, _, true, false) => {
+            "Port mạng và cổng UPnP đang mở sẽ bị đóng/gỡ khi thoát Launcher."
+        }
+        (false, true, false, false) => {
+            "Port mạng đang mở sẽ bị đóng và ngắt kết nối người chơi khi thoát Launcher."
+        }
+        (false, false, false, true) | (false, false, false, false) => {
+            "Game đang kết nối qua cầu nối IPv6 của Launcher — đóng sẽ ngắt kết nối server."
+        }
+    }
+}
+
+fn should_block_close_transition(
+    allow_exit: bool,
+    has_active_resources: bool,
+    confirm_modal_open: &mut bool,
+) -> (bool, bool) {
+    if allow_exit || !has_active_resources {
+        return (false, false);
+    }
+    let newly_opened = !*confirm_modal_open;
+    if newly_opened {
+        *confirm_modal_open = true;
+    }
+    (true, newly_opened)
+}
+
+fn check_install_edition_ready_flags(
+    install_busy: bool,
+    steamcmd_busy: bool,
+    running_game_ed: Option<GameEdition>,
+    vanilla_server_running: bool,
+    tml_server_running: bool,
+    target_edition: Option<GameEdition>,
+) -> Result<(), &'static str> {
+    if install_busy {
+        return Err("Đang có tiến trình cài đặt khác đang chạy, vui lòng chờ.");
+    }
+    if steamcmd_busy {
+        return Err("Đang có tác vụ SteamCMD/Workshop/ModPack khác chạy, vui lòng chờ xong.");
+    }
+    match target_edition {
+        Some(GameEdition::Vanilla) => {
+            if running_game_ed.is_some() {
+                return Err(
+                    "Vui lòng đóng Terraria và tModLoader đang chạy trước khi cài đặt/cập nhật Terraria.",
+                );
+            }
+            if vanilla_server_running || tml_server_running {
+                return Err(
+                    "Vui lòng tắt Server Terraria và tModLoader đang chạy trước khi cài đặt/cập nhật Terraria.",
+                );
+            }
+        }
+        Some(GameEdition::TModLoader) => {
+            if running_game_ed == Some(GameEdition::TModLoader) {
+                return Err("Vui lòng đóng tModLoader đang chạy trước khi cài đặt/cập nhật.");
+            }
+            if tml_server_running {
+                return Err(
+                    "Vui lòng tắt server tModLoader đang chạy trước khi cài đặt/cập nhật.",
+                );
+            }
+        }
+        None => {
+            if running_game_ed == Some(GameEdition::Vanilla) {
+                return Err("Vui lòng đóng Terraria đang chạy trước khi cài đặt XNA 4.0.");
+            }
+            if vanilla_server_running {
+                return Err("Vui lòng tắt server Terraria đang chạy trước khi cài đặt XNA 4.0.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_restore_world_backup_flags(
+    install_busy: bool,
+    active_ed: GameEdition,
+    running_game_ed: Option<GameEdition>,
+    server_running_for_active_ed: bool,
+    detected_edition: Option<GameEdition>,
+) -> Result<(), &'static str> {
+    if install_busy {
+        return Err("Đang có tiến trình cài đặt chạy, không thể khôi phục thế giới lúc này.");
+    }
+    if running_game_ed == Some(active_ed) {
+        return Err("Vui lòng đóng Game đang chạy trước khi khôi phục thế giới.");
+    }
+    if server_running_for_active_ed {
+        return Err("Vui lòng tắt Server đang chạy trước khi khôi phục thế giới.");
+    }
+    match detected_edition {
+        Some(ed) if ed == active_ed => Ok(()),
+        Some(GameEdition::Vanilla) => Err(
+            "Bản sao lưu thuộc Terraria Vanilla; hãy chuyển sang Terraria để khôi phục.",
+        ),
+        Some(GameEdition::TModLoader) => Err(
+            "Bản sao lưu thuộc tModLoader; hãy chuyển sang tModLoader để khôi phục.",
+        ),
+        None => Err("Không nhận diện được định dạng thế giới (.wld/.twld) trong bản sao lưu này."),
+    }
+}
+
+fn is_server_managed_by_direct_host(
+    profile_id: &str,
+    pending_ports: &HashMap<String, u16>,
+    direct_handles: &HashMap<String, DirectPortHostHandle>,
+) -> bool {
+    pending_ports.contains_key(profile_id)
+        || direct_handles.get(profile_id).is_some_and(|h| {
+            matches!(
+                h.current_status(),
+                DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
+            )
+        })
+}
+
+fn validate_and_normalize_manual_ban_ip(raw: &str) -> Result<IpAddr, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Nhập địa chỉ IP cần cấm.");
+    }
+    if is_loopback_ban_target(trimmed) || trimmed.to_ascii_lowercase().starts_with("localhost:") {
+        return Err(
+            "Không được phép đưa IP nội bộ (127.0.0.1 / localhost / ::1) vào danh sách chặn.",
+        );
+    }
+    let ip_str = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let parsed = ip_str
+        .parse::<IpAddr>()
+        .map_err(|_| "Địa chỉ IP không hợp lệ (chỉ nhập IPv4 hoặc IPv6, không kèm cổng).")?;
+    let norm = normalize_ip_addr(parsed);
+    if norm.is_loopback() || norm.is_unspecified() {
+        return Err(
+            "Không được phép đưa IP nội bộ (127.0.0.1 / 0.0.0.0 / ::1) vào danh sách chặn.",
+        );
+    }
+    Ok(norm)
+}
+
+fn merge_manual_ban_entry(entries: &mut Vec<BanEntry>, label: String, norm_ip: IpAddr) -> bool {
+    if entries
+        .iter()
+        .any(|e| extract_ban_ip_key(&e.ip).map(normalize_ip_addr) == Some(norm_ip))
+    {
+        return false;
+    }
+    entries.push(BanEntry {
+        label,
+        ip: norm_ip.to_string(),
+    });
+    true
+}
+
+fn remove_ban_entry_from_disk_list(disk_entries: &mut Vec<BanEntry>, target: &BanEntry) -> bool {
+    let target_norm = extract_ban_ip_key(&target.ip).map(normalize_ip_addr);
+    if let Some(pos) = disk_entries.iter().position(|e| {
+        (e.label == target.label && e.ip == target.ip)
+            || (target_norm.is_some()
+                && extract_ban_ip_key(&e.ip).map(normalize_ip_addr) == target_norm)
+    }) {
+        disk_entries.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+fn next_available_server_port(servers: &[ServerProfile]) -> u16 {
+    let used: HashSet<u16> = servers.iter().map(|s| s.config.port).collect();
+    (7777..=u16::MAX)
+        .find(|p| !used.contains(p))
+        .unwrap_or(7777)
+}
+
+fn active_direct_host_ports(
+    direct_handles: &HashMap<String, DirectPortHostHandle>,
+    exclude_profile_id: Option<&str>,
+) -> HashSet<u16> {
+    direct_handles
+        .iter()
+        .filter(|(id, _)| exclude_profile_id != Some(id.as_str()))
+        .filter_map(|(_, handle)| match handle.current_status() {
+            DirectHostStatus::Starting { host_port, .. } if host_port > 0 => Some(host_port),
+            DirectHostStatus::Running(info) if info.host_port > 0 => Some(info.host_port),
+            _ => None,
+        })
+        .collect()
+}
+
+fn resolve_active_server_port_value(
+    sup_active: bool,
+    snap_port: Option<u16>,
+    showing_external: bool,
+    ext_port: Option<u16>,
+    cfg_port: Option<u16>,
+) -> u16 {
+    let port = if sup_active {
+        snap_port.filter(|&p| p > 0).or(cfg_port)
+    } else if showing_external {
+        ext_port.filter(|&p| p > 0).or(cfg_port)
+    } else {
+        cfg_port.filter(|&p| p > 0).or(ext_port)
+    };
+    port.filter(|&p| p > 0).unwrap_or(7777)
+}
+
+fn sanitize_server_console_arg(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|&c| c != '\r' && c != '\n')
+        .collect()
+}
+
+fn collect_banlist_ips_from_entries(entries: &[BanEntry]) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    for entry in entries {
+        if is_loopback_ban_target(&entry.ip) {
+            continue;
+        }
+        if let Some(ip) = extract_ban_ip_key(&entry.ip) {
+            let canonical = normalize_ip_addr(ip);
+            if !canonical.is_loopback() && !canonical.is_unspecified() && !ips.contains(&canonical) {
+                ips.push(canonical);
+            }
+        }
+    }
+    ips
+}
+
+fn format_player_ip_with_resolver(
+    raw: &str,
+    resolve_peer: impl FnOnce(u16) -> Option<IpAddr>,
+) -> String {
+    let trimmed = raw.trim();
+    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        if sock.ip().is_loopback() {
+            if let Some(real_ip) = resolve_peer(sock.port()) {
+                return normalize_ip_addr(real_ip).to_string();
+            }
+        }
+        return trimmed.to_string();
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return normalize_ip_addr(ip).to_string();
+    }
+    raw.to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayerBanResolution {
+    RefuseLoopback,
+    BridgedRealIp(IpAddr),
+    DirectIp(IpAddr),
+    UnknownIp,
+}
+
+fn resolve_player_ban_target(
+    raw: Option<&str>,
+    resolve_peer: impl FnOnce(u16) -> Option<IpAddr>,
+) -> PlayerBanResolution {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return PlayerBanResolution::UnknownIp;
+    };
+    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        let ip = normalize_ip_addr(sock.ip());
+        if ip.is_loopback() || ip.is_unspecified() {
+            return match resolve_peer(sock.port())
+                .map(normalize_ip_addr)
+                .filter(|r| !r.is_loopback() && !r.is_unspecified())
+            {
+                Some(real_ip) => PlayerBanResolution::BridgedRealIp(real_ip),
+                None => PlayerBanResolution::RefuseLoopback,
+            };
+        }
+        return PlayerBanResolution::DirectIp(ip);
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        let ip = normalize_ip_addr(ip);
+        if ip.is_loopback() || ip.is_unspecified() {
+            return PlayerBanResolution::RefuseLoopback;
+        }
+        return PlayerBanResolution::DirectIp(ip);
+    }
+    if is_loopback_ban_target(trimmed) {
+        return PlayerBanResolution::RefuseLoopback;
+    }
+    PlayerBanResolution::UnknownIp
+}
+
+fn resolve_profile_world_path_with_override(
+    paths: &LauncherPaths,
+    profile: &ServerProfile,
+    effective_world_override: Option<&str>,
+) -> Option<PathBuf> {
+    let default_worlds_dir = match profile.edition {
+        GameEdition::Vanilla => paths.vanilla_worlds_dir(),
+        GameEdition::TModLoader => paths.tml_worlds_dir(),
+    };
+    let worlds_dir = {
+        let wp = profile.config.worldpath.trim();
+        if wp.is_empty() {
+            default_worlds_dir
+        } else {
+            let p = PathBuf::from(wp);
+            if p.is_absolute() {
+                p
+            } else {
+                default_worlds_dir.join(p)
+            }
+        }
+    };
+    if let Some(raw_override) = effective_world_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let p = PathBuf::from(raw_override);
+        return Some(if p.is_absolute() { p } else { worlds_dir.join(p) });
+    }
+    let raw_world = profile.config.world.trim();
+    if !raw_world.is_empty() {
+        let p = PathBuf::from(raw_world);
+        return Some(if p.is_absolute() { p } else { worlds_dir.join(p) });
+    }
+    let world_name = profile.config.worldname.trim();
+    if world_name.is_empty() {
+        return None;
+    }
+    Some(worlds_dir.join(format!("{world_name}.wld")))
+}
+
+fn resolve_profile_world_path(paths: &LauncherPaths, profile: &ServerProfile) -> Option<PathBuf> {
+    resolve_profile_world_path_with_override(paths, profile, None)
+}
+
+fn normalize_world_path_key(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut normalized = PathBuf::new();
+    for comp in resolved.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let s = normalized.to_string_lossy().replace('/', "\\");
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    #[cfg(windows)]
+    {
+        stripped.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        stripped.to_string()
+    }
+}
+
+fn find_conflicting_world_profile_name(
+    paths: &LauncherPaths,
+    target: &ServerProfile,
+    servers: &[ServerProfile],
+    active_supervised_ids: &HashSet<&str>,
+    server_snapshots: &HashMap<String, ServerRuntimeSnapshot>,
+    external_servers: &[DetectedExternalServer],
+) -> Option<String> {
+    let target_key =
+        resolve_profile_world_path(paths, target).map(|p| normalize_world_path_key(&p))?;
+
+    for other_id in active_supervised_ids {
+        if *other_id == target.id {
+            continue;
+        }
+        let snap = server_snapshots.get(*other_id);
+        let snap_world = snap
+            .map(|s| s.effective_world.trim())
+            .filter(|s| !s.is_empty());
+        if let Some(other) = servers.iter().find(|p| p.id == *other_id) {
+            if let Some(other_key) =
+                resolve_profile_world_path_with_override(paths, other, snap_world)
+                    .map(|p| normalize_world_path_key(&p))
+            {
+                if other_key == target_key {
+                    return Some(other.name.clone());
+                }
+            }
+        } else if let (Some(s), Some(world_str)) = (snap, snap_world) {
+            let p = PathBuf::from(world_str);
+            let resolved = if p.is_absolute() {
+                p
+            } else {
+                match s.edition {
+                    GameEdition::Vanilla => paths.vanilla_worlds_dir().join(p),
+                    GameEdition::TModLoader => paths.tml_worlds_dir().join(p),
+                }
+            };
+            if normalize_world_path_key(&resolved) == target_key {
+                return Some(s.profile_name.clone());
+            }
+        }
+    }
+
+    for ext in external_servers {
+        let Some(ext_id) = ext.profile_id.as_deref() else {
+            continue;
+        };
+        if ext_id == target.id {
+            continue;
+        }
+        if let Some(other) = servers.iter().find(|p| p.id == ext_id) {
+            if let Some(other_key) =
+                resolve_profile_world_path(paths, other).map(|p| normalize_world_path_key(&p))
+            {
+                if other_key == target_key {
+                    return Some(other.name.clone());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn generate_unique_profile_world_stem(
+    paths: &LauncherPaths,
+    worlds_dir: &Path,
+    existing_servers: &[ServerProfile],
+) -> String {
+    let used_keys: HashSet<String> = existing_servers
+        .iter()
+        .filter_map(|p| resolve_profile_world_path(paths, p))
+        .map(|p| normalize_world_path_key(&p))
+        .collect();
+
+    let first_candidate = worlds_dir.join("NewWorld.wld");
+    if !used_keys.contains(&normalize_world_path_key(&first_candidate)) && !first_candidate.exists()
+    {
+        return "NewWorld".to_string();
+    }
+
+    let mut idx = 2usize;
+    loop {
+        let stem = format!("ServerWorld_{idx}");
+        let cand = worlds_dir.join(format!("{stem}.wld"));
+        if !used_keys.contains(&normalize_world_path_key(&cand)) && !cand.exists() {
+            return stem;
+        }
+        idx += 1;
+    }
+}
+
+fn is_existing_valid_modpack(paths: &LauncherPaths, pack_name: &str) -> bool {
+    let trimmed = pack_name.trim();
+    if trimmed.is_empty() || !is_safe_single_dir_component(trimmed) {
+        return false;
+    }
+    let modpacks_dir = paths.tml_modpacks_dir();
+    let pack_dir = modpacks_dir.join(trimmed);
+    pack_dir.join("Mods").is_dir() || modpacks_dir.join(format!("{trimmed}.json")).is_file()
+}
+
+fn apply_saved_join_server_to_config(
+    paths: &LauncherPaths,
+    config: &mut LauncherConfig,
+    quick_join_port_input: &mut String,
+    idx: usize,
+) -> Option<(bool, Option<String>)> {
+    let srv = config.saved_join_servers.get(idx).cloned()?;
+    config.quick_join_host = srv.host;
+    config.quick_join_port = srv.port;
+    *quick_join_port_input = srv.port.to_string();
+    config.quick_join_password = srv.password;
+    let edition_changed = config.active_edition != srv.edition;
+    config.active_edition = srv.edition;
+
+    let mut missing_pack = None;
+    let pack_trimmed = srv.modpack.trim();
+    if pack_trimmed.is_empty() {
+        config.active_modpack.clear();
+    } else if srv.edition == GameEdition::TModLoader {
+        if is_existing_valid_modpack(paths, pack_trimmed) {
+            config.active_modpack = pack_trimmed.to_string();
+        } else {
+            missing_pack = Some(pack_trimmed.to_string());
+        }
+    }
+
+    Some((edition_changed, missing_pack))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split_host_port_input;
+    use super::{
+        apply_saved_join_server_to_config, check_install_edition_ready_flags,
+        check_restore_world_backup_flags, collect_banlist_ips_from_entries,
+        find_conflicting_world_profile_name, format_close_confirm_message,
+        format_player_ip_with_resolver, generate_unique_profile_world_stem,
+        is_safe_single_dir_component, merge_manual_ban_entry, next_available_server_port,
+        remove_ban_entry_from_disk_list, resolve_active_server_port_value,
+        resolve_player_ban_target, resolve_profile_world_path, resolve_workshop_install_order,
+        sanitize_server_console_arg, should_block_close_transition, split_host_port_input,
+        validate_and_normalize_manual_ban_ip, PlayerBanResolution,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::net::IpAddr;
+    use std::path::PathBuf;
+    use tl_core::{
+        GameEdition, LauncherConfig, LauncherPaths, SavedJoinServer, ServerConfigData,
+        ServerProfile,
+    };
+    use tl_runtime::{BanEntry, DetectedExternalServer, ServerLifecycleState, ServerRuntimeSnapshot};
 
     #[test]
     fn split_host_port_input_handles_ipv6_and_plain_hosts() {
@@ -3817,5 +5914,671 @@ mod tests {
             split_host_port_input(":50355", 7777),
             (":50355".to_string(), 7777)
         );
+    }
+
+    #[test]
+    fn collect_banlist_ips_ignores_loopback_and_normalizes_ipv6_mapped() {
+        let entries = vec![
+            BanEntry {
+                label: "Local".to_string(),
+                ip: "127.0.0.1".to_string(),
+            },
+            BanEntry {
+                label: "Local6".to_string(),
+                ip: "[::1]:7777".to_string(),
+            },
+            BanEntry {
+                label: "Host".to_string(),
+                ip: "localhost".to_string(),
+            },
+            BanEntry {
+                label: "Wildcard".to_string(),
+                ip: "0.0.0.0".to_string(),
+            },
+            BanEntry {
+                label: "Mapped".to_string(),
+                ip: "::ffff:203.0.113.9".to_string(),
+            },
+            BanEntry {
+                label: "Dup".to_string(),
+                ip: "203.0.113.9".to_string(),
+            },
+            BanEntry {
+                label: "V6".to_string(),
+                ip: "[2405:4802::1]:12345".to_string(),
+            },
+        ];
+        let ips = collect_banlist_ips_from_entries(&entries);
+        assert_eq!(
+            ips,
+            vec![
+                "203.0.113.9".parse::<IpAddr>().unwrap(),
+                "2405:4802::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_player_ip_resolves_bridged_loopback_and_preserves_direct() {
+        let bridged = format_player_ip_with_resolver("127.0.0.1:60972", |port| {
+            assert_eq!(port, 60972);
+            Some("::ffff:198.51.100.4".parse().unwrap())
+        });
+        assert_eq!(bridged, "198.51.100.4");
+
+        let unbridged = format_player_ip_with_resolver("127.0.0.1:50000", |_| None);
+        assert_eq!(unbridged, "127.0.0.1:50000");
+
+        let direct = format_player_ip_with_resolver(" 192.168.1.50:7777 ", |_| None);
+        assert_eq!(direct, "192.168.1.50:7777");
+    }
+
+    #[test]
+    fn resolve_player_ban_target_protects_localhost_and_unmasks_bridge() {
+        assert_eq!(
+            resolve_player_ban_target(Some("127.0.0.1:60972"), |port| {
+                assert_eq!(port, 60972);
+                Some("::ffff:203.0.113.5".parse().unwrap())
+            }),
+            PlayerBanResolution::BridgedRealIp("203.0.113.5".parse().unwrap())
+        );
+        assert_eq!(
+            resolve_player_ban_target(Some("127.0.0.1:60972"), |_| None),
+            PlayerBanResolution::RefuseLoopback
+        );
+        assert_eq!(
+            resolve_player_ban_target(Some("[::1]:54321"), |_| {
+                Some("127.0.0.1".parse().unwrap())
+            }),
+            PlayerBanResolution::RefuseLoopback
+        );
+        assert_eq!(
+            resolve_player_ban_target(Some("192.168.1.88:5555"), |_| None),
+            PlayerBanResolution::DirectIp("192.168.1.88".parse().unwrap())
+        );
+        assert_eq!(
+            resolve_player_ban_target(None, |_| None),
+            PlayerBanResolution::UnknownIp
+        );
+    }
+
+    #[test]
+    fn resolve_profile_world_path_handles_relative_and_fallback_worldname() {
+        let paths = LauncherPaths::resolve(None, None);
+        let mut profile = ServerProfile {
+            id: "srv-test".to_string(),
+            name: "Test".to_string(),
+            edition: GameEdition::TModLoader,
+            auto_restart: false,
+            extra_args: String::new(),
+            config: ServerConfigData {
+                world: "Custom.wld".to_string(),
+                worldpath: String::new(),
+                worldname: "Fallback".to_string(),
+                ..ServerConfigData::default()
+            },
+        };
+        assert_eq!(
+            resolve_profile_world_path(&paths, &profile),
+            Some(paths.tml_worlds_dir().join("Custom.wld"))
+        );
+
+        profile.config.world.clear();
+        profile.edition = GameEdition::Vanilla;
+        assert_eq!(
+            resolve_profile_world_path(&paths, &profile),
+            Some(paths.vanilla_worlds_dir().join("Fallback.wld"))
+        );
+
+        let abs = PathBuf::from(r"D:\Worlds\Main.wld");
+        profile.config.world = abs.to_string_lossy().into_owned();
+        assert_eq!(resolve_profile_world_path(&paths, &profile), Some(abs));
+    }
+
+    #[test]
+    fn is_safe_single_dir_component_rejects_traversal_and_special_paths() {
+        assert!(is_safe_single_dir_component("default-tml"));
+        assert!(is_safe_single_dir_component("srv-1a2b3c"));
+        assert!(!is_safe_single_dir_component(""));
+        assert!(!is_safe_single_dir_component("."));
+        assert!(!is_safe_single_dir_component(".."));
+        assert!(!is_safe_single_dir_component("../escape"));
+        assert!(!is_safe_single_dir_component("a/b"));
+        assert!(!is_safe_single_dir_component(r"a\b"));
+        assert!(!is_safe_single_dir_component("C:srv"));
+        assert!(!is_safe_single_dir_component(" srv "));
+    }
+
+    #[test]
+    fn sanitize_server_console_arg_strips_newlines() {
+        assert_eq!(
+            sanitize_server_console_arg("  Alice\r\nexit "),
+            "Aliceexit"
+        );
+        assert_eq!(sanitize_server_console_arg("Player Two"), "Player Two");
+    }
+
+    fn make_test_profile(id: &str, name: &str, world: &str) -> ServerProfile {
+        ServerProfile {
+            id: id.to_string(),
+            name: name.to_string(),
+            edition: GameEdition::TModLoader,
+            auto_restart: false,
+            extra_args: String::new(),
+            config: ServerConfigData {
+                world: world.to_string(),
+                worldpath: String::new(),
+                worldname: "NewWorld".to_string(),
+                ..ServerConfigData::default()
+            },
+        }
+    }
+
+    #[test]
+    fn saved_join_server_preserves_modpack_across_serde() {
+        let entry = SavedJoinServer {
+            name: "Calamity Co-op".to_string(),
+            host: "203.0.113.10".to_string(),
+            port: 7777,
+            password: "secret".to_string(),
+            edition: GameEdition::TModLoader,
+            modpack: "CalamityPack".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let roundtrip: SavedJoinServer = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.modpack, "CalamityPack");
+
+        let legacy_json =
+            r#"{"name":"Legacy","host":"127.0.0.1","port":7777,"password":"","edition":"TModLoader"}"#;
+        let legacy: SavedJoinServer = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.modpack, "");
+    }
+
+    #[test]
+    fn load_saved_join_server_to_form_restores_fields_and_modpack() {
+        let root = std::env::temp_dir().join(format!(
+            "tl_app_state_saved_join_{}_{}",
+            std::process::id(),
+            super::uuid_short()
+        ));
+        let mut paths = LauncherPaths::resolve(None, None);
+        paths.base_dir = root.clone();
+        paths.tmodloader_dir = root.join("tModLoader");
+        paths.data_dir = root.join("data");
+        paths.tml_saves_dir = paths.data_dir.join("Saves").join("tModLoader");
+        paths.vanilla_saves_dir = paths.data_dir.join("Saves").join("Vanilla");
+        paths.servers_dir = paths.data_dir.join("Servers");
+        std::fs::create_dir_all(paths.tml_modpacks_dir().join("CalamityPack").join("Mods"))
+            .unwrap();
+
+        let mut config = LauncherConfig {
+            active_edition: GameEdition::Vanilla,
+            active_modpack: "OldPack".to_string(),
+            saved_join_servers: vec![
+                SavedJoinServer {
+                    name: "Friends TML".to_string(),
+                    host: "play.example.org".to_string(),
+                    port: 7788,
+                    password: "pw".to_string(),
+                    edition: GameEdition::TModLoader,
+                    modpack: "CalamityPack".to_string(),
+                },
+                SavedJoinServer {
+                    name: "Missing Pack".to_string(),
+                    host: "192.168.1.2".to_string(),
+                    port: 7799,
+                    password: String::new(),
+                    edition: GameEdition::TModLoader,
+                    modpack: "DeletedPack".to_string(),
+                },
+            ],
+            ..LauncherConfig::default()
+        };
+
+        let mut port_input = "7777".to_string();
+        let (ed_changed, missing) =
+            apply_saved_join_server_to_config(&paths, &mut config, &mut port_input, 0).unwrap();
+        assert!(ed_changed);
+        assert!(missing.is_none());
+        assert_eq!(config.quick_join_host, "play.example.org");
+        assert_eq!(config.quick_join_port, 7788);
+        assert_eq!(port_input, "7788");
+        assert_eq!(config.quick_join_password, "pw");
+        assert_eq!(config.active_edition, GameEdition::TModLoader);
+        assert_eq!(config.active_modpack, "CalamityPack");
+
+        let (ed_changed_2, missing_2) =
+            apply_saved_join_server_to_config(&paths, &mut config, &mut port_input, 1).unwrap();
+        assert!(!ed_changed_2);
+        assert_eq!(missing_2.as_deref(), Some("DeletedPack"));
+        assert_eq!(config.active_modpack, "CalamityPack");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn active_server_port_prioritizes_external_when_showing_external() {
+        assert_eq!(
+            resolve_active_server_port_value(false, None, true, Some(7780), Some(7777)),
+            7780
+        );
+        assert_eq!(
+            resolve_active_server_port_value(false, None, false, Some(7780), Some(7777)),
+            7777
+        );
+        assert_eq!(
+            resolve_active_server_port_value(true, Some(7790), true, Some(7780), Some(7777)),
+            7790
+        );
+    }
+
+    #[test]
+    fn find_conflicting_world_profile_name_detects_active_supervised_and_external() {
+        let paths = LauncherPaths::resolve(None, None);
+        let shared_abs = paths
+            .tml_worlds_dir()
+            .join("SharedWorld.wld")
+            .to_string_lossy()
+            .into_owned();
+        let p1 = make_test_profile("srv-1", "Main Server", &shared_abs);
+        let p2 = make_test_profile("srv-2", "Second Server", "SharedWorld.wld");
+        let p3 = make_test_profile("srv-3", "Third Server", "OtherWorld.wld");
+        let servers = vec![p1.clone(), p2.clone(), p3.clone()];
+
+        let active_sup = HashSet::from(["srv-1"]);
+        assert_eq!(
+            find_conflicting_world_profile_name(
+                &paths,
+                &p2,
+                &servers,
+                &active_sup,
+                &HashMap::new(),
+                &[],
+            ),
+            Some("Main Server".to_string())
+        );
+        assert_eq!(
+            find_conflicting_world_profile_name(
+                &paths,
+                &p3,
+                &servers,
+                &active_sup,
+                &HashMap::new(),
+                &[],
+            ),
+            None
+        );
+
+        let ext = DetectedExternalServer {
+            pid: 9999,
+            edition: GameEdition::TModLoader,
+            port: Some(7778),
+            profile_id: Some("srv-2".to_string()),
+            memory_mb: 100,
+            cpu_percent: 1.0,
+        };
+        assert_eq!(
+            find_conflicting_world_profile_name(
+                &paths,
+                &p1,
+                &servers,
+                &HashSet::new(),
+                &HashMap::new(),
+                &[ext],
+            ),
+            Some("Second Server".to_string())
+        );
+    }
+
+    #[test]
+    fn generate_unique_profile_world_stem_avoids_existing_profiles_and_disk_files() {
+        let root = std::env::temp_dir().join(format!(
+            "tl_app_state_world_stem_{}_{}",
+            std::process::id(),
+            super::uuid_short()
+        ));
+        let mut paths = LauncherPaths::resolve(None, None);
+        paths.base_dir = root.clone();
+        paths.data_dir = root.join("data");
+        paths.vanilla_saves_dir = paths.data_dir.join("Saves").join("Vanilla");
+        paths.tml_saves_dir = paths.data_dir.join("Saves").join("tModLoader");
+        paths.servers_dir = paths.data_dir.join("Servers");
+        paths.tmodloader_dir = root.join("tModLoader");
+        let worlds_dir = paths.tml_worlds_dir();
+        std::fs::create_dir_all(&worlds_dir).unwrap();
+
+        assert_eq!(
+            generate_unique_profile_world_stem(&paths, &worlds_dir, &[]),
+            "NewWorld"
+        );
+
+        let existing = vec![make_test_profile("srv-1", "P1", "NewWorld.wld")];
+        assert_eq!(
+            generate_unique_profile_world_stem(&paths, &worlds_dir, &existing),
+            "ServerWorld_2"
+        );
+
+        std::fs::write(worlds_dir.join("ServerWorld_2.wld"), b"").unwrap();
+        assert_eq!(
+            generate_unique_profile_world_stem(&paths, &worlds_dir, &existing),
+            "ServerWorld_3"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn should_block_close_transition_and_messages_cover_all_hosted_resources() {
+        let mut modal_open = false;
+        assert_eq!(
+            should_block_close_transition(false, false, &mut modal_open),
+            (false, false)
+        );
+        assert!(!modal_open);
+
+        assert_eq!(
+            should_block_close_transition(false, true, &mut modal_open),
+            (true, true)
+        );
+        assert!(modal_open);
+
+        assert_eq!(
+            should_block_close_transition(false, true, &mut modal_open),
+            (true, false)
+        );
+        assert!(modal_open);
+
+        assert_eq!(
+            should_block_close_transition(true, true, &mut modal_open),
+            (false, false)
+        );
+
+        let msg_server = format_close_confirm_message(true, false, false, false);
+        assert!(msg_server.contains("Server"));
+        let msg_all = format_close_confirm_message(true, true, true, true);
+        assert!(msg_all.contains("Server"));
+        assert!(msg_all.contains("UPnP"));
+        assert!(msg_all.contains("IPv6"));
+        let msg_upnp = format_close_confirm_message(false, true, true, false);
+        assert!(msg_upnp.contains("UPnP"));
+        let msg_direct = format_close_confirm_message(false, true, false, false);
+        assert!(msg_direct.contains("Port"));
+        let msg_bridge = format_close_confirm_message(false, false, false, true);
+        assert!(msg_bridge.contains("IPv6"));
+    }
+
+    #[test]
+    fn apply_saved_join_server_clears_modpack_when_entry_is_blank() {
+        let paths = LauncherPaths::resolve(None, None);
+        let mut config = LauncherConfig {
+            active_edition: GameEdition::TModLoader,
+            active_modpack: "OldPack".to_string(),
+            saved_join_servers: vec![
+                SavedJoinServer {
+                    name: "Blank TML".to_string(),
+                    host: "play.example.org".to_string(),
+                    port: 7777,
+                    password: String::new(),
+                    edition: GameEdition::TModLoader,
+                    modpack: "   ".to_string(),
+                },
+                SavedJoinServer {
+                    name: "Blank Vanilla".to_string(),
+                    host: "198.51.100.7".to_string(),
+                    port: 7780,
+                    password: String::new(),
+                    edition: GameEdition::Vanilla,
+                    modpack: String::new(),
+                },
+            ],
+            ..LauncherConfig::default()
+        };
+
+        let mut port_input = String::new();
+        let (ed_changed_1, missing_1) =
+            apply_saved_join_server_to_config(&paths, &mut config, &mut port_input, 0).unwrap();
+        assert!(!ed_changed_1);
+        assert!(missing_1.is_none());
+        assert!(config.active_modpack.is_empty());
+
+        config.active_modpack = "OldPack".to_string();
+        let (ed_changed_2, missing_2) =
+            apply_saved_join_server_to_config(&paths, &mut config, &mut port_input, 1).unwrap();
+        assert!(ed_changed_2);
+        assert!(missing_2.is_none());
+        assert!(config.active_modpack.is_empty());
+        assert_eq!(config.active_edition, GameEdition::Vanilla);
+    }
+
+    #[test]
+    fn find_conflicting_world_profile_name_checks_active_effective_world_snapshot() {
+        let paths = LauncherPaths::resolve(None, None);
+        let p1 = make_test_profile("srv-1", "Main Server", "WorldA.wld");
+        let p2 = make_test_profile("srv-2", "Second Server", "WorldB.wld");
+        let p3 = make_test_profile("srv-3", "Third Server", "WorldA.wld");
+        let servers = vec![p1.clone(), p2.clone(), p3.clone()];
+
+        let active_sup = HashSet::from(["srv-1"]);
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "srv-1".to_string(),
+            ServerRuntimeSnapshot {
+                profile_id: "srv-1".to_string(),
+                profile_name: "Main Server".to_string(),
+                edition: GameEdition::TModLoader,
+                port: 7777,
+                effective_world: paths
+                    .tml_worlds_dir()
+                    .join("WorldB.wld")
+                    .to_string_lossy()
+                    .into_owned(),
+                effective_password: String::new(),
+                effective_modpack: String::new(),
+                state: ServerLifecycleState::Running,
+                status_detail: "Running".to_string(),
+                pid: Some(1234),
+                memory_mb: 256,
+                cpu_percent: 2.0,
+                players: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            find_conflicting_world_profile_name(&paths, &p2, &servers, &active_sup, &snaps, &[]),
+            Some("Main Server".to_string())
+        );
+        assert_eq!(
+            find_conflicting_world_profile_name(&paths, &p3, &servers, &active_sup, &snaps, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn next_available_server_port_picks_lowest_unused_from_7777() {
+        assert_eq!(next_available_server_port(&[]), 7777);
+
+        let servers_with_gap = vec![
+            make_test_profile("srv-1", "S1", "W1.wld"),
+            ServerProfile {
+                config: ServerConfigData {
+                    port: 7779,
+                    ..ServerConfigData::default()
+                },
+                ..make_test_profile("srv-2", "S2", "W2.wld")
+            },
+        ];
+        assert_eq!(next_available_server_port(&servers_with_gap), 7778);
+    }
+
+    #[test]
+    fn resolve_workshop_install_order_handles_transitive_diamonds_cycles_and_installed_deps() {
+        let mut adj = HashMap::new();
+        adj.insert("100".to_string(), vec!["200".to_string(), "300".to_string()]);
+        adj.insert(
+            "200".to_string(),
+            vec!["400".to_string(), "500".to_string(), "100".to_string()],
+        );
+        adj.insert("300".to_string(), vec!["400".to_string()]);
+        adj.insert("400".to_string(), Vec::new());
+
+        let installed = HashSet::from(["500".to_string(), "100".to_string()]);
+        let order = resolve_workshop_install_order("100", &adj, &installed);
+
+        assert!(!order.contains(&"500".to_string()));
+        assert_eq!(order.last().map(String::as_str), Some("100"));
+        assert_eq!(order.iter().filter(|id| id.as_str() == "400").count(), 1);
+        let pos_400 = order.iter().position(|id| id == "400").unwrap();
+        let pos_200 = order.iter().position(|id| id == "200").unwrap();
+        let pos_300 = order.iter().position(|id| id == "300").unwrap();
+        let pos_100 = order.iter().position(|id| id == "100").unwrap();
+        assert!(pos_400 < pos_200 && pos_400 < pos_300);
+        assert!(pos_200 < pos_100 && pos_300 < pos_100);
+    }
+
+    #[test]
+    fn install_and_restore_gates_enforce_cross_edition_and_unknown_format_rules() {
+        assert!(check_install_edition_ready_flags(
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(GameEdition::TModLoader),
+        )
+        .is_err());
+        assert!(check_install_edition_ready_flags(
+            false,
+            true,
+            None,
+            false,
+            false,
+            Some(GameEdition::Vanilla),
+        )
+        .is_err());
+        assert!(check_install_edition_ready_flags(
+            false,
+            false,
+            Some(GameEdition::TModLoader),
+            false,
+            false,
+            Some(GameEdition::Vanilla),
+        )
+        .is_err());
+        assert!(check_install_edition_ready_flags(
+            false,
+            false,
+            None,
+            false,
+            true,
+            Some(GameEdition::Vanilla),
+        )
+        .is_err());
+        assert!(check_install_edition_ready_flags(
+            false,
+            false,
+            Some(GameEdition::Vanilla),
+            true,
+            false,
+            Some(GameEdition::TModLoader),
+        )
+        .is_ok());
+        assert!(check_install_edition_ready_flags(
+            false,
+            false,
+            Some(GameEdition::Vanilla),
+            false,
+            false,
+            None,
+        )
+        .is_err());
+        assert!(check_install_edition_ready_flags(
+            false,
+            false,
+            Some(GameEdition::TModLoader),
+            false,
+            true,
+            None,
+        )
+        .is_ok());
+
+        assert!(check_restore_world_backup_flags(
+            true,
+            GameEdition::TModLoader,
+            None,
+            false,
+            Some(GameEdition::TModLoader),
+        )
+        .is_err());
+        assert!(check_restore_world_backup_flags(
+            false,
+            GameEdition::TModLoader,
+            Some(GameEdition::TModLoader),
+            false,
+            Some(GameEdition::TModLoader),
+        )
+        .is_err());
+        assert!(check_restore_world_backup_flags(
+            false,
+            GameEdition::TModLoader,
+            None,
+            true,
+            Some(GameEdition::TModLoader),
+        )
+        .is_err());
+        assert!(check_restore_world_backup_flags(
+            false,
+            GameEdition::TModLoader,
+            None,
+            false,
+            None,
+        )
+        .is_err());
+        assert!(check_restore_world_backup_flags(
+            false,
+            GameEdition::TModLoader,
+            None,
+            false,
+            Some(GameEdition::Vanilla),
+        )
+        .is_err());
+        assert!(check_restore_world_backup_flags(
+            false,
+            GameEdition::TModLoader,
+            None,
+            false,
+            Some(GameEdition::TModLoader),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn manual_ban_validation_dedup_and_disk_merge_preserve_concurrent_entries() {
+        assert!(validate_and_normalize_manual_ban_ip("").is_err());
+        assert!(validate_and_normalize_manual_ban_ip("127.0.0.1").is_err());
+        assert!(validate_and_normalize_manual_ban_ip("localhost:7777").is_err());
+        assert!(validate_and_normalize_manual_ban_ip("[::1]").is_err());
+        assert!(validate_and_normalize_manual_ban_ip("0.0.0.0").is_err());
+        assert!(validate_and_normalize_manual_ban_ip("203.0.113.10:7777").is_err());
+
+        let v4 = validate_and_normalize_manual_ban_ip("::ffff:203.0.113.10").unwrap();
+        assert_eq!(v4, "203.0.113.10".parse::<IpAddr>().unwrap());
+        let v6 = validate_and_normalize_manual_ban_ip("[2405:4802::1]").unwrap();
+        assert_eq!(v6, "2405:4802::1".parse::<IpAddr>().unwrap());
+
+        let mut disk = vec![BanEntry {
+            label: "ConcurrentBan".to_string(),
+            ip: "198.51.100.2".to_string(),
+        }];
+        assert!(merge_manual_ban_entry(&mut disk, "Manual".to_string(), v4));
+        assert!(!merge_manual_ban_entry(&mut disk, "Duplicate".to_string(), v4));
+        assert_eq!(disk.len(), 2);
+
+        let target = BanEntry {
+            label: "Manual".to_string(),
+            ip: "::ffff:203.0.113.10".to_string(),
+        };
+        assert!(remove_ban_entry_from_disk_list(&mut disk, &target));
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk[0].label, "ConcurrentBan");
     }
 }

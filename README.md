@@ -15,7 +15,7 @@ C:\TerrariaLauncher\
 │   ├── config.json         # Cấu hình launcher & hồ sơ server (tự tạo khi lưu)
 │   ├── Saves\
 │   │   ├── Vanilla\Worlds\ # Thế giới Terraria 1.4.5.8
-│   │   └── tModLoader\     # Thế giới (.wld/.twld), Mods\ (enabled.json) & ModPacks\
+│   │   └── tModLoader\     # Thế giới (.wld/.twld), Mods\ (enabled.json, ModPacks\)
 │   ├── Servers\            # serverconfig.txt, server.log và banlist.txt theo từng hồ sơ
 │   ├── Backups\            # Bản sao lưu thế giới (.zip)
 │   └── SteamCMD\           # Thư mục SteamCMD & staging tải Steam Workshop

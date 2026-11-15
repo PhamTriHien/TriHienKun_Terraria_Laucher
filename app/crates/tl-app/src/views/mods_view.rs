@@ -13,6 +13,9 @@ use tl_runtime::{
     WorkshopItemDetails, WorkshopSort, CURATED_GITHUB_MODS,
 };
 
+const TML_MODS_LOCKED_HINT: &str =
+    "Không thể thay đổi mod khi tModLoader hoặc tModLoader Server đang chạy.";
+
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
     let assets = state.assets.clone();
@@ -67,6 +70,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 fn render_installed_tab(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
     let assets = state.assets.clone();
+    let tml_locked = state.is_tml_mods_locked();
     rpg_card(ui, assets.as_ref(), p, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.add(
@@ -74,15 +78,20 @@ fn render_installed_tab(state: &mut AppState, ui: &mut egui::Ui) {
                     .desired_width(210.0)
                     .hint_text("Tìm mod theo tên hoặc tác giả..."),
             );
-            if rpg_button(
-                ui,
-                assets.as_ref(),
-                p,
-                ButtonSkin::Emerald,
-                UiIcon::Download,
-                "Nhập .tmod / .zip",
-            )
-            .clicked()
+            if ui
+                .add_enabled_ui(!tml_locked, |ui| {
+                    rpg_button(
+                        ui,
+                        assets.as_ref(),
+                        p,
+                        ButtonSkin::Emerald,
+                        UiIcon::Download,
+                        "Nhập .tmod / .zip",
+                    )
+                })
+                .inner
+                .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
+                .clicked()
             {
                 state.import_mods_dialog();
             }
@@ -151,6 +160,7 @@ fn render_installed_tab(state: &mut AppState, ui: &mut egui::Ui) {
         }
 
         let mut toggle_action: Option<(String, bool)> = None;
+        let mut enable_deps_for: Option<String> = None;
         let mut delete_action: Option<(std::path::PathBuf, String)> = None;
 
         for idx in matched_indices {
@@ -191,6 +201,13 @@ fn render_installed_tab(state: &mut AppState, ui: &mut egui::Ui) {
                                     p.accent_red,
                                 );
                             }
+                            if !entry.disabled_deps.is_empty() {
+                                status_pill(
+                                    ui,
+                                    &format!("Cần bật: {}", entry.disabled_deps.join(", ")),
+                                    p.accent_amber,
+                                );
+                            }
                         });
 
                         let author = if entry.meta.author.trim().is_empty() {
@@ -216,15 +233,20 @@ fn render_installed_tab(state: &mut AppState, ui: &mut egui::Ui) {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if rpg_compact_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            ButtonSkin::Red,
-                            Some(UiIcon::Trash),
-                            "Xóa",
-                        )
-                        .clicked()
+                        if ui
+                            .add_enabled_ui(!tml_locked, |ui| {
+                                rpg_compact_button(
+                                    ui,
+                                    assets.as_ref(),
+                                    p,
+                                    ButtonSkin::Red,
+                                    Some(UiIcon::Trash),
+                                    "Xóa",
+                                )
+                            })
+                            .inner
+                            .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
+                            .clicked()
                         {
                             delete_action = Some((
                                 entry.meta.file_path.clone(),
@@ -236,18 +258,41 @@ fn render_installed_tab(state: &mut AppState, ui: &mut egui::Ui) {
                         } else {
                             (ButtonSkin::Emerald, UiIcon::Play, "Bật")
                         };
-                        if rpg_compact_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            btn_skin,
-                            Some(btn_icon),
-                            btn_text,
-                        )
-                        .clicked()
+                        if ui
+                            .add_enabled_ui(!tml_locked, |ui| {
+                                rpg_compact_button(
+                                    ui,
+                                    assets.as_ref(),
+                                    p,
+                                    btn_skin,
+                                    Some(btn_icon),
+                                    btn_text,
+                                )
+                            })
+                            .inner
+                            .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
+                            .clicked()
                         {
                             toggle_action =
                                 Some((entry.meta.internal_name.clone(), !entry.enabled));
+                        }
+                        if !entry.disabled_deps.is_empty()
+                            && ui
+                                .add_enabled_ui(!tml_locked, |ui| {
+                                    rpg_compact_button(
+                                        ui,
+                                        assets.as_ref(),
+                                        p,
+                                        ButtonSkin::Amber,
+                                        Some(UiIcon::Play),
+                                        "Bật đủ",
+                                    )
+                                })
+                                .inner
+                                .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
+                                .clicked()
+                        {
+                            enable_deps_for = Some(entry.meta.internal_name.clone());
                         }
                     });
                 });
@@ -257,6 +302,9 @@ fn render_installed_tab(state: &mut AppState, ui: &mut egui::Ui) {
 
         if let Some((name, enable)) = toggle_action {
             state.toggle_mod(&name, enable);
+        }
+        if let Some(name) = enable_deps_for {
+            state.enable_mod_with_deps(&name);
         }
         if let Some((path, name)) = delete_action {
             state.delete_mod(&path, &name);
@@ -336,6 +384,12 @@ fn render_github_tab(state: &mut AppState, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             let mut download_target: Option<(String, String, String)> = None;
             let gh_busy = state.github_busy;
+            let tml_locked = state.is_tml_mods_locked();
+            let gh_dl_hint = if tml_locked {
+                TML_MODS_LOCKED_HINT
+            } else {
+                "Đang tải từ GitHub..."
+            };
             for asset in &state.github_assets {
                 rpg_subcard(ui, assets.as_ref(), p, |ui| {
                     ui.horizontal(|ui| {
@@ -348,7 +402,7 @@ fn render_github_tab(state: &mut AppState, ui: &mut egui::Ui) {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .add_enabled_ui(!gh_busy, |ui| {
+                                .add_enabled_ui(!gh_busy && !tml_locked, |ui| {
                                     rpg_compact_button(
                                         ui,
                                         assets.as_ref(),
@@ -359,6 +413,7 @@ fn render_github_tab(state: &mut AppState, ui: &mut egui::Ui) {
                                     )
                                 })
                                 .inner
+                                .on_disabled_hover_text(gh_dl_hint)
                                 .clicked()
                             {
                                 download_target = Some((
@@ -389,7 +444,16 @@ fn render_github_tab(state: &mut AppState, ui: &mut egui::Ui) {
             "Tải trực tiếp từ URL (.tmod)",
         );
         ui.add_space(6.0);
-        let can_download = !state.direct_mod_url.trim().is_empty() && !state.github_busy;
+        let tml_locked = state.is_tml_mods_locked();
+        let can_download =
+            !tml_locked && !state.direct_mod_url.trim().is_empty() && !state.github_busy;
+        let url_dl_hint = if tml_locked {
+            TML_MODS_LOCKED_HINT
+        } else if state.github_busy {
+            "Đang tải mod..."
+        } else {
+            "Nhập URL tệp .tmod trước"
+        };
         let mut trigger_download = false;
         ui.horizontal(|ui| {
             let resp = ui.add(
@@ -412,6 +476,7 @@ fn render_github_tab(state: &mut AppState, ui: &mut egui::Ui) {
                     )
                 })
                 .inner
+                .on_disabled_hover_text(url_dl_hint)
                 .clicked()
             {
                 trigger_download = true;
@@ -462,42 +527,79 @@ fn render_modpack_list_card(state: &mut AppState, ui: &mut egui::Ui) {
 }
 
 fn render_modpack_row(state: &mut AppState, ui: &mut egui::Ui, pack: &ModPackInfo) {
+    enum ModPackRowAction {
+        Remove,
+        Deactivate,
+        Activate,
+        Share,
+    }
+
     let p = state.palette();
     let assets = state.assets.clone();
     let is_active = state.config.active_modpack == pack.name;
+    let tml_locked = state.is_tml_mods_locked();
+    let mut row_action = None;
+
     rpg_subcard(ui, assets.as_ref(), p, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(&pack.name).strong().size(14.5));
             status_pill(ui, &format!("{} mod", pack.enabled_mods.len()), p.accent_cyan);
+            if is_active {
+                status_pill(ui, "Đang dùng", p.accent_emerald);
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if rpg_compact_button(
-                    ui,
-                    assets.as_ref(),
-                    p,
-                    ButtonSkin::Red,
-                    Some(UiIcon::Trash),
-                    "Xóa",
-                )
-                .clicked()
-                {
-                    state.remove_modpack(pack);
-                }
                 if ui
-                    .add_enabled_ui(!is_active, |ui| {
+                    .add_enabled_ui(!tml_locked, |ui| {
+                        rpg_compact_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Red,
+                            Some(UiIcon::Trash),
+                            "Xóa",
+                        )
+                    })
+                    .inner
+                    .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
+                    .clicked()
+                {
+                    row_action = Some(ModPackRowAction::Remove);
+                }
+                if is_active {
+                    if ui
+                        .add_enabled_ui(!tml_locked, |ui| {
+                            rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Slate,
+                                Some(UiIcon::Stop),
+                                "Bỏ dùng",
+                            )
+                        })
+                        .inner
+                        .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
+                        .clicked()
+                    {
+                        row_action = Some(ModPackRowAction::Deactivate);
+                    }
+                } else if ui
+                    .add_enabled_ui(!tml_locked, |ui| {
                         rpg_compact_button(
                             ui,
                             assets.as_ref(),
                             p,
                             ButtonSkin::Emerald,
-                            if is_active { None } else { Some(UiIcon::Play) },
-                            if is_active { "Đang dùng" } else { "Kích hoạt" },
+                            Some(UiIcon::Play),
+                            "Kích hoạt",
                         )
                     })
                     .inner
+                    .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
                     .clicked()
                 {
-                    state.activate_selected_modpack(pack);
+                    row_action = Some(ModPackRowAction::Activate);
                 }
                 if rpg_compact_button(
                     ui,
@@ -509,11 +611,19 @@ fn render_modpack_row(state: &mut AppState, ui: &mut egui::Ui, pack: &ModPackInf
                 )
                 .clicked()
                 {
-                    state.prepare_share_key_for_pack(pack);
+                    row_action = Some(ModPackRowAction::Share);
                 }
             });
         });
     });
+
+    match row_action {
+        Some(ModPackRowAction::Remove) => state.remove_modpack(pack),
+        Some(ModPackRowAction::Deactivate) => state.deactivate_modpack(),
+        Some(ModPackRowAction::Activate) => state.activate_selected_modpack(pack),
+        Some(ModPackRowAction::Share) => state.prepare_share_key_for_pack(pack),
+        None => {}
+    }
 }
 
 fn render_modpack_create_card(state: &mut AppState, ui: &mut egui::Ui) {
@@ -523,7 +633,13 @@ fn render_modpack_create_card(state: &mut AppState, ui: &mut egui::Ui) {
         rpg_section_heading(ui, assets.as_ref(), p, UiIcon::Pack, "Tạo & Xuất ModPack");
         ui.add_space(6.0);
 
-        let can_create = !state.new_modpack_name.trim().is_empty();
+        let tml_locked = state.is_tml_mods_locked();
+        let can_create = !tml_locked && !state.new_modpack_name.trim().is_empty();
+        let create_hint = if tml_locked {
+            TML_MODS_LOCKED_HINT
+        } else {
+            "Nhập tên ModPack trước"
+        };
         let mut trigger_create = false;
         let mut trigger_export_enabled = false;
 
@@ -548,6 +664,7 @@ fn render_modpack_create_card(state: &mut AppState, ui: &mut egui::Ui) {
                     )
                 })
                 .inner
+                .on_disabled_hover_text(create_hint)
                 .clicked()
             {
                 trigger_create = true;
@@ -988,12 +1105,13 @@ fn render_share_import_preview(
             }
         });
 
+        let steamcmd_busy = state.is_steamcmd_busy();
         if preview.workshop_download_count > 0 && state.env.steamcmd_path.is_none() {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Cần SteamCMD để tải mod Workshop.").color(p.accent_amber));
                 if ui
-                    .add_enabled_ui(!state.steamcmd_busy, |ui| {
+                    .add_enabled_ui(!steamcmd_busy, |ui| {
                         rpg_button(
                             ui,
                             assets.as_ref(),
@@ -1019,9 +1137,20 @@ fn render_share_import_preview(
         }
 
         ui.add_space(8.0);
-        let can_sync = !state.modpack_sync_busy
+        let tml_locked = state.is_tml_mods_locked();
+        let can_sync = !tml_locked
+            && !state.is_steamcmd_busy()
             && !state.share_import_pack_name.trim().is_empty()
             && (preview.workshop_download_count == 0 || state.env.steamcmd_path.is_some());
+        let sync_hint = if tml_locked {
+            TML_MODS_LOCKED_HINT
+        } else if state.is_steamcmd_busy() {
+            "Đang tải hoặc đồng bộ..."
+        } else if state.share_import_pack_name.trim().is_empty() {
+            "Nhập tên ModPack mới trước"
+        } else {
+            "Cần cài SteamCMD để tải mod Workshop"
+        };
         if ui
             .add_enabled_ui(can_sync, |ui| {
                 rpg_button(
@@ -1034,6 +1163,7 @@ fn render_share_import_preview(
                 )
             })
             .inner
+            .on_disabled_hover_text(sync_hint)
             .clicked()
         {
             state.sync_modpack_from_key();
@@ -1214,7 +1344,7 @@ fn render_workshop_search_card(state: &mut AppState, ui: &mut egui::Ui) {
                     status_pill(ui, "SteamCMD sẵn sàng", p.accent_emerald);
                 } else {
                     if ui
-                        .add_enabled_ui(!state.steamcmd_busy, |ui| {
+                        .add_enabled_ui(!state.is_steamcmd_busy(), |ui| {
                             rpg_button(
                                 ui,
                                 assets.as_ref(),
@@ -1245,7 +1375,16 @@ fn render_workshop_search_card(state: &mut AppState, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         let query_busy = state.workshop_browse_busy || state.workshop_inspect_busy;
         let parsed_id_valid = parse_workshop_id(&state.workshop_input).is_some();
-        let can_download_id = !state.workshop_busy && state.env.steamcmd_path.is_some();
+        let tml_locked = state.is_tml_mods_locked();
+        let can_download_id =
+            !tml_locked && !state.is_steamcmd_busy() && state.env.steamcmd_path.is_some();
+        let download_id_hint = if tml_locked {
+            TML_MODS_LOCKED_HINT
+        } else if state.is_steamcmd_busy() {
+            "Đang tải từ SteamCMD..."
+        } else {
+            "Cần cài SteamCMD trước"
+        };
         let mut trigger_smart_query = false;
         let mut trigger_download_id = false;
         let mut sort_changed = false;
@@ -1293,6 +1432,7 @@ fn render_workshop_search_card(state: &mut AppState, ui: &mut egui::Ui) {
                         )
                     })
                     .inner
+                    .on_disabled_hover_text(download_id_hint)
                     .clicked()
             {
                 trigger_download_id = true;
@@ -1514,10 +1654,17 @@ fn render_workshop_details_card(
 
         let mut trigger_download = false;
         let mut trigger_toggle: Option<(String, bool)> = None;
+        let steamcmd_busy = state.is_steamcmd_busy();
+        let tml_locked = state.is_tml_mods_locked();
+        let ws_dl_hint = if tml_locked {
+            TML_MODS_LOCKED_HINT
+        } else {
+            "Đang tải từ SteamCMD..."
+        };
 
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled_ui(!state.workshop_busy, |ui| {
+                .add_enabled_ui(!steamcmd_busy && !tml_locked, |ui| {
                     rpg_button(
                         ui,
                         assets.as_ref(),
@@ -1528,6 +1675,7 @@ fn render_workshop_details_card(
                     )
                 })
                 .inner
+                .on_disabled_hover_text(ws_dl_hint)
                 .clicked()
             {
                 trigger_download = true;
@@ -1541,7 +1689,14 @@ fn render_workshop_details_card(
                 } else {
                     ("Bật", ButtonSkin::Emerald, UiIcon::Play)
                 };
-                if rpg_button(ui, assets.as_ref(), p, btn_skin, btn_icon, btn_text).clicked() {
+                if ui
+                    .add_enabled_ui(!tml_locked, |ui| {
+                        rpg_button(ui, assets.as_ref(), p, btn_skin, btn_icon, btn_text)
+                    })
+                    .inner
+                    .on_disabled_hover_text(TML_MODS_LOCKED_HINT)
+                    .clicked()
+                {
                     trigger_toggle = Some((internal_name.clone(), !*enabled));
                 }
             }
@@ -1566,7 +1721,15 @@ fn render_workshop_details_card(
             state.inspect_workshop_id(&cid);
         }
         if trigger_download {
-            state.download_workshop_item(&details.published_file_id, Some(details.clone()));
+            if details.child_ids.is_empty() {
+                state.download_workshop_item(&details.published_file_id, Some(details.clone()));
+            } else {
+                state.download_workshop_with_missing_deps(
+                    details.published_file_id.clone(),
+                    details.child_ids.clone(),
+                    Some(details.clone()),
+                );
+            }
         }
         if let Some((name, enable)) = trigger_toggle {
             state.toggle_mod(&name, enable);
@@ -1672,8 +1835,14 @@ fn render_workshop_catalog_card(state: &mut AppState, ui: &mut egui::Ui) {
         if let Some(act) = action {
             match act {
                 CatalogAction::Download(item) => {
-                    let id = item.published_file_id.clone();
-                    state.download_workshop_item(&id, Some(item));
+                    if item.child_ids.is_empty() {
+                        let id = item.published_file_id.clone();
+                        state.download_workshop_item(&id, Some(item));
+                    } else {
+                        let id = item.published_file_id.clone();
+                        let child_ids = item.child_ids.clone();
+                        state.download_workshop_with_missing_deps(id, child_ids, Some(item));
+                    }
                 }
                 CatalogAction::Inspect(id) => state.inspect_workshop_id(&id),
                 CatalogAction::OpenSteam(id) => {
@@ -1723,7 +1892,13 @@ fn render_workshop_catalog_item(
         state.workshop_install_status(&item.published_file_id, item.time_updated);
     let is_downloading =
         state.workshop_downloading_id.as_deref() == Some(item.published_file_id.as_str());
-    let workshop_busy = state.workshop_busy;
+    let steamcmd_busy = state.is_steamcmd_busy();
+    let tml_locked = state.is_tml_mods_locked();
+    let ws_dl_hint = if tml_locked {
+        TML_MODS_LOCKED_HINT
+    } else {
+        "Đang tải từ SteamCMD..."
+    };
 
     ui.push_id(&item.published_file_id, |ui| {
         rpg_subcard(ui, assets.as_ref(), p, |ui| {
@@ -1784,7 +1959,7 @@ fn render_workshop_catalog_item(
             };
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled_ui(!workshop_busy, |ui| {
+                    .add_enabled_ui(!steamcmd_busy && !tml_locked, |ui| {
                         rpg_compact_button(
                             ui,
                             assets.as_ref(),
@@ -1795,6 +1970,7 @@ fn render_workshop_catalog_item(
                         )
                     })
                     .inner
+                    .on_disabled_hover_text(ws_dl_hint)
                     .clicked()
                 {
                     *action = Some(CatalogAction::Download(item.clone()));

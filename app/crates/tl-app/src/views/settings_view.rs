@@ -4,7 +4,7 @@ use crate::theme::ThemePalette;
 use crate::views::play_view::render_install_progress_bar;
 use crate::{anim3d, theme};
 use egui::RichText;
-use tl_core::{GraphicsBackend, ProcessPriority};
+use tl_core::{GameEdition, GraphicsBackend, ProcessPriority};
 use tl_runtime::TmodLoaderReleaseInfo;
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
@@ -257,37 +257,57 @@ fn render_tml_installer_subcard(
         let mut do_install_tml = false;
         let mut do_install_dotnet = false;
         let mut do_install_steamcmd = false;
+        let can_install_tml = state.can_install_edition_ui(Some(GameEdition::TModLoader));
+        let tml_install_hint = if state.install_busy {
+            "Đang có tác vụ cài đặt khác đang chạy."
+        } else {
+            "Dừng tModLoader và tModLoader Server trước khi cài đặt."
+        };
+        let can_install_steamcmd = !state.is_steamcmd_busy() && !state.install_busy;
+        let steamcmd_install_hint = if state.is_steamcmd_busy() {
+            "Đang tải hoặc cài đặt SteamCMD..."
+        } else {
+            "Đang có tác vụ cài đặt khác đang chạy."
+        };
 
         ui.horizontal_wrapped(|ui| {
-            ui.add_enabled_ui(!state.install_busy, |ui| {
-                if theme::rpg_button(
-                    ui,
-                    assets,
-                    p,
-                    ButtonSkin::Emerald,
-                    UiIcon::Download,
-                    "Cài đặt / Cập nhật tModLoader",
-                )
+            if ui
+                .add_enabled_ui(can_install_tml, |ui| {
+                    theme::rpg_button(
+                        ui,
+                        assets,
+                        p,
+                        ButtonSkin::Emerald,
+                        UiIcon::Download,
+                        "Cài đặt / Cập nhật tModLoader",
+                    )
+                })
+                .inner
+                .on_disabled_hover_text(tml_install_hint)
                 .clicked()
-                {
-                    do_install_tml = true;
-                }
+            {
+                do_install_tml = true;
+            }
 
-                let (dotnet_skin, dotnet_icon, dotnet_label) = if !dotnet_ok {
-                    (ButtonSkin::Amber, UiIcon::Download, "Cài .NET 8")
-                } else {
-                    (ButtonSkin::Slate, UiIcon::Refresh, "Cài lại .NET 8")
-                };
-                if theme::rpg_button(ui, assets, p, dotnet_skin, dotnet_icon, dotnet_label)
-                    .clicked()
-                {
-                    do_install_dotnet = true;
-                }
-            });
+            let (dotnet_skin, dotnet_icon, dotnet_label) = if !dotnet_ok {
+                (ButtonSkin::Amber, UiIcon::Download, "Cài .NET 8")
+            } else {
+                (ButtonSkin::Slate, UiIcon::Refresh, "Cài lại .NET 8")
+            };
+            if ui
+                .add_enabled_ui(can_install_tml, |ui| {
+                    theme::rpg_button(ui, assets, p, dotnet_skin, dotnet_icon, dotnet_label)
+                })
+                .inner
+                .on_disabled_hover_text(tml_install_hint)
+                .clicked()
+            {
+                do_install_dotnet = true;
+            }
 
             if steamcmd_missing {
                 if ui
-                    .add_enabled_ui(!state.steamcmd_busy, |ui| {
+                    .add_enabled_ui(can_install_steamcmd, |ui| {
                         theme::rpg_button(
                             ui,
                             assets,
@@ -298,6 +318,7 @@ fn render_tml_installer_subcard(
                         )
                     })
                     .inner
+                    .on_disabled_hover_text(steamcmd_install_hint)
                     .clicked()
                 {
                     do_install_steamcmd = true;
@@ -378,27 +399,42 @@ fn render_terraria_installer_subcard(
         let mut do_check_update = false;
         let mut do_zip = false;
         let mut do_xna = false;
+        let can_install_vanilla = state.can_install_edition_ui(Some(GameEdition::Vanilla));
+        let vanilla_install_hint = if state.install_busy {
+            "Đang có tác vụ cài đặt khác đang chạy."
+        } else {
+            "Dừng Terraria và Terraria Server trước khi cài đặt."
+        };
+        let can_install_xna = state.can_install_edition_ui(None);
+        let xna_install_hint = if state.install_busy {
+            "Đang có tác vụ cài đặt khác đang chạy."
+        } else {
+            "Dừng game và server trước khi cài đặt XNA 4.0."
+        };
 
         ui.horizontal_wrapped(|ui| {
-            ui.add_enabled_ui(!state.install_busy, |ui| {
-                let primary_skin = if state.env.terraria_installed && is_synced {
-                    ButtonSkin::Cyan
-                } else {
-                    ButtonSkin::Emerald
-                };
-                if theme::rpg_button(
-                    ui,
-                    assets,
-                    p,
-                    primary_skin,
-                    UiIcon::Download,
-                    "Tải & Cài Terraria",
-                )
+            let primary_skin = if state.env.terraria_installed && is_synced {
+                ButtonSkin::Cyan
+            } else {
+                ButtonSkin::Emerald
+            };
+            if ui
+                .add_enabled_ui(can_install_vanilla, |ui| {
+                    theme::rpg_button(
+                        ui,
+                        assets,
+                        p,
+                        primary_skin,
+                        UiIcon::Download,
+                        "Tải & Cài Terraria",
+                    )
+                })
+                .inner
+                .on_disabled_hover_text(vanilla_install_hint)
                 .clicked()
-                {
-                    do_url = true;
-                }
-            });
+            {
+                do_url = true;
+            }
 
             if ui
                 .add_enabled_ui(!state.terraria_check_busy, |ui| {
@@ -420,34 +456,42 @@ fn render_terraria_installer_subcard(
                 ui.spinner();
             }
 
-            ui.add_enabled_ui(!state.install_busy, |ui| {
-                if theme::rpg_button(
-                    ui,
-                    assets,
-                    p,
-                    ButtonSkin::Slate,
-                    UiIcon::Folder,
-                    "Cài từ file .zip",
-                )
-                .clicked()
-                {
-                    do_zip = true;
-                }
-
-                if !state.env.xna_installed
-                    && theme::rpg_button(
+            if ui
+                .add_enabled_ui(can_install_vanilla, |ui| {
+                    theme::rpg_button(
                         ui,
                         assets,
                         p,
-                        ButtonSkin::Amber,
-                        UiIcon::Download,
-                        "Cài XNA Framework 4.0",
+                        ButtonSkin::Slate,
+                        UiIcon::Folder,
+                        "Cài từ file .zip",
                     )
+                })
+                .inner
+                .on_disabled_hover_text(vanilla_install_hint)
+                .clicked()
+            {
+                do_zip = true;
+            }
+
+            if !state.env.xna_installed
+                && ui
+                    .add_enabled_ui(can_install_xna, |ui| {
+                        theme::rpg_button(
+                            ui,
+                            assets,
+                            p,
+                            ButtonSkin::Amber,
+                            UiIcon::Download,
+                            "Cài XNA Framework 4.0",
+                        )
+                    })
+                    .inner
+                    .on_disabled_hover_text(xna_install_hint)
                     .clicked()
-                {
-                    do_xna = true;
-                }
-            });
+            {
+                do_xna = true;
+            }
         });
 
         ui.add_space(4.0);
@@ -602,10 +646,23 @@ fn render_paths_and_proxy_card(
         );
         ui.add_space(8.0);
 
-        let default_terraria_hint = state.paths.terraria_dir.to_string_lossy().into_owned();
-        let default_tml_hint = state.paths.tmodloader_dir.to_string_lossy().into_owned();
+        let default_terraria_hint = state
+            .paths
+            .base_dir
+            .join("Terraria")
+            .to_string_lossy()
+            .into_owned();
+        let default_tml_hint = state
+            .paths
+            .base_dir
+            .join("tModLoader")
+            .to_string_lossy()
+            .into_owned();
         let input_w = (ui.available_width() - 330.0).max(210.0);
         let pressed_enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let paths_locked = state.is_runtime_or_task_busy_for_paths();
+        const PATHS_LOCKED_HINT: &str =
+            "Dừng game, server, bridge và tác vụ cài đặt trước khi đổi thư mục.";
 
         let mut auto_apply = false;
         let mut explicit_apply = false;
@@ -616,11 +673,14 @@ fn render_paths_and_proxy_card(
             .show(ui, |ui| {
                 ui.label(RichText::new("Thư mục Terraria:").color(p.text_muted));
                 ui.horizontal(|ui| {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut state.config.custom_terraria_dir)
-                            .desired_width(input_w)
-                            .hint_text(&default_terraria_hint),
-                    );
+                    let resp = ui
+                        .add_enabled(
+                            !paths_locked,
+                            egui::TextEdit::singleline(&mut state.config.custom_terraria_dir)
+                                .desired_width(input_w)
+                                .hint_text(&default_terraria_hint),
+                        )
+                        .on_disabled_hover_text(PATHS_LOCKED_HINT);
                     if resp.lost_focus() {
                         if pressed_enter {
                             explicit_apply = true;
@@ -628,15 +688,20 @@ fn render_paths_and_proxy_card(
                             auto_apply = true;
                         }
                     }
-                    if theme::rpg_compact_button(
-                        ui,
-                        assets,
-                        p,
-                        ButtonSkin::Slate,
-                        Some(UiIcon::Folder),
-                        "Chọn...",
-                    )
-                    .clicked()
+                    if ui
+                        .add_enabled_ui(!paths_locked, |ui| {
+                            theme::rpg_compact_button(
+                                ui,
+                                assets,
+                                p,
+                                ButtonSkin::Slate,
+                                Some(UiIcon::Folder),
+                                "Chọn...",
+                            )
+                        })
+                        .inner
+                        .on_disabled_hover_text(PATHS_LOCKED_HINT)
+                        .clicked()
                     {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             state.config.custom_terraria_dir = dir.to_string_lossy().into_owned();
@@ -645,7 +710,7 @@ fn render_paths_and_proxy_card(
                     }
                     let has_custom = !state.config.custom_terraria_dir.trim().is_empty();
                     if ui
-                        .add_enabled_ui(has_custom, |ui| {
+                        .add_enabled_ui(!paths_locked && has_custom, |ui| {
                             theme::rpg_compact_button(
                                 ui,
                                 assets,
@@ -656,6 +721,11 @@ fn render_paths_and_proxy_card(
                             )
                         })
                         .inner
+                        .on_disabled_hover_text(if paths_locked {
+                            PATHS_LOCKED_HINT
+                        } else {
+                            "Đang dùng đường dẫn mặc định"
+                        })
                         .clicked()
                     {
                         state.config.custom_terraria_dir.clear();
@@ -666,11 +736,14 @@ fn render_paths_and_proxy_card(
 
                 ui.label(RichText::new("Thư mục tModLoader:").color(p.text_muted));
                 ui.horizontal(|ui| {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut state.config.custom_tmodloader_dir)
-                            .desired_width(input_w)
-                            .hint_text(&default_tml_hint),
-                    );
+                    let resp = ui
+                        .add_enabled(
+                            !paths_locked,
+                            egui::TextEdit::singleline(&mut state.config.custom_tmodloader_dir)
+                                .desired_width(input_w)
+                                .hint_text(&default_tml_hint),
+                        )
+                        .on_disabled_hover_text(PATHS_LOCKED_HINT);
                     if resp.lost_focus() {
                         if pressed_enter {
                             explicit_apply = true;
@@ -678,15 +751,20 @@ fn render_paths_and_proxy_card(
                             auto_apply = true;
                         }
                     }
-                    if theme::rpg_compact_button(
-                        ui,
-                        assets,
-                        p,
-                        ButtonSkin::Slate,
-                        Some(UiIcon::Folder),
-                        "Chọn...",
-                    )
-                    .clicked()
+                    if ui
+                        .add_enabled_ui(!paths_locked, |ui| {
+                            theme::rpg_compact_button(
+                                ui,
+                                assets,
+                                p,
+                                ButtonSkin::Slate,
+                                Some(UiIcon::Folder),
+                                "Chọn...",
+                            )
+                        })
+                        .inner
+                        .on_disabled_hover_text(PATHS_LOCKED_HINT)
+                        .clicked()
                     {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             state.config.custom_tmodloader_dir = dir.to_string_lossy().into_owned();
@@ -695,7 +773,7 @@ fn render_paths_and_proxy_card(
                     }
                     let has_custom = !state.config.custom_tmodloader_dir.trim().is_empty();
                     if ui
-                        .add_enabled_ui(has_custom, |ui| {
+                        .add_enabled_ui(!paths_locked && has_custom, |ui| {
                             theme::rpg_compact_button(
                                 ui,
                                 assets,
@@ -706,6 +784,11 @@ fn render_paths_and_proxy_card(
                             )
                         })
                         .inner
+                        .on_disabled_hover_text(if paths_locked {
+                            PATHS_LOCKED_HINT
+                        } else {
+                            "Đang dùng đường dẫn mặc định"
+                        })
                         .clicked()
                     {
                         state.config.custom_tmodloader_dir.clear();
@@ -805,15 +888,20 @@ fn render_paths_and_proxy_card(
 
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
-            if theme::rpg_button(
-                ui,
-                assets,
-                p,
-                ButtonSkin::Emerald,
-                UiIcon::Pack,
-                "Lưu & Áp dụng",
-            )
-            .clicked()
+            if ui
+                .add_enabled_ui(!paths_locked, |ui| {
+                    theme::rpg_button(
+                        ui,
+                        assets,
+                        p,
+                        ButtonSkin::Emerald,
+                        UiIcon::Pack,
+                        "Lưu & Áp dụng",
+                    )
+                })
+                .inner
+                .on_disabled_hover_text(PATHS_LOCKED_HINT)
+                .clicked()
             {
                 explicit_apply = true;
             }
@@ -833,11 +921,15 @@ fn render_paths_and_proxy_card(
 
         if explicit_apply {
             state.save_config();
-            state.refresh_environment();
+            if !paths_locked {
+                state.refresh_environment();
+            }
             state.notify_ok("Đã lưu và áp dụng cài đặt.");
         } else if auto_apply {
             state.save_config();
-            state.refresh_environment();
+            if !paths_locked {
+                state.refresh_environment();
+            }
         }
     });
 }
