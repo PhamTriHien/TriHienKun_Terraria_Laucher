@@ -166,14 +166,25 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Resolves the launcher root directory for a given executable path, falling back to `C:\TerrariaLauncher`.
-pub fn detect_base_dir_for_exe(exe: Option<&Path>) -> PathBuf {
+fn has_launcher_layout_dirs(dir: &Path) -> bool {
+    dir.join("Terraria").is_dir() || dir.join("tModLoader").is_dir() || dir.join("data").is_dir()
+}
+
+fn is_launcher_exe_stem(stem: &str) -> bool {
+    let compact: String = stem
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    compact.starts_with("trihienkunterrarialauncher")
+        || compact.starts_with("trihienkunterrarialaucher")
+        || compact.starts_with("terrarialauncher")
+}
+
+fn detect_base_dir_for_exe_with_default(exe: Option<&Path>, default_root: &Path) -> PathBuf {
     if let Some(exe) = exe {
         if let Some(parent) = exe.parent() {
-            if parent.join("Terraria").is_dir()
-                || parent.join("tModLoader").is_dir()
-                || parent.join("data").is_dir()
-            {
+            if has_launcher_layout_dirs(parent) {
                 return parent.to_path_buf();
             }
             if let Some(grand) = parent.parent().and_then(Path::parent).and_then(Path::parent) {
@@ -184,17 +195,31 @@ pub fn detect_base_dir_for_exe(exe: Option<&Path>) -> PathBuf {
                     return grand.to_path_buf();
                 }
             }
+            let is_user_drop_dir = parent
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("desktop") || name.eq_ignore_ascii_case("downloads")
+                });
+            if is_user_drop_dir && has_launcher_layout_dirs(default_root) {
+                return default_root.to_path_buf();
+            }
             if exe
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .is_some_and(|s| s.to_ascii_lowercase().starts_with("terrarialauncher"))
+                .is_some_and(is_launcher_exe_stem)
                 && parent.is_dir()
             {
                 return parent.to_path_buf();
             }
         }
     }
-    PathBuf::from(r"C:\TerrariaLauncher")
+    default_root.to_path_buf()
+}
+
+/// Resolves the launcher root directory for a given executable path, falling back to `C:\TerrariaLauncher`.
+pub fn detect_base_dir_for_exe(exe: Option<&Path>) -> PathBuf {
+    detect_base_dir_for_exe_with_default(exe, Path::new(r"C:\TerrariaLauncher"))
 }
 
 fn detect_base_dir() -> PathBuf {
@@ -207,30 +232,81 @@ pub struct EnvironmentStatus {
     pub terraria_installed: bool,
     pub terraria_server_installed: bool,
     pub tmodloader_installed: bool,
+    #[serde(default)]
+    pub terraria_content_available: bool,
     pub dotnet8_version: Option<String>,
+    #[serde(default)]
+    pub required_tml_dotnet_version: Option<String>,
+    #[serde(default)]
+    pub dotnet8_ready: bool,
     pub xna_installed: bool,
     pub xna_msi_available: bool,
     pub steamcmd_path: Option<PathBuf>,
 }
 
-pub fn detect_environment(paths: &LauncherPaths, custom_steamcmd: Option<&str>) -> EnvironmentStatus {
+fn has_terraria_content(paths: &LauncherPaths) -> bool {
+    paths.terraria_dir.join("Content").is_dir()
+        || paths
+            .tmodloader_dir
+            .parent()
+            .is_some_and(|p| p.join("Terraria").join("Content").is_dir())
+}
+
+fn is_dotnet8_ready(installed: Option<&str>, required: Option<&str>) -> bool {
+    installed.is_some_and(|v| required.is_none_or(|r| version_at_least_patch(v, r)))
+}
+
+fn is_dotnet8_ready_with<F>(paths: &LauncherPaths, detect_dotnet: F) -> bool
+where
+    F: FnOnce(&LauncherPaths) -> Option<String>,
+{
+    let req = read_declared_tml_dotnet_version_opt(paths);
+    let ver = detect_dotnet(paths);
+    is_dotnet8_ready(ver.as_deref(), req.as_deref())
+}
+
+pub fn is_dotnet8_ready_for_paths(paths: &LauncherPaths) -> bool {
+    is_dotnet8_ready_with(paths, detect_dotnet8_runtime)
+}
+
+fn detect_environment_with_dotnet<F>(
+    paths: &LauncherPaths,
+    custom_steamcmd: Option<&str>,
+    detect_dotnet: F,
+) -> EnvironmentStatus
+where
+    F: FnOnce(&LauncherPaths) -> Option<String>,
+{
     let terraria_installed = paths.terraria_exe().is_file();
     let terraria_server_installed = paths.terraria_server_exe().is_file();
     let tmodloader_installed = paths.tmodloader_dll().is_file();
+    let terraria_content_available = has_terraria_content(paths);
     let xna_msi_available = paths.xna_msi_path().is_file();
     let xna_installed = is_xna_framework_installed();
-    let dotnet8_version = detect_dotnet8_runtime(paths);
+    let required_tml_dotnet_version = read_declared_tml_dotnet_version_opt(paths);
+    let dotnet8_version = detect_dotnet(paths);
+    let dotnet8_ready = is_dotnet8_ready(
+        dotnet8_version.as_deref(),
+        required_tml_dotnet_version.as_deref(),
+    );
     let steamcmd_path = find_steamcmd(paths, custom_steamcmd);
 
     EnvironmentStatus {
         terraria_installed,
         terraria_server_installed,
         tmodloader_installed,
+        terraria_content_available,
         dotnet8_version,
+        required_tml_dotnet_version,
+        dotnet8_ready,
         xna_installed,
         xna_msi_available,
         steamcmd_path,
     }
+}
+
+pub fn detect_environment(paths: &LauncherPaths, custom_steamcmd: Option<&str>) -> EnvironmentStatus {
+    detect_environment_with_dotnet(paths, custom_steamcmd, detect_dotnet8_runtime)
 }
 
 pub fn is_xna_framework_installed() -> bool {
@@ -283,8 +359,104 @@ pub fn query_system_dotnet8_runtime() -> Option<String> {
     query_dotnet8_runtime_bin(std::ffi::OsStr::new("dotnet"))
 }
 
+fn normalize_dotnet8_version(raw: &str) -> Option<String> {
+    let ver = raw.trim();
+    let valid_chars = ver
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if valid_chars && ver.starts_with("8.") && parse_version_triplet(ver).is_some() {
+        Some(ver.to_string())
+    } else {
+        None
+    }
+}
+
+/// Parses the required `.NET 8` runtime version from `tModLoader.runtimeconfig.json`.
+pub fn parse_dotnet_runtime_version_opt(json: &str) -> Option<String> {
+    let clean = json.trim_start_matches('\u{feff}');
+    let root: serde_json::Value = serde_json::from_str(clean).ok()?;
+    let runtime_options = root.get("runtimeOptions")?;
+
+    let from_single = runtime_options
+        .get("framework")
+        .and_then(|fw| {
+            let name_ok = fw
+                .get("name")
+                .and_then(|n| n.as_str())
+                .is_none_or(|n| n.eq_ignore_ascii_case("Microsoft.NETCore.App"));
+            if name_ok {
+                fw.get("version").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        })
+        .and_then(normalize_dotnet8_version);
+
+    if from_single.is_some() {
+        return from_single;
+    }
+
+    runtime_options
+        .get("frameworks")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|fw| {
+                let is_netcore = fw
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case("Microsoft.NETCore.App"));
+                if is_netcore {
+                    fw.get("version")
+                        .and_then(|v| v.as_str())
+                        .and_then(normalize_dotnet8_version)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+/// Reads the declared `.NET 8` runtime version from `tModLoader\tModLoader.runtimeconfig.json`.
+pub fn read_declared_tml_dotnet_version_opt(paths: &LauncherPaths) -> Option<String> {
+    let runtimeconfig_path = paths.tmodloader_dir.join("tModLoader.runtimeconfig.json");
+    let json = std::fs::read_to_string(runtimeconfig_path).ok()?;
+    parse_dotnet_runtime_version_opt(&json)
+}
+
+fn detect_dotnet8_runtime_with<FLocal, FSys>(
+    paths: &LauncherPaths,
+    query_local: FLocal,
+    query_system: FSys,
+) -> Option<String>
+where
+    FLocal: FnOnce(&LauncherPaths) -> Option<String>,
+    FSys: FnOnce() -> Option<String>,
+{
+    let req = read_declared_tml_dotnet_version_opt(paths);
+    let meets_req = |ver: &str| {
+        req.as_deref()
+            .is_none_or(|r| version_at_least_patch(ver, r))
+    };
+
+    let local_ver = query_local(paths);
+    if local_ver.as_deref().is_some_and(meets_req) {
+        return local_ver;
+    }
+
+    let sys_ver = query_system();
+    if sys_ver.as_deref().is_some_and(meets_req) {
+        return sys_ver;
+    }
+
+    local_ver.or(sys_ver)
+}
+
 pub fn detect_dotnet8_runtime(paths: &LauncherPaths) -> Option<String> {
-    query_local_dotnet8_runtime(paths).or_else(query_system_dotnet8_runtime)
+    detect_dotnet8_runtime_with(
+        paths,
+        query_local_dotnet8_runtime,
+        query_system_dotnet8_runtime,
+    )
 }
 
 fn parse_version_triplet(raw: &str) -> Option<(u64, u64, u64)> {
@@ -517,6 +689,18 @@ mod tests {
             clean_portable
         );
         assert_eq!(
+            detect_base_dir_for_exe(Some(
+                &clean_portable.join("TriHienKun Terraria Launcher.exe")
+            )),
+            clean_portable
+        );
+        assert_eq!(
+            detect_base_dir_for_exe(Some(
+                &clean_portable.join("TriHienKun_Terraria_Launcher.exe")
+            )),
+            clean_portable
+        );
+        assert_eq!(
             detect_base_dir_for_exe(Some(&clean_portable.join("other_tool.exe"))),
             PathBuf::from(r"C:\TerrariaLauncher")
         );
@@ -550,6 +734,73 @@ mod tests {
     }
 
     #[test]
+    fn detect_base_dir_for_exe_prefers_populated_default_root_from_desktop_or_downloads() {
+        let root = std::env::temp_dir().join(format!(
+            "tl_core_desktop_fallback_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let default_root = root.join("DefaultRoot");
+        let desktop = root.join("Desktop");
+        let downloads = root.join("Downloads");
+        let clean_portable = root.join("CleanPortable");
+        std::fs::create_dir_all(&default_root).unwrap();
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::create_dir_all(&clean_portable).unwrap();
+
+        let exe_names = [
+            "TerrariaLauncher.exe",
+            "TriHienKun Terraria Launcher.exe",
+            "TriHienKun_Terraria_Launcher.exe",
+        ];
+
+        for exe_name in exe_names {
+            assert_eq!(
+                detect_base_dir_for_exe_with_default(Some(&desktop.join(exe_name)), &default_root),
+                desktop
+            );
+            assert_eq!(
+                detect_base_dir_for_exe_with_default(
+                    Some(&downloads.join(exe_name)),
+                    &default_root
+                ),
+                downloads
+            );
+            assert_eq!(
+                detect_base_dir_for_exe_with_default(
+                    Some(&clean_portable.join(exe_name)),
+                    &default_root
+                ),
+                clean_portable
+            );
+        }
+
+        std::fs::create_dir_all(default_root.join("tModLoader")).unwrap();
+        for exe_name in exe_names {
+            assert_eq!(
+                detect_base_dir_for_exe_with_default(Some(&desktop.join(exe_name)), &default_root),
+                default_root
+            );
+            assert_eq!(
+                detect_base_dir_for_exe_with_default(
+                    Some(&downloads.join(exe_name)),
+                    &default_root
+                ),
+                default_root
+            );
+            assert_eq!(
+                detect_base_dir_for_exe_with_default(
+                    Some(&clean_portable.join(exe_name)),
+                    &default_root
+                ),
+                clean_portable
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn version_at_least_patch_enforces_same_major_minor_and_patch_floor() {
         assert!(version_at_least_patch("8.0.15", "8.0.0"));
         assert!(version_at_least_patch("8.0.15", "8.0.15"));
@@ -558,5 +809,131 @@ mod tests {
         assert!(!version_at_least_patch("9.0.0", "8.0.0"));
         assert!(!version_at_least_patch("8.1.0", "8.0.0"));
         assert!(!version_at_least_patch("invalid", "8.0.0"));
+    }
+
+    #[test]
+    fn parse_dotnet_runtime_version_opt_parses_bom_single_and_frameworks_array() {
+        let single_with_bom = "\u{feff}{\"runtimeOptions\":{\"framework\":{\"name\":\"Microsoft.NETCore.App\",\"version\":\"8.0.15\"}}}";
+        assert_eq!(
+            parse_dotnet_runtime_version_opt(single_with_bom).as_deref(),
+            Some("8.0.15")
+        );
+
+        let frameworks_array = r#"{
+            "runtimeOptions": {
+                "frameworks": [
+                    { "name": "Microsoft.WindowsDesktop.App", "version": "8.0.11" },
+                    { "name": "Microsoft.NETCore.App", "version": "8.0.14" }
+                ]
+            }
+        }"#;
+        assert_eq!(
+            parse_dotnet_runtime_version_opt(frameworks_array).as_deref(),
+            Some("8.0.14")
+        );
+
+        let non_8 = r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"9.0.1"}}}"#;
+        assert_eq!(parse_dotnet_runtime_version_opt(non_8), None);
+
+        let wrong_fw = r#"{"runtimeOptions":{"framework":{"name":"Microsoft.AspNetCore.App","version":"8.0.15"}}}"#;
+        assert_eq!(parse_dotnet_runtime_version_opt(wrong_fw), None);
+
+        let bad_triplet = r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0"}}}"#;
+        assert_eq!(parse_dotnet_runtime_version_opt(bad_triplet), None);
+        assert_eq!(parse_dotnet_runtime_version_opt("{bad json"), None);
+    }
+
+    #[test]
+    fn environment_status_checks_dotnet_patch_readiness_and_terraria_content() {
+        let root = std::env::temp_dir().join(format!("tl_core_env_{}", uuid::Uuid::new_v4()));
+        let mut paths = test_paths_under(&root);
+        std::fs::create_dir_all(&paths.tmodloader_dir).unwrap();
+        std::fs::write(
+            paths.tmodloader_dir.join("tModLoader.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0.15"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_declared_tml_dotnet_version_opt(&paths).as_deref(),
+            Some("8.0.15")
+        );
+
+        let outdated_env = detect_environment_with_dotnet(&paths, None, |_| Some("8.0.2".into()));
+        assert_eq!(
+            outdated_env.required_tml_dotnet_version.as_deref(),
+            Some("8.0.15")
+        );
+        assert_eq!(outdated_env.dotnet8_version.as_deref(), Some("8.0.2"));
+        assert!(!outdated_env.dotnet8_ready);
+        assert!(!outdated_env.terraria_content_available);
+
+        let ready_env = detect_environment_with_dotnet(&paths, None, |_| Some("8.0.15".into()));
+        assert!(ready_env.dotnet8_ready);
+
+        assert_eq!(
+            detect_dotnet8_runtime_with(&paths, |_| Some("8.0.2".into()), || Some("8.0.15".into()))
+                .as_deref(),
+            Some("8.0.15")
+        );
+        assert_eq!(
+            detect_dotnet8_runtime_with(&paths, |_| Some("8.0.15".into()), || Some("8.0.2".into()))
+                .as_deref(),
+            Some("8.0.15")
+        );
+        assert_eq!(
+            detect_dotnet8_runtime_with(&paths, |_| Some("8.0.2".into()), || Some("8.0.5".into()))
+                .as_deref(),
+            Some("8.0.2")
+        );
+
+        paths.terraria_dir = root.join("CustomTerrariaWithoutContent");
+        std::fs::create_dir_all(&paths.terraria_dir).unwrap();
+        let env_missing = detect_environment_with_dotnet(&paths, None, |_| None);
+        assert!(!env_missing.terraria_content_available);
+
+        std::fs::create_dir_all(root.join("Terraria").join("Content")).unwrap();
+        let env_sibling = detect_environment_with_dotnet(&paths, None, |_| None);
+        assert!(env_sibling.terraria_content_available);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_dotnet8_ready_with_checks_declared_requirement_and_runtime_version() {
+        let root =
+            std::env::temp_dir().join(format!("tl_core_dotnet_ready_{}", uuid::Uuid::new_v4()));
+        let paths = test_paths_under(&root);
+
+        assert!(!is_dotnet8_ready_with(&paths, |_| None));
+        assert!(is_dotnet8_ready_with(&paths, |_| Some("8.0.1".into())));
+
+        std::fs::create_dir_all(&paths.tmodloader_dir).unwrap();
+        std::fs::write(
+            paths.tmodloader_dir.join("tModLoader.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0.15"}}}"#,
+        )
+        .unwrap();
+
+        assert!(!is_dotnet8_ready_with(&paths, |_| None));
+        assert!(!is_dotnet8_ready_with(&paths, |_| Some("8.0.14".into())));
+        assert!(!is_dotnet8_ready_with(&paths, |_| Some("9.0.0".into())));
+        assert!(is_dotnet8_ready_with(&paths, |_| Some("8.0.15".into())));
+        assert!(is_dotnet8_ready_with(&paths, |_| Some("8.0.20".into())));
+        assert!(is_dotnet8_ready_with(&paths, |p| {
+            detect_dotnet8_runtime_with(p, |_| Some("8.0.2".into()), || Some("8.0.15".into()))
+        }));
+        assert!(!is_dotnet8_ready_with(&paths, |p| {
+            detect_dotnet8_runtime_with(p, |_| Some("8.0.2".into()), || Some("8.0.5".into()))
+        }));
+
+        std::fs::write(
+            paths.tmodloader_dir.join("tModLoader.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.999.999"}}}"#,
+        )
+        .unwrap();
+        assert!(!is_dotnet8_ready_for_paths(&paths));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

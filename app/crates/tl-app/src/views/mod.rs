@@ -57,6 +57,7 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
     let assets = state.assets.clone();
     let server_active = state.any_server_active();
+    let compact = ui.available_width() < 160.0;
 
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
@@ -68,11 +69,26 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 server_active,
             );
             ui.add_space(2.0);
-            ui.label(
-                RichText::new("Terraria\nLauncher")
-                    .font(crate::theme::ui_font_strong(16.0))
-                    .color(p.text_primary),
-            );
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add_space(if compact { 5.0 } else { 3.0 });
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("TriHienKun")
+                            .font(crate::theme::ui_font_strong(if compact { 13.5 } else { 15.0 }))
+                            .color(p.text_primary),
+                    )
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Terraria Launcher")
+                            .font(crate::theme::ui_font_strong(if compact { 11.0 } else { 12.5 }))
+                            .color(p.text_muted),
+                    )
+                    .truncate(),
+                );
+            });
         });
         ui.add_space(12.0);
 
@@ -142,16 +158,7 @@ fn render_sidebar(state: &mut AppState, ui: &mut egui::Ui) {
             );
 
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                if state.active_tab == NavTab::Settings && tab != NavTab::Settings {
-                    state.save_config();
-                    if !state.is_runtime_or_task_busy_for_paths() {
-                        state.refresh_environment();
-                    }
-                }
-                state.active_tab = tab;
-                if tab == NavTab::Server {
-                    state.refresh_worlds_and_backups();
-                }
+                state.switch_nav_tab(tab);
             }
             ui.add_space(4.0);
         }

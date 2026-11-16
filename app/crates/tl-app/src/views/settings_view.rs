@@ -53,7 +53,6 @@ fn render_components_and_installer_card(
         );
         ui.add_space(8.0);
 
-        let dotnet_ok = state.env.dotnet8_version.is_some();
         let steamcmd_ok = state.env.steamcmd_path.is_some();
         let mut do_recheck = false;
 
@@ -84,19 +83,17 @@ fn render_components_and_installer_card(
                     p.accent_red
                 },
             );
-            theme::status_pill(
-                ui,
-                if dotnet_ok {
-                    ".NET 8: Sẵn sàng"
-                } else {
-                    ".NET 8: Chưa có"
-                },
-                if dotnet_ok {
-                    p.accent_emerald
-                } else {
-                    p.accent_red
-                },
-            );
+            let (dotnet_pill_text, dotnet_pill_color) = if state.env.dotnet8_ready {
+                (".NET 8: Sẵn sàng".to_string(), p.accent_emerald)
+            } else if let (Some(ver), Some(req)) = (
+                &state.env.dotnet8_version,
+                &state.env.required_tml_dotnet_version,
+            ) {
+                (format!(".NET 8: {ver} (cần >= {req})"), p.accent_amber)
+            } else {
+                (".NET 8: Chưa có".to_string(), p.accent_red)
+            };
+            theme::status_pill(ui, &dotnet_pill_text, dotnet_pill_color);
             theme::status_pill(
                 ui,
                 if state.env.xna_installed {
@@ -138,8 +135,7 @@ fn render_components_and_installer_card(
             }
         });
 
-        if do_recheck {
-            state.refresh_environment();
+        if do_recheck && state.refresh_environment() {
             state.notify_ok("Đã kiểm tra lại trạng thái thành phần.");
         }
 
@@ -252,7 +248,6 @@ fn render_tml_installer_subcard(
         }
 
         ui.add_space(4.0);
-        let dotnet_ok = state.env.dotnet8_version.is_some();
         let steamcmd_missing = state.env.steamcmd_path.is_none();
         let mut do_install_tml = false;
         let mut do_install_dotnet = false;
@@ -289,10 +284,12 @@ fn render_tml_installer_subcard(
                 do_install_tml = true;
             }
 
-            let (dotnet_skin, dotnet_icon, dotnet_label) = if !dotnet_ok {
-                (ButtonSkin::Amber, UiIcon::Download, "Cài .NET 8")
-            } else {
+            let (dotnet_skin, dotnet_icon, dotnet_label) = if state.env.dotnet8_ready {
                 (ButtonSkin::Slate, UiIcon::Refresh, "Cài lại .NET 8")
+            } else if state.env.dotnet8_version.is_some() {
+                (ButtonSkin::Amber, UiIcon::Download, "Cập nhật .NET 8")
+            } else {
+                (ButtonSkin::Amber, UiIcon::Download, "Cài .NET 8")
             };
             if ui
                 .add_enabled_ui(can_install_tml, |ui| {
@@ -797,13 +794,21 @@ fn render_paths_and_proxy_card(
                 });
                 ui.end_row();
 
+                let steamcmd_locked = state.is_steamcmd_busy();
+                const STEAMCMD_LOCKED_HINT: &str =
+                    "Đang tải hoặc sử dụng SteamCMD (Workshop / ModPack).";
                 ui.label(RichText::new("Công cụ SteamCMD:").color(p.text_muted));
                 ui.horizontal(|ui| {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut state.config.custom_steamcmd_path)
-                            .desired_width(input_w)
-                            .hint_text("Mặc định (tự nhận diện)"),
-                    );
+                    let resp = ui
+                        .add_enabled_ui(!steamcmd_locked, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.config.custom_steamcmd_path)
+                                    .desired_width(input_w)
+                                    .hint_text("Mặc định (tự nhận diện)"),
+                            )
+                        })
+                        .inner
+                        .on_disabled_hover_text(STEAMCMD_LOCKED_HINT);
                     if resp.lost_focus() {
                         if pressed_enter {
                             explicit_apply = true;
@@ -811,15 +816,20 @@ fn render_paths_and_proxy_card(
                             auto_apply = true;
                         }
                     }
-                    if theme::rpg_compact_button(
-                        ui,
-                        assets,
-                        p,
-                        ButtonSkin::Slate,
-                        Some(UiIcon::Folder),
-                        "Chọn...",
-                    )
-                    .clicked()
+                    if ui
+                        .add_enabled_ui(!steamcmd_locked, |ui| {
+                            theme::rpg_compact_button(
+                                ui,
+                                assets,
+                                p,
+                                ButtonSkin::Slate,
+                                Some(UiIcon::Folder),
+                                "Chọn...",
+                            )
+                        })
+                        .inner
+                        .on_disabled_hover_text(STEAMCMD_LOCKED_HINT)
+                        .clicked()
                     {
                         if let Some(file) = rfd::FileDialog::new()
                             .add_filter("Executable", &["exe"])
@@ -831,7 +841,7 @@ fn render_paths_and_proxy_card(
                     }
                     let has_custom = !state.config.custom_steamcmd_path.trim().is_empty();
                     if ui
-                        .add_enabled_ui(has_custom, |ui| {
+                        .add_enabled_ui(!steamcmd_locked && has_custom, |ui| {
                             theme::rpg_compact_button(
                                 ui,
                                 assets,
@@ -842,6 +852,11 @@ fn render_paths_and_proxy_card(
                             )
                         })
                         .inner
+                        .on_disabled_hover_text(if steamcmd_locked {
+                            STEAMCMD_LOCKED_HINT
+                        } else {
+                            "Đang dùng đường dẫn mặc định"
+                        })
                         .clicked()
                     {
                         state.config.custom_steamcmd_path.clear();
@@ -919,29 +934,21 @@ fn render_paths_and_proxy_card(
             }
         });
 
-        if explicit_apply {
+        if explicit_apply || auto_apply {
+            let applied = state.refresh_environment();
             state.save_config();
-            if !paths_locked {
-                state.refresh_environment();
-            }
-            state.notify_ok("Đã lưu và áp dụng cài đặt.");
-        } else if auto_apply {
-            state.save_config();
-            if !paths_locked {
-                state.refresh_environment();
+            if explicit_apply && applied {
+                state.notify_ok("Đã lưu và áp dụng cài đặt.");
             }
         }
     });
 }
 
 fn priority_clean_label(prio: ProcessPriority) -> &'static str {
-    let raw = prio.label();
-    if raw.contains("Cao hơn") || raw.contains("Trên") || raw.contains("Above") {
-        "Cao hơn"
-    } else if raw.contains("Cao") || raw.contains("High") {
-        "Cao"
-    } else {
-        "Bình thường"
+    match prio {
+        ProcessPriority::Normal => "Bình thường",
+        ProcessPriority::AboveNormal => "Cao hơn",
+        ProcessPriority::High => "Cao",
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::game_runner::{
-    apply_dotnet_tokio_env, apply_dotnet_tuning_tokio_env, map_dotnet_spawn_error,
-    native_lib_path_env, resolve_dotnet_launch, split_shell_args, DotnetLaunchSpec,
-    RuntimeTuning,
+    apply_dotnet_tokio_env, apply_dotnet_tuning_tokio_env, has_terraria_content,
+    map_dotnet_spawn_error, native_lib_path_env, resolve_dotnet_launch, split_shell_args,
+    DotnetLaunchSpec, RuntimeTuning,
 };
 #[cfg(windows)]
 use crate::game_runner::windows_priority_flag;
@@ -16,11 +16,12 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tl_core::{
-    is_xna_framework_installed, prepare_folder_modpack_for_server, GameEdition, LauncherError,
-    LauncherPaths, LauncherResult, ServerConfigData, ServerProfile,
+    is_dotnet8_ready_for_paths, is_xna_framework_installed, prepare_folder_modpack_for_server,
+    read_declared_tml_dotnet_version_opt, GameEdition, LauncherError, LauncherPaths,
+    LauncherResult, ServerConfigData, ServerProfile,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -134,6 +135,9 @@ pub struct DetectedExternalServer {
     pub edition: GameEdition,
     pub port: Option<u16>,
     pub profile_id: Option<String>,
+    pub effective_world: Option<String>,
+    pub effective_modpack: Option<String>,
+    pub started_at_unix: u64,
     pub memory_mb: u64,
     pub cpu_percent: f32,
 }
@@ -199,7 +203,7 @@ impl Drop for KillOnCloseJob {
     }
 }
 
-fn resolve_effective_join_metadata(profile: &ServerProfile) -> (u16, String, String) {
+pub fn resolve_effective_join_metadata(profile: &ServerProfile) -> (u16, String, String) {
     let mut effective_port = profile.config.port;
     let mut effective_password = profile.config.password.clone();
     let mut effective_modpack = if profile.edition == GameEdition::TModLoader {
@@ -309,13 +313,20 @@ fn acquire_named_single_instance_guard(
 pub fn focus_existing_launcher_window() {
     #[cfg(windows)]
     {
-        if let Ok(hwnd) =
-            unsafe { FindWindowW(PCWSTR::null(), windows::core::w!("Terraria Launcher")) }
-        {
-            if !hwnd.is_invalid() {
-                let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-                let _ = unsafe { SetForegroundWindow(hwnd) };
-            }
+        let hwnd = [
+            windows::core::w!("TriHienKun Terraria Launcher"),
+            windows::core::w!("Terraria Launcher"),
+        ]
+        .into_iter()
+        .find_map(|title| {
+            unsafe { FindWindowW(PCWSTR::null(), title) }
+                .ok()
+                .filter(|hwnd| !hwnd.is_invalid())
+        });
+
+        if let Some(hwnd) = hwnd {
+            let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+            let _ = unsafe { SetForegroundWindow(hwnd) };
         }
     }
 }
@@ -347,6 +358,7 @@ struct ServerSharedState {
     snapshot: ServerRuntimeSnapshot,
     logs: VecDeque<ConsoleLogLine>,
     log_file_path: PathBuf,
+    playing_batch_names: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -354,6 +366,7 @@ pub struct ServerSupervisor {
     shared: Arc<RwLock<ServerSharedState>>,
     stdin_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     stop_requested: Arc<AtomicBool>,
+    auto_restart: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
     child_pid: Arc<Mutex<Option<u32>>>,
     run_generation: Arc<AtomicU64>,
@@ -397,9 +410,11 @@ impl ServerSupervisor {
                 },
                 logs: VecDeque::with_capacity(MAX_CONSOLE_LINES),
                 log_file_path,
+                playing_batch_names: Vec::new(),
             })),
             stdin_tx: Arc::new(Mutex::new(None)),
             stop_requested: Arc::new(AtomicBool::new(false)),
+            auto_restart: Arc::new(AtomicBool::new(profile.auto_restart)),
             stop_notify: Arc::new(Notify::new()),
             child_pid: Arc::new(Mutex::new(None)),
             run_generation: Arc::new(AtomicU64::new(0)),
@@ -469,6 +484,10 @@ impl ServerSupervisor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    pub fn set_auto_restart(&self, enabled: bool) {
+        self.auto_restart.store(enabled, Ordering::SeqCst);
     }
 
     fn request_ui_repaint(&self) {
@@ -740,16 +759,99 @@ pub fn resolve_tmodloader_server_modpack_config(
     Ok(())
 }
 
+pub fn rebase_portable_data_path(paths: &LauncherPaths, raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let raw_path = Path::new(trimmed);
+    if !raw_path.is_absolute() || raw_path.exists() {
+        return trimmed.to_string();
+    }
+
+    let normalized = trimmed.replace('\\', "/").to_ascii_lowercase();
+    let match_idx = ["/data/saves/", "/data/servers/"]
+        .into_iter()
+        .filter_map(|marker| normalized.rfind(marker))
+        .max();
+    let Some(idx) = match_idx else {
+        return trimmed.to_string();
+    };
+
+    let rel_raw = &trimmed[idx + "/data/".len()..];
+    let mut candidate = paths.data_dir.clone();
+    let mut has_segment = false;
+    for (seg_idx, seg) in rel_raw
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
+        if seg == "." || seg == ".." {
+            return trimmed.to_string();
+        }
+        if seg_idx == 0 && seg.eq_ignore_ascii_case("saves") {
+            candidate.push("Saves");
+        } else if seg_idx == 0 && seg.eq_ignore_ascii_case("servers") {
+            candidate.push("Servers");
+        } else {
+            candidate.push(seg);
+        }
+        has_segment = true;
+    }
+    if !has_segment {
+        return trimmed.to_string();
+    }
+
+    if candidate.exists() || candidate.parent().is_some_and(|p| p.is_dir()) {
+        candidate.to_string_lossy().into_owned()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn resolve_server_banlist_path(paths: &LauncherPaths, profile: &ServerProfile) -> PathBuf {
+    let rebased = rebase_portable_data_path(paths, &profile.config.banlist);
+    let ban_trimmed = rebased.trim();
+    if ban_trimmed.is_empty() || Path::new(ban_trimmed).is_relative() {
+        let file_name = Path::new(ban_trimmed)
+            .file_name()
+            .filter(|_| !ban_trimmed.is_empty())
+            .unwrap_or_else(|| OsStr::new("banlist.txt"));
+        paths.servers_dir.join(&profile.id).join(file_name)
+    } else {
+        PathBuf::from(ban_trimmed)
+    }
+}
+
+pub fn resolve_running_effective_modpack(
+    profile: &ServerProfile,
+    effective_cfg: &ServerConfigData,
+) -> String {
+    if profile.edition == GameEdition::TModLoader
+        && profile.config.modpath.trim().is_empty()
+        && (!effective_cfg.modpack.trim().is_empty() || !effective_cfg.modpath.trim().is_empty())
+    {
+        let configured = profile.config.modpack.trim();
+        if !configured.is_empty() {
+            configured.to_string()
+        } else {
+            resolve_effective_join_metadata(profile).2
+        }
+    } else {
+        String::new()
+    }
+}
+
 fn prepare_effective_server_config(
     paths: &LauncherPaths,
     profile: &ServerProfile,
-    server_dir: &Path,
     tuning: RuntimeTuning,
 ) -> LauncherResult<ServerConfigData> {
     let mut effective_cfg = profile.config.clone();
     if tuning.disable_builtin_upnp {
         effective_cfg.upnp = false;
     }
+    effective_cfg.worldpath = rebase_portable_data_path(paths, &effective_cfg.worldpath);
     if effective_cfg.worldpath.trim().is_empty() {
         effective_cfg.worldpath = match profile.edition {
             GameEdition::Vanilla => paths.vanilla_worlds_dir(),
@@ -758,7 +860,7 @@ fn prepare_effective_server_config(
         .to_string_lossy()
         .into_owned();
     }
-    effective_cfg.world = effective_cfg.world.trim().to_string();
+    effective_cfg.world = rebase_portable_data_path(paths, &effective_cfg.world);
     if effective_cfg.world.is_empty() && !effective_cfg.worldname.trim().is_empty() {
         effective_cfg.world = Path::new(&effective_cfg.worldpath)
             .join(format!("{}.wld", effective_cfg.worldname.trim()))
@@ -776,21 +878,21 @@ fn prepare_effective_server_config(
         effective_cfg.language = "en-US".to_string();
     }
 
-    let ban_trimmed = effective_cfg.banlist.trim();
-    if ban_trimmed.is_empty() || Path::new(ban_trimmed).is_relative() {
-        let file_name = Path::new(ban_trimmed)
-            .file_name()
-            .filter(|_| !ban_trimmed.is_empty())
-            .unwrap_or_else(|| OsStr::new("banlist.txt"));
-        effective_cfg.banlist = server_dir.join(file_name).to_string_lossy().into_owned();
-    } else {
-        effective_cfg.banlist = ban_trimmed.to_string();
-    }
-    if let Some(ban_parent) = Path::new(&effective_cfg.banlist).parent() {
+    let banlist_path = resolve_server_banlist_path(paths, profile);
+    if let Some(ban_parent) = banlist_path.parent() {
         let _ = fs::create_dir_all(ban_parent);
     }
-    if !Path::new(&effective_cfg.banlist).exists() {
-        let _ = fs::write(&effective_cfg.banlist, "");
+    if !banlist_path.exists() {
+        let _ = fs::write(&banlist_path, "");
+    }
+    effective_cfg.banlist = banlist_path.to_string_lossy().into_owned();
+
+    let (_, _, cli_modpack) = resolve_effective_join_metadata(profile);
+    if profile.edition == GameEdition::TModLoader
+        && effective_cfg.modpack.trim().is_empty()
+        && !cli_modpack.trim().is_empty()
+    {
+        effective_cfg.modpack = cli_modpack;
     }
     resolve_tmodloader_server_modpack_config(paths, profile.edition, &mut effective_cfg)?;
     Ok(effective_cfg)
@@ -818,17 +920,32 @@ pub fn start_server(
                     .to_string(),
             ));
         }
-    } else if !paths.tmodloader_dll().is_file() {
-        return Err(LauncherError::NotFound(format!(
-            "Không tìm thấy tModLoader.dll tại {}",
-            paths.tmodloader_dll().display()
-        )));
+    } else {
+        if !paths.tmodloader_dll().is_file() {
+            return Err(LauncherError::NotFound(format!(
+                "Không tìm thấy tModLoader.dll tại {}",
+                paths.tmodloader_dll().display()
+            )));
+        }
+        if !has_terraria_content(&paths) {
+            return Err(LauncherError::NotFound(
+                "Không tìm thấy thư mục Terraria\\Content cần thiết để chạy server tModLoader."
+                    .to_string(),
+            ));
+        }
+        if !is_dotnet8_ready_for_paths(&paths) {
+            let required = read_declared_tml_dotnet_version_opt(&paths)
+                .unwrap_or_else(|| "8.0".to_string());
+            return Err(LauncherError::NotFound(format!(
+                "Thiếu .NET {required} runtime cho server tModLoader. Hãy cài đặt hoặc kiểm tra .NET trong Cài đặt."
+            )));
+        }
     }
 
     let server_dir = paths.servers_dir.join(&profile.id);
     fs::create_dir_all(&server_dir)?;
 
-    let effective_cfg = prepare_effective_server_config(&paths, &profile, &server_dir, tuning)?;
+    let effective_cfg = prepare_effective_server_config(&paths, &profile, tuning)?;
 
     let config_file = server_dir.join("serverconfig.txt");
     fs::write(&config_file, effective_cfg.to_config_text(profile.edition))?;
@@ -838,8 +955,10 @@ pub fn start_server(
         .async_ctx
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some((rt.clone(), repaint_ctx.clone()));
-    let (effective_port, effective_password, effective_modpack) =
-        resolve_effective_join_metadata(&profile);
+    let (effective_port, effective_password, _) = resolve_effective_join_metadata(&profile);
+    let effective_modpack = resolve_running_effective_modpack(&profile, &effective_cfg);
+    let strip_cli_modpack =
+        profile.edition == GameEdition::TModLoader && !effective_cfg.modpath.trim().is_empty();
     {
         let mut guard = supervisor.shared.write().unwrap_or_else(|e| e.into_inner());
         guard.snapshot.state = ServerLifecycleState::Starting;
@@ -857,6 +976,7 @@ pub fn start_server(
             paths,
             profile,
             config_file,
+            strip_cli_modpack,
             tuning,
             repaint_ctx,
         )
@@ -883,6 +1003,7 @@ fn mark_stopped_by_request(sup: &ServerSupervisor, repaint: &egui_repaint::Repai
         let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
         guard.snapshot.pid = None;
         guard.snapshot.players.clear();
+        guard.playing_batch_names.clear();
         guard.snapshot.state = ServerLifecycleState::Stopped;
         guard.snapshot.status_detail = "Đã dừng theo yêu cầu".to_string();
     }
@@ -895,6 +1016,7 @@ async fn run_server_supervisor(
     paths: LauncherPaths,
     profile: ServerProfile,
     config_file: PathBuf,
+    strip_cli_modpack: bool,
     tuning: RuntimeTuning,
     repaint: egui_repaint::RepaintHandle,
 ) {
@@ -903,7 +1025,7 @@ async fn run_server_supervisor(
             mark_stopped_by_request(&sup, &repaint);
             break;
         }
-        match spawn_server_process(&paths, &profile, &config_file, tuning) {
+        match spawn_server_process(&paths, &profile, &config_file, strip_cli_modpack, tuning) {
             Ok(mut child) => {
                 #[cfg(windows)]
                 if let Some(job) = sup._job_object.as_ref() {
@@ -923,6 +1045,7 @@ async fn run_server_supervisor(
                     guard.snapshot.pid = pid;
                     guard.snapshot.state = ServerLifecycleState::Starting;
                     guard.snapshot.players.clear();
+                    guard.playing_batch_names.clear();
                 }
                 repaint.wake();
 
@@ -988,11 +1111,12 @@ async fn run_server_supervisor(
                     format!("[Launcher] Tiến trình server đã kết thúc ({exit_desc})."),
                 );
 
-                if clean_shutdown || !profile.auto_restart {
+                if clean_shutdown || !sup.auto_restart.load(Ordering::SeqCst) {
                     {
                         let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
                         guard.snapshot.pid = None;
                         guard.snapshot.players.clear();
+                        guard.playing_batch_names.clear();
                         if clean_shutdown {
                             guard.snapshot.state = ServerLifecycleState::Stopped;
                             guard.snapshot.status_detail = "Đã dừng".to_string();
@@ -1030,6 +1154,7 @@ async fn wait_for_auto_restart_or_stop(
         let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
         guard.snapshot.pid = None;
         guard.snapshot.players.clear();
+        guard.playing_batch_names.clear();
         guard.snapshot.state = ServerLifecycleState::Starting;
         guard.snapshot.status_detail = "Server tự khởi động lại sau 3 giây...".to_string();
     }
@@ -1051,6 +1176,7 @@ async fn wait_for_auto_restart_or_stop(
             guard.snapshot.pid = None;
             guard.snapshot.state = ServerLifecycleState::Stopped;
             guard.snapshot.players.clear();
+            guard.playing_batch_names.clear();
             guard.snapshot.status_detail = "Đã dừng theo yêu cầu".to_string();
         }
         sup.exit_notify.notify_waiters();
@@ -1061,12 +1187,46 @@ async fn wait_for_auto_restart_or_stop(
     true
 }
 
-fn spawn_server_process(
+fn filter_server_extra_args(extra_args: &str, strip_cli_modpack: bool) -> Vec<String> {
+    let args = split_shell_args(extra_args);
+    if !strip_cli_modpack {
+        return args;
+    }
+
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let trimmed = args[i].trim();
+        if trimmed.eq_ignore_ascii_case("-modpack") {
+            if let Some(next) = args.get(i + 1) {
+                if !next.trim().starts_with('-') {
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if trimmed
+            .split_once('=')
+            .is_some_and(|(flag, _)| flag.trim().eq_ignore_ascii_case("-modpack"))
+        {
+            i += 1;
+            continue;
+        }
+        filtered.push(args[i].clone());
+        i += 1;
+    }
+    filtered
+}
+
+fn build_server_command(
     paths: &LauncherPaths,
     profile: &ServerProfile,
     config_file: &Path,
+    strip_cli_modpack: bool,
     tuning: RuntimeTuning,
-) -> LauncherResult<Child> {
+) -> (Command, Option<DotnetLaunchSpec>) {
     let mut dotnet_spec: Option<DotnetLaunchSpec> = None;
     let mut cmd = match profile.edition {
         GameEdition::Vanilla => {
@@ -1098,12 +1258,26 @@ fn spawn_server_process(
     if !profile.config.upnp || tuning.disable_builtin_upnp {
         cmd.arg("-noupnp");
     }
-    for extra in split_shell_args(&profile.extra_args) {
+    let effective_strip = profile.edition == GameEdition::TModLoader && strip_cli_modpack;
+    for extra in filter_server_extra_args(&profile.extra_args, effective_strip) {
         cmd.arg(extra);
     }
 
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW | windows_priority_flag(tuning.process_priority));
+
+    (cmd, dotnet_spec)
+}
+
+fn spawn_server_process(
+    paths: &LauncherPaths,
+    profile: &ServerProfile,
+    config_file: &Path,
+    strip_cli_modpack: bool,
+    tuning: RuntimeTuning,
+) -> LauncherResult<Child> {
+    let (mut cmd, dotnet_spec) =
+        build_server_command(paths, profile, config_file, strip_cli_modpack, tuning);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1200,6 +1374,17 @@ fn parse_playing_player_line(normalized: &str) -> Option<(&str, &str)> {
     }
 }
 
+fn parse_players_connected_summary(normalized: &str) -> Option<usize> {
+    let cleaned = strip_prompt_prefix(normalized);
+    let count_str = cleaned
+        .strip_suffix(" players connected.")
+        .or_else(|| cleaned.strip_suffix(" player connected."))?;
+    if count_str.is_empty() || !count_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    count_str.parse::<usize>().ok().filter(|&n| n >= 1)
+}
+
 fn handle_server_output_line(sup: &ServerSupervisor, is_error: bool, raw_line: &str) {
     let clean = raw_line.trim_end_matches(['\r', '\n']);
     if clean.is_empty() {
@@ -1210,16 +1395,21 @@ fn handle_server_output_line(sup: &ServerSupervisor, is_error: bool, raw_line: &
     let (outcome, is_stopping) = {
         let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
         let now = Local::now().format("%H:%M:%S").to_string();
-        let snap = &mut guard.snapshot;
+        let state = &mut *guard;
         let is_stopping = sup.stop_requested.load(Ordering::SeqCst)
-            || snap.state == ServerLifecycleState::Stopping;
-        let outcome =
-            apply_log_event_to_state(clean, &now, &mut snap.status_detail, &mut snap.players);
+            || state.snapshot.state == ServerLifecycleState::Stopping;
+        let outcome = apply_log_event_to_state(
+            clean,
+            &now,
+            &mut state.snapshot.status_detail,
+            &mut state.snapshot.players,
+            &mut state.playing_batch_names,
+        );
         if let Some(parsed_port) = outcome.listening_port {
-            snap.port = parsed_port;
+            state.snapshot.port = parsed_port;
         }
         if outcome.became_running && !is_stopping {
-            snap.state = ServerLifecycleState::Running;
+            state.snapshot.state = ServerLifecycleState::Running;
         }
         (outcome, is_stopping)
     };
@@ -1234,6 +1424,7 @@ fn apply_log_event_to_state(
     timestamp: &str,
     status_detail: &mut String,
     players: &mut Vec<ConnectedPlayer>,
+    playing_batch_names: &mut Vec<String>,
 ) -> LogEventOutcome {
     let mut outcome = LogEventOutcome::default();
     let normalized = strip_prompt_prefix(text);
@@ -1266,6 +1457,7 @@ fn apply_log_event_to_state(
         *status_detail =
             "Đang chờ chọn World (nhập số thứ tự ở Console hoặc bật tự tạo)".to_string();
     } else if let Some(name) = normalized.strip_suffix(" has joined.") {
+        playing_batch_names.clear();
         let trimmed = name.trim();
         if !trimmed.is_empty() {
             if !players.iter().any(|p| p.name == trimmed) {
@@ -1278,11 +1470,19 @@ fn apply_log_event_to_state(
             outcome.player_joined = true;
         }
     } else if let Some(name) = normalized.strip_suffix(" has left.") {
+        playing_batch_names.clear();
         let trimmed = name.trim();
         players.retain(|p| p.name != trimmed);
     } else if normalized == "No players connected." {
         players.clear();
+        playing_batch_names.clear();
+    } else if parse_players_connected_summary(normalized).is_some() {
+        if !playing_batch_names.is_empty() {
+            players.retain(|p| playing_batch_names.contains(&p.name));
+            playing_batch_names.clear();
+        }
     } else if let Some((pname, ip_part)) = parse_playing_player_line(normalized) {
+        playing_batch_names.push(pname.to_string());
         let ip_str = ip_part.to_string();
         if let Some(existing) = players.iter_mut().find(|p| p.name == pname) {
             existing.ip = Some(ip_str);
@@ -1338,6 +1538,7 @@ pub fn summarize_server_log_lines(lines: &[ConsoleLogLine]) -> ExternalServerLog
         lines: lines.to_vec(),
         ..Default::default()
     };
+    let mut playing_batch_names = Vec::new();
 
     for line in lines {
         let text = line.text.trim_end_matches(['\r', '\n']);
@@ -1346,6 +1547,7 @@ pub fn summarize_server_log_lines(lines: &[ConsoleLogLine]) -> ExternalServerLog
             || text.starts_with("Running engine preload...")
         {
             summary.players.clear();
+            playing_batch_names.clear();
             summary.is_listening = false;
             summary.status_detail.clear();
             continue;
@@ -1356,6 +1558,7 @@ pub fn summarize_server_log_lines(lines: &[ConsoleLogLine]) -> ExternalServerLog
             &line.timestamp,
             &mut summary.status_detail,
             &mut summary.players,
+            &mut playing_batch_names,
         );
         if outcome.became_running {
             summary.is_listening = true;
@@ -1417,6 +1620,28 @@ pub fn read_server_log_summary(
     summarize_server_log_lines(&lines)
 }
 
+pub fn read_server_log_summary_if_fresh(
+    paths: &LauncherPaths,
+    profile_id: &str,
+    max_lines: usize,
+    min_mtime_unix: Option<u64>,
+) -> ExternalServerLogSummary {
+    if let Some(min_unix) = min_mtime_unix.filter(|&t| t > 0) {
+        let log_path = paths.servers_dir.join(profile_id).join("server.log");
+        let Ok(modified) = fs::metadata(&log_path).and_then(|m| m.modified()) else {
+            return ExternalServerLogSummary::default();
+        };
+        let log_mtime_unix = modified
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if log_mtime_unix < min_unix.saturating_sub(5) {
+            return ExternalServerLogSummary::default();
+        }
+    }
+    read_server_log_summary(paths, profile_id, max_lines)
+}
+
 /// Scans running OS processes for Terraria and tModLoader dedicated server instances.
 pub fn detect_existing_server_processes(
     sys: &mut System,
@@ -1443,23 +1668,17 @@ pub fn detect_existing_server_processes(
             continue;
         };
 
-        let port = parsed.port.or_else(|| {
-            parsed
-                .config_path
-                .as_deref()
-                .and_then(|cfg_path| fs::read_to_string(cfg_path).ok())
-                .and_then(|text| parse_port_from_serverconfig(&text))
-        });
-        let profile_id = parsed
-            .config_path
-            .as_deref()
-            .and_then(|cfg_path| extract_profile_id_from_config_path(cfg_path, paths));
+        let (port, profile_id, effective_world, effective_modpack) =
+            resolve_external_server_metadata(&parsed, paths);
 
         detected.push(DetectedExternalServer {
             pid: pid_u32,
             edition: parsed.edition,
             port,
             profile_id,
+            effective_world,
+            effective_modpack,
+            started_at_unix: proc_info.start_time(),
             memory_mb: proc_info.memory() / (1024 * 1024),
             cpu_percent: proc_info.cpu_usage(),
         });
@@ -1524,6 +1743,26 @@ struct ParsedServerCmdline {
     edition: GameEdition,
     port: Option<u16>,
     config_path: Option<PathBuf>,
+    world: Option<String>,
+    modpack: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedCliOptions {
+    port: Option<u16>,
+    config_path: Option<PathBuf>,
+    world: Option<String>,
+    modpack: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedServerConfigMetadata {
+    port: Option<u16>,
+    world: Option<String>,
+    worldpath: Option<String>,
+    worldname: Option<String>,
+    modpack: Option<String>,
+    modpath: Option<String>,
 }
 
 fn file_name_from_arg(raw: &str) -> &str {
@@ -1559,9 +1798,8 @@ fn is_tmodloader_dll_arg(raw: &str) -> bool {
     file_name_from_arg(raw).eq_ignore_ascii_case("tmodloader.dll")
 }
 
-fn extract_cli_options(args: &[String]) -> (Option<u16>, Option<PathBuf>) {
-    let mut port: Option<u16> = None;
-    let mut config_path: Option<PathBuf> = None;
+fn extract_cli_options(args: &[String]) -> ParsedCliOptions {
+    let mut opts = ParsedCliOptions::default();
     let mut i = 0;
 
     while i < args.len() {
@@ -1570,7 +1808,7 @@ fn extract_cli_options(args: &[String]) -> (Option<u16>, Option<PathBuf>) {
             if let Some(next) = args.get(i + 1) {
                 let cleaned = next.trim().trim_matches('"');
                 if !cleaned.is_empty() && !cleaned.starts_with('-') {
-                    config_path = Some(PathBuf::from(cleaned));
+                    opts.config_path = Some(PathBuf::from(cleaned));
                     i += 2;
                     continue;
                 }
@@ -1581,9 +1819,27 @@ fn extract_cli_options(args: &[String]) -> (Option<u16>, Option<PathBuf>) {
                 if !cleaned.starts_with('-') {
                     if let Ok(parsed) = cleaned.parse::<u16>() {
                         if parsed > 0 {
-                            port = Some(parsed);
+                            opts.port = Some(parsed);
                         }
                     }
+                    i += 2;
+                    continue;
+                }
+            }
+        } else if arg.eq_ignore_ascii_case("-world") {
+            if let Some(next) = args.get(i + 1) {
+                let cleaned = next.trim().trim_matches('"');
+                if !cleaned.is_empty() && !cleaned.starts_with('-') {
+                    opts.world = Some(cleaned.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+        } else if arg.eq_ignore_ascii_case("-modpack") {
+            if let Some(next) = args.get(i + 1) {
+                let cleaned = next.trim().trim_matches('"');
+                if !cleaned.is_empty() && !cleaned.starts_with('-') {
+                    opts.modpack = Some(cleaned.to_string());
                     i += 2;
                     continue;
                 }
@@ -1593,20 +1849,26 @@ fn extract_cli_options(args: &[String]) -> (Option<u16>, Option<PathBuf>) {
             let cleaned = value.trim().trim_matches('"');
             if flag.eq_ignore_ascii_case("-config") {
                 if !cleaned.is_empty() {
-                    config_path = Some(PathBuf::from(cleaned));
+                    opts.config_path = Some(PathBuf::from(cleaned));
                 }
             } else if flag.eq_ignore_ascii_case("-port") {
                 if let Ok(parsed) = cleaned.parse::<u16>() {
                     if parsed > 0 {
-                        port = Some(parsed);
+                        opts.port = Some(parsed);
                     }
                 }
+            } else if flag.eq_ignore_ascii_case("-world") {
+                if !cleaned.is_empty() {
+                    opts.world = Some(cleaned.to_string());
+                }
+            } else if flag.eq_ignore_ascii_case("-modpack") && !cleaned.is_empty() {
+                opts.modpack = Some(cleaned.to_string());
             }
         }
         i += 1;
     }
 
-    (port, config_path)
+    opts
 }
 
 fn parse_server_cmdline(exe_or_name: &str, args: &[String]) -> Option<ParsedServerCmdline> {
@@ -1629,32 +1891,125 @@ fn parse_server_cmdline(exe_or_name: &str, args: &[String]) -> Option<ParsedServ
         return None;
     };
 
-    let (port, config_path) = extract_cli_options(args);
+    let opts = extract_cli_options(args);
     Some(ParsedServerCmdline {
         edition,
-        port,
-        config_path,
+        port: opts.port,
+        config_path: opts.config_path,
+        world: opts.world,
+        modpack: opts.modpack,
     })
 }
 
-fn parse_port_from_serverconfig(text: &str) -> Option<u16> {
-    let mut port = None;
+fn parse_serverconfig_metadata(text: &str) -> ParsedServerConfigMetadata {
+    let mut meta = ParsedServerConfigMetadata::default();
     for raw_line in text.lines() {
         let line = raw_line.trim().trim_start_matches('\u{feff}');
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((key, val)) = line.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("port") {
-                if let Ok(parsed) = val.trim().parse::<u16>() {
-                    if parsed > 0 {
-                        port = Some(parsed);
-                    }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        if key.eq_ignore_ascii_case("port") {
+            if let Ok(parsed) = val.parse::<u16>() {
+                if parsed > 0 {
+                    meta.port = Some(parsed);
                 }
             }
+        } else if key.eq_ignore_ascii_case("world") {
+            meta.world = (!val.is_empty()).then(|| val.to_string());
+        } else if key.eq_ignore_ascii_case("worldpath") {
+            meta.worldpath = (!val.is_empty()).then(|| val.to_string());
+        } else if key.eq_ignore_ascii_case("worldname") {
+            meta.worldname = (!val.is_empty()).then(|| val.to_string());
+        } else if key.eq_ignore_ascii_case("modpack") {
+            meta.modpack = (!val.is_empty()).then(|| val.to_string());
+        } else if key.eq_ignore_ascii_case("modpath") {
+            meta.modpath = (!val.is_empty()).then(|| val.to_string());
         }
     }
-    port
+    meta
+}
+
+#[cfg(test)]
+fn parse_port_from_serverconfig(text: &str) -> Option<u16> {
+    parse_serverconfig_metadata(text).port
+}
+
+fn extract_modpack_name_from_modpath(raw_modpath: &str) -> Option<String> {
+    let trimmed = raw_modpath.trim().trim_end_matches(['\\', '/']);
+    let mut parts = trimmed.rsplit(['\\', '/']);
+    let last = parts.next()?;
+    if !last.eq_ignore_ascii_case("Mods") {
+        return None;
+    }
+    let pack_name = parts.next()?.trim();
+    let modpacks_dir = parts.next()?;
+    if modpacks_dir.eq_ignore_ascii_case("ModPacks") && !pack_name.is_empty() {
+        Some(pack_name.to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_external_server_metadata(
+    parsed: &ParsedServerCmdline,
+    paths: &LauncherPaths,
+) -> (Option<u16>, Option<String>, Option<String>, Option<String>) {
+    let cfg_meta = parsed
+        .config_path
+        .as_deref()
+        .filter(|cfg_path| cfg_path.is_file())
+        .and_then(|cfg_path| fs::read_to_string(cfg_path).ok())
+        .map(|text| parse_serverconfig_metadata(&text));
+
+    let port = parsed
+        .port
+        .or_else(|| cfg_meta.as_ref().and_then(|m| m.port));
+    let profile_id = parsed
+        .config_path
+        .as_deref()
+        .and_then(|cfg_path| extract_profile_id_from_config_path(cfg_path, paths));
+
+    let effective_world = parsed
+        .world
+        .clone()
+        .or_else(|| cfg_meta.as_ref().and_then(|m| m.world.clone()))
+        .or_else(|| {
+            let meta = cfg_meta.as_ref()?;
+            let wp = meta.worldpath.as_deref()?.trim();
+            let wn = meta.worldname.as_deref()?.trim();
+            if wp.is_empty() || wn.is_empty() {
+                None
+            } else {
+                Some(
+                    Path::new(wp)
+                        .join(format!("{wn}.wld"))
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+        });
+
+    let effective_modpack = if parsed.edition == GameEdition::TModLoader {
+        parsed
+            .modpack
+            .clone()
+            .or_else(|| cfg_meta.as_ref().and_then(|m| m.modpack.clone()))
+            .or_else(|| {
+                cfg_meta
+                    .as_ref()
+                    .and_then(|m| m.modpath.as_deref())
+                    .and_then(extract_modpack_name_from_modpath)
+            })
+    } else {
+        None
+    };
+
+    (port, profile_id, effective_world, effective_modpack)
 }
 
 fn clean_lexical_path(path: &Path) -> PathBuf {
@@ -2768,7 +3123,7 @@ mod tests {
         profile.config.world = missing_world.to_string_lossy().into_owned();
         profile.config.autocreate = None;
 
-        let err = prepare_effective_server_config(&paths, &profile, &server_dir, tuning)
+        let err = prepare_effective_server_config(&paths, &profile, tuning)
             .expect_err("missing world without autocreate must error before spawning");
         assert!(matches!(err, LauncherError::InvalidInput(_)));
 
@@ -2776,16 +3131,14 @@ mod tests {
         empty_world_profile.config.world.clear();
         empty_world_profile.config.worldname.clear();
         empty_world_profile.config.autocreate = Some(1);
-        let err_empty =
-            prepare_effective_server_config(&paths, &empty_world_profile, &server_dir, tuning)
-                .expect_err("empty world path must error even with autocreate");
+        let err_empty = prepare_effective_server_config(&paths, &empty_world_profile, tuning)
+            .expect_err("empty world path must error even with autocreate");
         assert!(matches!(err_empty, LauncherError::InvalidInput(_)));
 
         profile.config.autocreate = Some(2);
         profile.config.language = "   ".to_string();
         profile.config.banlist = "banlist.txt".to_string();
-        let effective =
-            prepare_effective_server_config(&paths, &profile, &server_dir, tuning).unwrap();
+        let effective = prepare_effective_server_config(&paths, &profile, tuning).unwrap();
         assert_eq!(effective.language, "en-US");
         assert_eq!(
             Path::new(&effective.banlist),
@@ -2794,8 +3147,7 @@ mod tests {
         assert!(Path::new(&effective.banlist).is_file());
 
         profile.config.banlist = "sub/custom_ban.txt".to_string();
-        let effective_rel =
-            prepare_effective_server_config(&paths, &profile, &server_dir, tuning).unwrap();
+        let effective_rel = prepare_effective_server_config(&paths, &profile, tuning).unwrap();
         assert_eq!(
             Path::new(&effective_rel.banlist),
             server_dir.join("custom_ban.txt").as_path()
@@ -2808,7 +3160,7 @@ mod tests {
         profile.config.autocreate = None;
         profile.config.banlist.clear();
         let effective_existing =
-            prepare_effective_server_config(&paths, &profile, &server_dir, tuning).unwrap();
+            prepare_effective_server_config(&paths, &profile, tuning).unwrap();
         assert_eq!(effective_existing.world, existing_world.to_string_lossy());
         assert_eq!(
             Path::new(&effective_existing.banlist),
@@ -2894,6 +3246,7 @@ mod tests {
                     paths_clone,
                     profile_clone,
                     config_file,
+                    false,
                     RuntimeTuning::default(),
                     egui_repaint::RepaintHandle::default(),
                 )
@@ -2908,5 +3261,407 @@ mod tests {
         assert_eq!(snap.status_detail, "Đã dừng theo yêu cầu");
         assert!(!terminate_process_by_pid(&mut sys, 0));
         assert!(!terminate_process_by_pid(&mut sys, std::process::id()));
+    }
+
+    #[test]
+    fn playing_output_prunes_ghost_players_across_log_summary_and_live_supervisor() {
+        assert_eq!(parse_players_connected_summary("1 player connected."), Some(1));
+        assert_eq!(parse_players_connected_summary(": 2 players connected."), Some(2));
+        assert_eq!(parse_players_connected_summary("0 players connected."), None);
+        assert_eq!(parse_players_connected_summary("<Alice> 1 player connected."), None);
+        assert_eq!(parse_players_connected_summary("foo player connected."), None);
+
+        let lines = vec![
+            ConsoleLogLine {
+                timestamp: "14:00:00".to_string(),
+                is_error: false,
+                text: "Listening on port 7777".to_string(),
+            },
+            ConsoleLogLine {
+                timestamp: "14:00:05".to_string(),
+                is_error: false,
+                text: "Alice has joined.".to_string(),
+            },
+            ConsoleLogLine {
+                timestamp: "14:00:06".to_string(),
+                is_error: false,
+                text: "GhostBob has joined.".to_string(),
+            },
+            ConsoleLogLine {
+                timestamp: "14:00:07".to_string(),
+                is_error: false,
+                text: "Charlie has joined.".to_string(),
+            },
+            ConsoleLogLine {
+                timestamp: "14:00:15".to_string(),
+                is_error: false,
+                text: ": Alice (127.0.0.1:60972)".to_string(),
+            },
+            ConsoleLogLine {
+                timestamp: "14:00:15".to_string(),
+                is_error: false,
+                text: ": Charlie (192.168.1.42:55100)".to_string(),
+            },
+            ConsoleLogLine {
+                timestamp: "14:00:15".to_string(),
+                is_error: false,
+                text: ": 2 players connected.".to_string(),
+            },
+        ];
+
+        let summary = summarize_server_log_lines(&lines);
+        assert_eq!(summary.players.len(), 2);
+        assert_eq!(summary.players[0].name, "Alice");
+        assert_eq!(summary.players[0].ip.as_deref(), Some("127.0.0.1:60972"));
+        assert_eq!(summary.players[1].name, "Charlie");
+        assert_eq!(summary.players[1].ip.as_deref(), Some("192.168.1.42:55100"));
+
+        let mut interrupted_lines = lines[..4].to_vec();
+        interrupted_lines.push(ConsoleLogLine {
+            timestamp: "14:00:16".to_string(),
+            is_error: false,
+            text: ": Alice (127.0.0.1:60972)".to_string(),
+        });
+        interrupted_lines.push(ConsoleLogLine {
+            timestamp: "14:00:16".to_string(),
+            is_error: false,
+            text: "Dave has joined.".to_string(),
+        });
+        interrupted_lines.push(ConsoleLogLine {
+            timestamp: "14:00:16".to_string(),
+            is_error: false,
+            text: "3 players connected.".to_string(),
+        });
+        let interrupted_summary = summarize_server_log_lines(&interrupted_lines);
+        assert_eq!(interrupted_summary.players.len(), 4);
+
+        let (_guard, paths) = make_temp_paths("tl_playing_prune");
+        let profile = ServerProfile::default();
+        let sup = ServerSupervisor::new(&paths, &profile);
+        handle_server_output_line(&sup, false, "Listening on port 7777");
+        handle_server_output_line(&sup, false, "Alice has joined.");
+        handle_server_output_line(&sup, false, "GhostBob has joined.");
+        handle_server_output_line(&sup, false, ": Alice (127.0.0.1:60972)");
+        handle_server_output_line(&sup, false, "1 player connected.");
+
+        let mut sys = System::new().unwrap();
+        let snap = sup.snapshot(&mut sys);
+        assert_eq!(snap.players.len(), 1);
+        assert_eq!(snap.players[0].name, "Alice");
+        assert_eq!(snap.players[0].ip.as_deref(), Some("127.0.0.1:60972"));
+
+        handle_server_output_line(&sup, false, "No players connected.");
+        assert!(sup.snapshot(&mut sys).players.is_empty());
+    }
+
+    #[test]
+    fn supervisor_set_auto_restart_updates_live_flag() {
+        let (_guard, paths) = make_temp_paths("tl_live_auto_restart");
+        let mut profile = ServerProfile {
+            auto_restart: false,
+            ..Default::default()
+        };
+        let sup = ServerSupervisor::new(&paths, &profile);
+        assert!(!sup.auto_restart.load(Ordering::SeqCst));
+
+        sup.set_auto_restart(true);
+        assert!(sup.auto_restart.load(Ordering::SeqCst));
+
+        sup.set_auto_restart(false);
+        assert!(!sup.auto_restart.load(Ordering::SeqCst));
+
+        profile.auto_restart = true;
+        let sup_enabled = ServerSupervisor::new(&paths, &profile);
+        assert!(sup_enabled.auto_restart.load(Ordering::SeqCst));
+        sup_enabled.set_auto_restart(false);
+        assert!(!sup_enabled.auto_restart.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn resolve_running_effective_modpack_clears_missing_override_and_vanilla() {
+        let (_guard, paths) = make_temp_paths("tl_running_modpack");
+        let mut profile = ServerProfile {
+            edition: GameEdition::TModLoader,
+            ..Default::default()
+        };
+        profile.config.modpack = "MissingPack".to_string();
+
+        let mut missing_cfg = profile.config.clone();
+        resolve_tmodloader_server_modpack_config(&paths, profile.edition, &mut missing_cfg).unwrap();
+        assert!(missing_cfg.modpack.is_empty());
+        assert!(missing_cfg.modpath.is_empty());
+        assert!(resolve_running_effective_modpack(&profile, &missing_cfg).is_empty());
+
+        fs::write(paths.tml_modpacks_dir().join("LegacyPack.json"), b"{}").unwrap();
+        profile.config.modpack = "  LegacyPack  ".to_string();
+        let mut legacy_cfg = profile.config.clone();
+        resolve_tmodloader_server_modpack_config(&paths, profile.edition, &mut legacy_cfg).unwrap();
+        assert!(legacy_cfg.modpath.is_empty());
+        assert_eq!(legacy_cfg.modpack, "LegacyPack");
+        assert_eq!(
+            resolve_running_effective_modpack(&profile, &legacy_cfg),
+            "LegacyPack"
+        );
+
+        let pack_mods = paths.tml_modpacks_dir().join("FolderPack").join("Mods");
+        fs::create_dir_all(&pack_mods).unwrap();
+        profile.config.modpack = "  FolderPack  ".to_string();
+        let mut folder_cfg = profile.config.clone();
+        resolve_tmodloader_server_modpack_config(&paths, profile.edition, &mut folder_cfg).unwrap();
+        assert_eq!(
+            resolve_running_effective_modpack(&profile, &folder_cfg),
+            "FolderPack"
+        );
+
+        let mut custom_modpath_profile = profile.clone();
+        custom_modpath_profile.config.modpath = r"C:\CustomMods".to_string();
+        assert!(
+            resolve_running_effective_modpack(&custom_modpath_profile, &folder_cfg).is_empty()
+        );
+
+        let mut vanilla_profile = profile.clone();
+        vanilla_profile.edition = GameEdition::Vanilla;
+        assert!(resolve_running_effective_modpack(&vanilla_profile, &folder_cfg).is_empty());
+    }
+
+    #[test]
+    fn start_server_checks_terraria_content_and_dotnet_runtime_for_tmodloader() {
+        let (_guard, paths) = make_temp_paths("tl_srv_preflight");
+        fs::create_dir_all(&paths.tmodloader_dir).unwrap();
+        fs::write(paths.tmodloader_dll(), b"dll").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let profile = ServerProfile {
+            id: "tml-preflight".to_string(),
+            edition: GameEdition::TModLoader,
+            ..Default::default()
+        };
+
+        let err = match start_server(
+            rt.handle(),
+            paths.clone(),
+            profile.clone(),
+            RuntimeTuning::default(),
+            egui_repaint::RepaintHandle::default(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("missing Terraria\\Content must be rejected"),
+        };
+        match err {
+            LauncherError::NotFound(msg) => {
+                assert!(msg.contains(r"Terraria\Content"), "unexpected message: {msg}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        fs::create_dir_all(paths.terraria_dir.join("Content")).unwrap();
+        fs::write(
+            paths.tmodloader_dir.join("tModLoader.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0.999"}}}"#,
+        )
+        .unwrap();
+
+        let err = match start_server(
+            rt.handle(),
+            paths,
+            profile,
+            RuntimeTuning::default(),
+            egui_repaint::RepaintHandle::default(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("unmet .NET version must fail preflight"),
+        };
+        match err {
+            LauncherError::NotFound(msg) => {
+                assert!(msg.contains("8.0.999"), "expected version in error: {msg}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_args_modpack_stages_folder_pack_and_strips_cli_flag() {
+        let (_guard, paths) = make_temp_paths("tl_cli_modpack_stage");
+        let pack_mods = paths
+            .tml_modpacks_dir()
+            .join("CliFolderPack")
+            .join("Mods");
+        fs::create_dir_all(&pack_mods).unwrap();
+        fs::write(pack_mods.join("enabled.json"), r#"["ExampleMod"]"#).unwrap();
+        let world_path = paths.tml_worlds_dir().join("CliWorld.wld");
+        fs::create_dir_all(world_path.parent().unwrap()).unwrap();
+        fs::write(&world_path, b"WLD").unwrap();
+
+        let mut profile = ServerProfile {
+            id: "cli-pack".to_string(),
+            edition: GameEdition::TModLoader,
+            extra_args: r#"-port 7788 -modpack "CliFolderPack" -secure"#.to_string(),
+            ..Default::default()
+        };
+        profile.config.world = world_path.to_string_lossy().into_owned();
+
+        let effective =
+            prepare_effective_server_config(&paths, &profile, RuntimeTuning::default()).unwrap();
+        assert!(effective.modpack.is_empty());
+        assert!(!effective.modpath.trim().is_empty());
+        assert_eq!(
+            resolve_running_effective_modpack(&profile, &effective),
+            "CliFolderPack"
+        );
+
+        let config_file = paths.servers_dir.join(&profile.id).join("serverconfig.txt");
+        let (cmd, _) =
+            build_server_command(&paths, &profile, &config_file, true, RuntimeTuning::default());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a.eq_ignore_ascii_case("-modpack")));
+        assert!(!args.iter().any(|a| a == "CliFolderPack"));
+        assert!(args.iter().any(|a| a == "-secure"));
+        assert!(args.iter().any(|a| a == "7788"));
+
+        let legacy_profile = ServerProfile {
+            id: "legacy-cli-pack".to_string(),
+            edition: GameEdition::TModLoader,
+            extra_args: r#"-modpack="LegacyPack" -secure"#.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            filter_server_extra_args(&legacy_profile.extra_args, true),
+            vec!["-secure"]
+        );
+        assert_eq!(
+            filter_server_extra_args(&legacy_profile.extra_args, false),
+            vec!["-modpack=LegacyPack", "-secure"]
+        );
+    }
+
+    #[test]
+    fn rebase_portable_data_path_and_resolve_server_banlist_path_handle_moved_root() {
+        let (_guard, paths) = make_temp_paths("tl_rebase_paths");
+        let worlds_dir = paths.vanilla_worlds_dir();
+        fs::create_dir_all(&worlds_dir).unwrap();
+        let moved_world = worlds_dir.join("MovedWorld.wld");
+        fs::write(&moved_world, b"WLD").unwrap();
+
+        let old_world_str = r"Z:\MissingDrive\OldLauncher\data\Saves\Vanilla\Worlds\MovedWorld.wld";
+        assert_eq!(
+            rebase_portable_data_path(&paths, old_world_str),
+            moved_world.to_string_lossy()
+        );
+        assert_eq!(
+            rebase_portable_data_path(&paths, "relative/banlist.txt"),
+            "relative/banlist.txt"
+        );
+        assert_eq!(
+            rebase_portable_data_path(&paths, &moved_world.to_string_lossy()),
+            moved_world.to_string_lossy()
+        );
+
+        let srv_dir = paths.servers_dir.join("moved-srv");
+        fs::create_dir_all(&srv_dir).unwrap();
+        let mut profile = ServerProfile {
+            id: "moved-srv".to_string(),
+            edition: GameEdition::Vanilla,
+            ..Default::default()
+        };
+        profile.config.worldpath = r"Z:/MissingDrive/DATA/saves/Vanilla/Worlds".to_string();
+        profile.config.world = old_world_str.to_string();
+        profile.config.banlist = r"Z:\MissingDrive\data\Servers\moved-srv\banlist.txt".to_string();
+
+        let resolved_ban = resolve_server_banlist_path(&paths, &profile);
+        assert_eq!(resolved_ban, srv_dir.join("banlist.txt"));
+
+        let effective =
+            prepare_effective_server_config(&paths, &profile, RuntimeTuning::default()).unwrap();
+        assert_eq!(effective.worldpath, worlds_dir.to_string_lossy());
+        assert_eq!(effective.world, moved_world.to_string_lossy());
+        assert_eq!(PathBuf::from(&effective.banlist), resolved_ban);
+    }
+
+    #[test]
+    fn detected_external_server_metadata_resolves_world_and_modpack_sources() {
+        let (_guard, paths) = make_temp_paths("tl_ext_srv_meta");
+        let cfg_dir = paths.servers_dir.join("ext-tml");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_path = cfg_dir.join("serverconfig.txt");
+        fs::write(
+            &cfg_path,
+            "port=7791\r\nworldpath=C:\\Worlds\r\nworldname=FallbackName\r\nmodpath=C:\\TL\\data\\Saves\\tModLoader\\ModPacks\\Calamity Pack\\Mods\r\n",
+        )
+        .unwrap();
+
+        let args_from_cfg = vec![
+            r"C:\TL\tModLoader\tModLoader.dll".to_string(),
+            "-server".to_string(),
+            "-config".to_string(),
+            cfg_path.to_string_lossy().into_owned(),
+        ];
+        let parsed_cfg = parse_server_cmdline("dotnet.exe", &args_from_cfg).unwrap();
+        let (port, profile_id, world, modpack) =
+            resolve_external_server_metadata(&parsed_cfg, &paths);
+        assert_eq!(port, Some(7791));
+        assert_eq!(profile_id.as_deref(), Some("ext-tml"));
+        assert_eq!(world.as_deref(), Some(r"C:\Worlds\FallbackName.wld"));
+        assert_eq!(modpack.as_deref(), Some("Calamity Pack"));
+
+        let args_cli_override = vec![
+            r"C:\TL\tModLoader\tModLoader.dll".to_string(),
+            "-server".to_string(),
+            "-config".to_string(),
+            cfg_path.to_string_lossy().into_owned(),
+            "-world".to_string(),
+            r"D:\Override.wld".to_string(),
+            "-modpack=OverPack".to_string(),
+        ];
+        let parsed_cli = parse_server_cmdline("dotnet.exe", &args_cli_override).unwrap();
+        let (_, _, cli_world, cli_modpack) = resolve_external_server_metadata(&parsed_cli, &paths);
+        assert_eq!(cli_world.as_deref(), Some(r"D:\Override.wld"));
+        assert_eq!(cli_modpack.as_deref(), Some("OverPack"));
+
+        fs::write(&cfg_path, "world=C:\\Explicit.wld\r\nmodpack=JsonPack\r\n").unwrap();
+        let parsed_explicit = parse_server_cmdline("dotnet.exe", &args_from_cfg).unwrap();
+        let (_, _, exp_world, exp_modpack) =
+            resolve_external_server_metadata(&parsed_explicit, &paths);
+        assert_eq!(exp_world.as_deref(), Some(r"C:\Explicit.wld"));
+        assert_eq!(exp_modpack.as_deref(), Some("JsonPack"));
+    }
+
+    #[test]
+    fn read_server_log_summary_if_fresh_rejects_stale_logs() {
+        let (_guard, paths) = make_temp_paths("tl_log_freshness");
+        let srv_dir = paths.servers_dir.join("fresh-check");
+        fs::create_dir_all(&srv_dir).unwrap();
+        let log_path = srv_dir.join("server.log");
+        fs::write(&log_path, "Listening on port 7777\r\nAlice has joined.\r\n").unwrap();
+
+        let mtime_secs = fs::metadata(&log_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let fresh = read_server_log_summary_if_fresh(&paths, "fresh-check", 200, Some(mtime_secs));
+        assert!(fresh.is_listening);
+        assert_eq!(fresh.players.len(), 1);
+
+        let stale = read_server_log_summary_if_fresh(
+            &paths,
+            "fresh-check",
+            200,
+            Some(mtime_secs + 60),
+        );
+        assert!(!stale.is_listening);
+        assert!(stale.players.is_empty());
+
+        let ignored = read_server_log_summary_if_fresh(&paths, "fresh-check", 200, None);
+        assert!(ignored.is_listening);
     }
 }

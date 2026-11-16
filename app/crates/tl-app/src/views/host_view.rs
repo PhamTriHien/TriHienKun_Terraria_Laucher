@@ -34,6 +34,12 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
         direct_status,
         DirectHostStatus::Running(_) | DirectHostStatus::Starting { .. }
     ) || pending_auto;
+    let missing_reason = match state.config.active_server() {
+        Some(active_profile) => {
+            super::server_view::server_edition_missing_reason(state, active_profile.edition)
+        }
+        None => Some("Chưa có hồ sơ server nào."),
+    };
 
     let effective_fw_port = state
         .direct_host_port_input
@@ -329,11 +335,27 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                     }
 
                     ui.label(RichText::new("Cổng mở:").color(p.text_muted));
-                    ui.add(
+                    let host_port_resp = ui.add(
                         egui::TextEdit::singleline(&mut state.direct_host_port_input)
                             .desired_width(64.0)
                             .hint_text(port.to_string()),
                     );
+                    if host_port_resp.changed() {
+                        if !direct_busy {
+                            if let Some(valid_port) = state
+                                .direct_host_port_input
+                                .trim()
+                                .parse::<u16>()
+                                .ok()
+                                .filter(|&pt| pt > 0)
+                            {
+                                state.port_probe_port = valid_port.to_string();
+                            }
+                        }
+                        ask_refresh_net = true;
+                    } else if host_port_resp.lost_focus() {
+                        ask_refresh_net = true;
+                    }
 
                     if ui
                         .checkbox(
@@ -380,13 +402,14 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                             state.cancel_pending_auto_direct_host(&active_profile_id);
                         }
                     } else if server_unstarted {
+                        let can_launch = !state.install_busy && port > 0 && missing_reason.is_none();
                         let launch_hint = if state.install_busy {
                             "Đang cài đặt thành phần..."
                         } else {
-                            "Cổng server phải lớn hơn 0"
+                            missing_reason.unwrap_or("Cổng server phải lớn hơn 0")
                         };
                         if ui
-                            .add_enabled_ui(!state.install_busy && port > 0, |ui| {
+                            .add_enabled_ui(can_launch, |ui| {
                                 rpg_button(
                                     ui,
                                     assets.as_ref(),
@@ -704,6 +727,14 @@ pub(super) fn render_players_and_banlist_card(
         ui.separator();
         ui.add_space(6.0);
 
+        let banlist_writable = !is_ext_readonly
+            || state
+                .active_external_server()
+                .and_then(|e| e.profile_id.as_ref())
+                .is_some();
+        let standalone_ban_hint =
+            "Server độc lập bên ngoài không gắn với hồ sơ banlist của Launcher";
+
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Cấm địa chỉ IP:").strong());
             ui.add(
@@ -717,10 +748,16 @@ pub(super) fn render_players_and_banlist_card(
                     .hint_text("Địa chỉ IP"),
             );
             let can_ban = !state.manual_ban_ip.trim().is_empty();
+            let ban_enabled = banlist_writable && can_ban;
+            let ban_hint = if !banlist_writable {
+                standalone_ban_hint
+            } else {
+                "Nhập địa chỉ IP cần cấm trước"
+            };
             let enter_ban =
-                can_ban && ip_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ban_enabled && ip_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let clicked_ban = ui
-                .add_enabled_ui(can_ban, |ui| {
+                .add_enabled_ui(ban_enabled, |ui| {
                     rpg_compact_button(
                         ui,
                         assets.as_ref(),
@@ -731,6 +768,7 @@ pub(super) fn render_players_and_banlist_card(
                     )
                 })
                 .inner
+                .on_disabled_hover_text(ban_hint)
                 .clicked();
             if clicked_ban || enter_ban {
                 state.add_manual_ban();
@@ -761,15 +799,20 @@ pub(super) fn render_players_and_banlist_card(
                         ui.label(RichText::new(&entry.label).strong());
                         ui.label(RichText::new(&entry.ip).monospace().color(p.text_muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if rpg_compact_button(
-                                ui,
-                                assets.as_ref(),
-                                p,
-                                ButtonSkin::Emerald,
-                                Some(UiIcon::Key),
-                                "Gỡ cấm",
-                            )
-                            .clicked()
+                            if ui
+                                .add_enabled_ui(banlist_writable, |ui| {
+                                    rpg_compact_button(
+                                        ui,
+                                        assets.as_ref(),
+                                        p,
+                                        ButtonSkin::Emerald,
+                                        Some(UiIcon::Key),
+                                        "Gỡ cấm",
+                                    )
+                                })
+                                .inner
+                                .on_disabled_hover_text(standalone_ban_hint)
+                                .clicked()
                             {
                                 unban_idx = Some(idx);
                             }

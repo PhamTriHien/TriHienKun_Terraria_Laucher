@@ -1,4 +1,4 @@
-use crate::config::write_atomic;
+use crate::config::{write_atomic, GameEdition};
 use crate::error::{LauncherError, LauncherResult};
 use crate::modpack_share::{
     is_safe_modpack_component, resolve_unique_modpack_name, sanitize_modpack_name,
@@ -618,9 +618,13 @@ pub fn create_modpack(
 
     save_enabled_mods(&pack_mods_dir.join("enabled.json"), enabled_mods)?;
 
-    let enabled_set: HashSet<&str> = enabled_mods.iter().map(String::as_str).collect();
+    let enabled_lower: HashSet<String> = enabled_mods
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
     for tmod in installed_tmods {
-        if enabled_set.contains(tmod.internal_name.as_str()) {
+        if enabled_lower.contains(&tmod.internal_name.trim().to_ascii_lowercase()) {
             let dest = pack_mods_dir.join(&tmod.file_name);
             let src = mods_dir.join(&tmod.file_name);
             if src.is_file() {
@@ -640,7 +644,7 @@ pub fn create_modpack(
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default()
                 });
-            if enabled_set.contains(internal_name.as_str()) {
+            if enabled_lower.contains(&internal_name.trim().to_ascii_lowercase()) {
                 local_tmod_count += 1;
             } else {
                 fs::remove_file(&p)?;
@@ -698,7 +702,7 @@ fn is_tmod_file(path: &Path) -> bool {
 pub fn backup_unsaved_enabled_mods_as_modpack(
     modpacks_dir: &Path,
     mods_dir: &Path,
-    _active_modpack: &str,
+    active_modpack: &str,
     installed_tmods: &[TmodMetadata],
     preferred_name: &str,
 ) -> LauncherResult<Option<ModPackInfo>> {
@@ -707,10 +711,31 @@ pub fn backup_unsaved_enabled_mods_as_modpack(
         return Ok(None);
     }
 
-    let current_set: HashSet<&str> = enabled.iter().map(String::as_str).collect();
+    let active = active_modpack.trim();
+    if !active.is_empty()
+        && is_safe_single_dir_component(active)
+        && modpacks_dir.join(active).join("Mods").is_dir()
+    {
+        let _ = sync_active_modpack_from_mods_dir(modpacks_dir, mods_dir, active, None);
+        return Ok(None);
+    }
+
+    let current_set: HashSet<String> = enabled
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if current_set.is_empty() {
+        return Ok(None);
+    }
     let existing_packs = list_modpacks(modpacks_dir)?;
     if existing_packs.iter().any(|pack| {
-        let pack_set: HashSet<&str> = pack.enabled_mods.iter().map(String::as_str).collect();
+        let pack_set: HashSet<String> = pack
+            .enabled_mods
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
         pack_set == current_set
     }) {
         return Ok(None);
@@ -819,10 +844,59 @@ pub fn sync_active_modpack_from_mods_dir(
     Ok(())
 }
 
-pub fn activate_modpack(
+fn cmp_ascii_case_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
+    for (ba, bb) in a.bytes().zip(b.bytes()) {
+        let ord = ba.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Compares mod version strings using numeric dot/dash/underscore components,
+/// falling back to ASCII case-insensitive comparison for non-numeric tokens.
+pub fn compare_mod_version_strings(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts_a: Vec<&str> = a
+        .trim()
+        .split(['.', '-', '_'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let parts_b: Vec<&str> = b
+        .trim()
+        .split(['.', '-', '_'])
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let max_len = parts_a.len().max(parts_b.len());
+    for i in 0..max_len {
+        let ord = match (parts_a.get(i).copied(), parts_b.get(i).copied()) {
+            (Some(pa), Some(pb)) => match (pa.parse::<u64>(), pb.parse::<u64>()) {
+                (Ok(na), Ok(nb)) => na.cmp(&nb),
+                _ => cmp_ascii_case_insensitive(pa, pb),
+            },
+            (Some(pa), None) => match pa.parse::<u64>() {
+                Ok(na) => na.cmp(&0),
+                Err(_) => std::cmp::Ordering::Greater,
+            },
+            (None, Some(pb)) => match pb.parse::<u64>() {
+                Ok(nb) => 0u64.cmp(&nb),
+                Err(_) => std::cmp::Ordering::Less,
+            },
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+pub fn activate_modpack_with_options(
     modpack_dir: &Path,
     target_mods_dir: &Path,
     copy_tmods: bool,
+    sync_back_to_pack: bool,
 ) -> LauncherResult<Vec<String>> {
     let pack_mods = modpack_dir.join("Mods");
     if !pack_mods.is_dir() {
@@ -839,7 +913,26 @@ pub fn activate_modpack(
             if p.is_file() && is_tmod_file(&p) {
                 let dest = target_mods_dir.join(entry.file_name());
                 if !files_have_same_content(&p, &dest)? {
-                    copy_file_atomic(&p, &dest)?;
+                    let target_newer_or_equal = if dest.is_file() {
+                        match (parse_tmod_file(&p), parse_tmod_file(&dest)) {
+                            (Ok(pack_meta), Ok(dest_meta)) => {
+                                compare_mod_version_strings(
+                                    &dest_meta.version,
+                                    &pack_meta.version,
+                                ) != std::cmp::Ordering::Less
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if target_newer_or_equal {
+                        if sync_back_to_pack {
+                            copy_file_atomic(&dest, &p)?;
+                        }
+                    } else {
+                        copy_file_atomic(&p, &dest)?;
+                    }
                 }
             }
         }
@@ -848,6 +941,14 @@ pub fn activate_modpack(
     let enabled = load_enabled_mods(&pack_mods.join("enabled.json"))?;
     save_enabled_mods(&target_mods_dir.join("enabled.json"), &enabled)?;
     Ok(enabled)
+}
+
+pub fn activate_modpack(
+    modpack_dir: &Path,
+    target_mods_dir: &Path,
+    copy_tmods: bool,
+) -> LauncherResult<Vec<String>> {
+    activate_modpack_with_options(modpack_dir, target_mods_dir, copy_tmods, true)
 }
 
 pub fn delete_modpack(modpack_dir: &Path) -> LauncherResult<()> {
@@ -902,19 +1003,69 @@ pub fn prepare_folder_modpack_for_server(
 
     let enabled = load_enabled_mods(&pack_mods_dir.join("enabled.json")).unwrap_or_default();
     if !enabled.is_empty() && mods_dir.is_dir() {
-        let enabled_set: HashSet<&str> = enabled.iter().map(String::as_str).collect();
         for tmod in scan_tmod_directory(mods_dir)? {
-            if enabled_set.contains(tmod.internal_name.as_str()) {
+            if enabled
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&tmod.internal_name))
+            {
                 let dest = pack_mods_dir.join(&tmod.file_name);
                 let src = mods_dir.join(&tmod.file_name);
-                if !dest.exists() && src.is_file() {
-                    fs::copy(&src, &dest)?;
+                if src.is_file() {
+                    let should_copy = !dest.is_file()
+                        || (!files_have_same_content(&src, &dest)?
+                            && parse_tmod_file(&dest)
+                                .map(|dm| {
+                                    compare_mod_version_strings(&tmod.version, &dm.version)
+                                        != std::cmp::Ordering::Less
+                                })
+                                .unwrap_or(true));
+                    if should_copy {
+                        copy_file_atomic(&src, &dest)?;
+                    }
                 }
             }
         }
     }
 
     Ok(Some(pack_mods_dir))
+}
+
+const BACKUP_META_FILENAME: &str = ".tl_backup_meta.json";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct BackupEditionMeta {
+    edition: GameEdition,
+}
+
+fn infer_backup_edition(
+    world_path: &Path,
+    twld_path: &Path,
+    edition_hint: Option<GameEdition>,
+) -> Option<GameEdition> {
+    if edition_hint.is_some() {
+        return edition_hint;
+    }
+    if twld_path.is_file() {
+        return Some(GameEdition::TModLoader);
+    }
+    let has_ancestor = |target: &str| {
+        world_path.parent().is_some_and(|parent| {
+            parent.components().any(|comp| {
+                matches!(
+                    comp,
+                    std::path::Component::Normal(s)
+                        if s.to_str().is_some_and(|name| name.eq_ignore_ascii_case(target))
+                )
+            })
+        })
+    };
+    if has_ancestor("tmodloader") {
+        Some(GameEdition::TModLoader)
+    } else if has_ancestor("vanilla") {
+        Some(GameEdition::Vanilla)
+    } else {
+        None
+    }
 }
 
 fn append_file_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -935,7 +1086,7 @@ fn format_modified_utc(meta: &fs::Metadata) -> String {
 
 pub fn inspect_world_backup_zip(
     zip_path: &Path,
-) -> (Option<crate::config::GameEdition>, Option<String>, bool) {
+) -> (Option<GameEdition>, Option<String>, bool) {
     let Ok(file) = File::open(zip_path) else {
         return (None, None, false);
     };
@@ -944,6 +1095,7 @@ pub fn inspect_world_backup_zip(
     };
 
     let mut has_twld = false;
+    let mut meta_edition: Option<GameEdition> = None;
     let mut primary_world_file: Option<String> = None;
     let mut world_format_version: Option<i32> = None;
     let mut has_relogic = false;
@@ -962,7 +1114,14 @@ pub fn inspect_world_backup_zip(
             continue;
         };
         let lower = fname.to_ascii_lowercase();
-        if lower.ends_with(".twld") {
+        if lower == BACKUP_META_FILENAME {
+            let mut raw = Vec::new();
+            if entry.take(4096).read_to_end(&mut raw).is_ok() {
+                if let Ok(parsed) = serde_json::from_slice::<BackupEditionMeta>(&raw) {
+                    meta_edition = Some(parsed.edition);
+                }
+            }
+        } else if lower.ends_with(".twld") {
             has_twld = true;
         } else if lower.ends_with(".wld") && primary_world_file.is_none() {
             primary_world_file = Some(fname);
@@ -984,12 +1143,16 @@ pub fn inspect_world_backup_zip(
     }
 
     let detected_edition = if has_twld {
-        Some(crate::config::GameEdition::TModLoader)
+        Some(GameEdition::TModLoader)
+    } else if world_format_version.is_some_and(|ver| ver >= 280) {
+        Some(GameEdition::Vanilla)
+    } else if let Some(ed) = meta_edition {
+        Some(ed)
     } else if primary_world_file.is_some()
         && world_format_version
             .is_some_and(|ver| ver >= 280 || ((140..280).contains(&ver) && has_relogic))
     {
-        Some(crate::config::GameEdition::Vanilla)
+        Some(GameEdition::Vanilla)
     } else {
         None
     };
@@ -997,8 +1160,13 @@ pub fn inspect_world_backup_zip(
     (detected_edition, primary_world_file, has_twld)
 }
 
-/// Archives `.wld` and matching `.twld`/`.bak` files into a timestamped backup ZIP.
-pub fn backup_world(world_path: &Path, backups_dir: &Path) -> LauncherResult<WorldBackupInfo> {
+/// Archives `.wld` and matching `.twld`/`.bak` files into a timestamped backup ZIP
+/// with optional explicit edition metadata.
+pub fn backup_world_for_edition(
+    world_path: &Path,
+    backups_dir: &Path,
+    edition_hint: Option<GameEdition>,
+) -> LauncherResult<WorldBackupInfo> {
     if !world_path.is_file() {
         return Err(LauncherError::NotFound(format!(
             "Không tìm thấy file thế giới {}",
@@ -1022,6 +1190,7 @@ pub fn backup_world(world_path: &Path, backups_dir: &Path) -> LauncherResult<Wor
     }
 
     let twld_path = world_path.with_extension("twld");
+    let resolved_edition = infer_backup_edition(world_path, &twld_path, edition_hint);
     let mut companions = vec![
         world_path.to_path_buf(),
         twld_path.clone(),
@@ -1049,6 +1218,11 @@ pub fn backup_world(world_path: &Path, backups_dir: &Path) -> LauncherResult<Wor
                 }
             }
         }
+        if let Some(edition) = resolved_edition {
+            let meta_bytes = serde_json::to_vec(&BackupEditionMeta { edition })?;
+            writer.start_file(BACKUP_META_FILENAME, options)?;
+            writer.write_all(&meta_bytes)?;
+        }
         let mut finished_file = writer.finish()?;
         finished_file.flush()?;
         drop(finished_file);
@@ -1075,6 +1249,11 @@ pub fn backup_world(world_path: &Path, backups_dir: &Path) -> LauncherResult<Wor
         detected_edition,
         primary_world_file,
     })
+}
+
+/// Archives `.wld` and matching `.twld`/`.bak` files into a timestamped backup ZIP.
+pub fn backup_world(world_path: &Path, backups_dir: &Path) -> LauncherResult<WorldBackupInfo> {
+    backup_world_for_edition(world_path, backups_dir, None)
 }
 
 pub fn list_world_backups(backups_dir: &Path) -> LauncherResult<Vec<WorldBackupInfo>> {
@@ -1108,6 +1287,21 @@ pub fn list_world_backups(backups_dir: &Path) -> LauncherResult<Vec<WorldBackupI
     Ok(backups)
 }
 
+fn is_allowed_world_restore_entry(name: &str) -> bool {
+    if name.eq_ignore_ascii_case(BACKUP_META_FILENAME) {
+        return false;
+    }
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    matches!(ext.as_deref(), Some("wld" | "twld" | "bak"))
+        || ext.as_deref().is_some_and(|e| {
+            e.strip_prefix("bak")
+                .is_some_and(|rest| rest.len() == 1 && matches!(rest.as_bytes()[0], b'2'..=b'9'))
+        })
+}
+
 pub fn restore_world_backup(zip_path: &Path, target_worlds_dir: &Path) -> LauncherResult<Vec<String>> {
     if !zip_path.is_file() {
         return Err(LauncherError::NotFound(format!(
@@ -1121,6 +1315,7 @@ pub fn restore_world_backup(zip_path: &Path, target_worlds_dir: &Path) -> Launch
     let mut restored = Vec::new();
     let mut restored_names = HashSet::new();
     let mut restored_wld_stems: Vec<String> = Vec::new();
+    let mut extracted_wld_count = 0usize;
 
     let stage_result = (|| -> LauncherResult<()> {
         for idx in 0..archive.len() {
@@ -1134,6 +1329,10 @@ pub fn restore_world_backup(zip_path: &Path, target_worlds_dir: &Path) -> Launch
             else {
                 continue;
             };
+            let name_str = safe_name.to_string_lossy().into_owned();
+            if !is_allowed_world_restore_entry(&name_str) {
+                continue;
+            }
             let final_path = target_worlds_dir.join(&safe_name);
             let tmp_path =
                 target_worlds_dir.join(format!(".{idx}_{}.tl_restore_tmp", Uuid::new_v4()));
@@ -1145,13 +1344,13 @@ pub fn restore_world_backup(zip_path: &Path, target_worlds_dir: &Path) -> Launch
                 out_file.flush()?;
             }
 
-            let name_str = safe_name.to_string_lossy().into_owned();
             restored_names.insert(name_str.to_ascii_lowercase());
             if final_path
                 .extension()
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case("wld"))
             {
+                extracted_wld_count += 1;
                 if let Some(stem) = final_path.file_stem().and_then(|s| s.to_str()) {
                     if !restored_wld_stems.iter().any(|s| s == stem) {
                         restored_wld_stems.push(stem.to_string());
@@ -1159,6 +1358,12 @@ pub fn restore_world_backup(zip_path: &Path, target_worlds_dir: &Path) -> Launch
                 }
             }
             restored.push(name_str);
+        }
+        if extracted_wld_count == 0 {
+            return Err(LauncherError::InvalidFormat(format!(
+                "Archive {} không chứa file thế giới (.wld) nào",
+                zip_path.display()
+            )));
         }
         Ok(())
     })();
@@ -1200,4 +1405,444 @@ pub fn restore_world_backup(zip_path: &Path, target_worlds_dir: &Path) -> Launch
     }
 
     Ok(restored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_dotnet_str(buf: &mut Vec<u8>, s: &str) {
+        let mut len = s.len();
+        loop {
+            let mut byte = (len & 0x7F) as u8;
+            len >>= 7;
+            if len != 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn write_test_tmod(path: &Path, internal_name: &str, version: &str) {
+        let mut tmod = Vec::new();
+        tmod.extend_from_slice(b"TMOD");
+        write_dotnet_str(&mut tmod, "2026.9.3.1");
+        tmod.extend_from_slice(&[0x11u8; 20]);
+        tmod.extend_from_slice(&[0u8; 256]);
+        tmod.extend_from_slice(&64i32.to_le_bytes());
+        write_dotnet_str(&mut tmod, internal_name);
+        write_dotnet_str(&mut tmod, version);
+        tmod.extend_from_slice(&0i32.to_le_bytes());
+        fs::write(path, &tmod).unwrap();
+    }
+
+    fn write_test_wld(path: &Path, format_version: i32, world_name: &str) {
+        let mut header = Vec::new();
+        write_dotnet_str(&mut header, world_name);
+        write_dotnet_str(&mut header, "123456");
+        header.extend_from_slice(&1u64.to_le_bytes());
+        header.extend_from_slice(&[7u8; 16]);
+        header.extend_from_slice(&42i32.to_le_bytes());
+        header.extend_from_slice(&[0u8; 16]);
+        header.extend_from_slice(&1800i32.to_le_bytes());
+        header.extend_from_slice(&6400i32.to_le_bytes());
+        header.extend_from_slice(&0i32.to_le_bytes());
+        header.extend_from_slice(&[0u8; 8]);
+
+        let mut wld = Vec::new();
+        wld.extend_from_slice(&format_version.to_le_bytes());
+        wld.extend_from_slice(b"relogic");
+        wld.push(2);
+        wld.extend_from_slice(&5u32.to_le_bytes());
+        wld.extend_from_slice(&1u64.to_le_bytes());
+        wld.extend_from_slice(&1i16.to_le_bytes());
+        let ptr_pos = wld.len();
+        wld.extend_from_slice(&0i32.to_le_bytes());
+        let header_offset = wld.len() as i32;
+        wld[ptr_pos..ptr_pos + 4].copy_from_slice(&header_offset.to_le_bytes());
+        wld.extend_from_slice(&header);
+        fs::write(path, &wld).unwrap();
+    }
+
+    #[test]
+    fn backup_world_for_edition_writes_meta_inspects_tml_and_skips_meta_on_restore() {
+        let root = make_temp_dir("tl_bp_world_meta");
+        let src_dir = root.join("CustomFolder");
+        let backups_dir = root.join("Backups");
+        let restore_dir = root.join("RestoredWorlds");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let wld_path = src_dir.join("ModOnlyWorld.wld");
+        write_test_wld(&wld_path, 279, "ModOnlyWorld");
+
+        let backup =
+            backup_world_for_edition(&wld_path, &backups_dir, Some(GameEdition::TModLoader))
+                .unwrap();
+        assert_eq!(backup.detected_edition, Some(GameEdition::TModLoader));
+        assert_eq!(
+            backup.primary_world_file.as_deref(),
+            Some("ModOnlyWorld.wld")
+        );
+
+        let mut archive = ZipArchive::new(File::open(&backup.file_path).unwrap()).unwrap();
+        {
+            let mut meta_entry = archive.by_name(BACKUP_META_FILENAME).unwrap();
+            let mut meta_raw = Vec::new();
+            meta_entry.read_to_end(&mut meta_raw).unwrap();
+            let parsed_meta: BackupEditionMeta = serde_json::from_slice(&meta_raw).unwrap();
+            assert_eq!(parsed_meta.edition, GameEdition::TModLoader);
+        }
+        drop(archive);
+
+        assert_eq!(
+            inspect_world_backup_zip(&backup.file_path),
+            (
+                Some(GameEdition::TModLoader),
+                Some("ModOnlyWorld.wld".to_string()),
+                false
+            )
+        );
+
+        let restored = restore_world_backup(&backup.file_path, &restore_dir).unwrap();
+        assert_eq!(restored, vec!["ModOnlyWorld.wld".to_string()]);
+        assert!(restore_dir.join("ModOnlyWorld.wld").is_file());
+        assert!(!restore_dir.join(BACKUP_META_FILENAME).exists());
+
+        let tml_ancestor_dir = root.join("Saves").join("tModLoader").join("Worlds");
+        fs::create_dir_all(&tml_ancestor_dir).unwrap();
+        let ancestor_wld = tml_ancestor_dir.join("AncestorWorld.wld");
+        write_test_wld(&ancestor_wld, 279, "AncestorWorld");
+        let inferred_backup = backup_world(&ancestor_wld, &backups_dir).unwrap();
+        assert_eq!(
+            inferred_backup.detected_edition,
+            Some(GameEdition::TModLoader)
+        );
+
+        let vanilla_280_wld = src_dir.join("Vanilla280.wld");
+        write_test_wld(&vanilla_280_wld, 280, "Vanilla280");
+        let forced_hint_280 =
+            backup_world_for_edition(&vanilla_280_wld, &backups_dir, Some(GameEdition::TModLoader))
+                .unwrap();
+        assert_eq!(forced_hint_280.detected_edition, Some(GameEdition::Vanilla));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compare_mod_version_strings_and_version_aware_modpack_sync() {
+        assert_eq!(
+            compare_mod_version_strings("1.2.10", "1.2.3"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_mod_version_strings("1.2.0", "1.2"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_mod_version_strings("1.0_10", "1.0_2"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_mod_version_strings("1.0-BETA", "1.0-beta"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_mod_version_strings("1.0-alpha", "1.0-beta"),
+            Ordering::Less
+        );
+
+        let root = make_temp_dir("tl_bp_modpack_ver");
+        let modpacks_dir = root.join("ModPacks");
+        let mods_dir = root.join("Mods");
+        let pack_dir = modpacks_dir.join("VersionPack");
+        let pack_mods = pack_dir.join("Mods");
+        fs::create_dir_all(&mods_dir).unwrap();
+        fs::create_dir_all(&pack_mods).unwrap();
+
+        save_enabled_mods(
+            &pack_mods.join("enabled.json"),
+            &[
+                "KeepNewer".to_string(),
+                "UpgradeFromPack".to_string(),
+                "RepairCorrupt".to_string(),
+            ],
+        )
+        .unwrap();
+
+        write_test_tmod(&pack_mods.join("KeepNewer.tmod"), "KeepNewer", "1.2.3");
+        write_test_tmod(&mods_dir.join("KeepNewer.tmod"), "KeepNewer", "1.2.10");
+
+        write_test_tmod(
+            &pack_mods.join("UpgradeFromPack.tmod"),
+            "UpgradeFromPack",
+            "2.0.0",
+        );
+        write_test_tmod(
+            &mods_dir.join("UpgradeFromPack.tmod"),
+            "UpgradeFromPack",
+            "1.5.0",
+        );
+
+        write_test_tmod(
+            &pack_mods.join("RepairCorrupt.tmod"),
+            "RepairCorrupt",
+            "1.0.0",
+        );
+        fs::write(mods_dir.join("RepairCorrupt.tmod"), b"BROKEN_TMOD").unwrap();
+
+        activate_modpack(&pack_dir, &mods_dir, true).unwrap();
+
+        assert_eq!(
+            parse_tmod_file(&mods_dir.join("KeepNewer.tmod"))
+                .unwrap()
+                .version,
+            "1.2.10"
+        );
+        assert_eq!(
+            parse_tmod_file(&pack_mods.join("KeepNewer.tmod"))
+                .unwrap()
+                .version,
+            "1.2.10"
+        );
+        assert_eq!(
+            parse_tmod_file(&mods_dir.join("UpgradeFromPack.tmod"))
+                .unwrap()
+                .version,
+            "2.0.0"
+        );
+        assert_eq!(
+            parse_tmod_file(&mods_dir.join("RepairCorrupt.tmod"))
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+
+        let srv_pack_mods = modpacks_dir.join("ServerCasePack").join("Mods");
+        fs::create_dir_all(&srv_pack_mods).unwrap();
+        save_enabled_mods(
+            &srv_pack_mods.join("enabled.json"),
+            &[
+                "keepnewer".to_string(),
+                "upgradefrompack".to_string(),
+                "repaircorrupt".to_string(),
+            ],
+        )
+        .unwrap();
+
+        write_test_tmod(&mods_dir.join("KeepNewer.tmod"), "KeepNewer", "1.2.3");
+        write_test_tmod(&srv_pack_mods.join("KeepNewer.tmod"), "KeepNewer", "1.2.10");
+
+        write_test_tmod(
+            &mods_dir.join("UpgradeFromPack.tmod"),
+            "UpgradeFromPack",
+            "3.0.0",
+        );
+        write_test_tmod(
+            &srv_pack_mods.join("UpgradeFromPack.tmod"),
+            "UpgradeFromPack",
+            "2.0.0",
+        );
+
+        write_test_tmod(
+            &mods_dir.join("RepairCorrupt.tmod"),
+            "RepairCorrupt",
+            "1.1.0",
+        );
+        fs::write(srv_pack_mods.join("RepairCorrupt.tmod"), b"CORRUPT").unwrap();
+
+        prepare_folder_modpack_for_server(&modpacks_dir, &mods_dir, "ServerCasePack").unwrap();
+
+        assert_eq!(
+            parse_tmod_file(&srv_pack_mods.join("KeepNewer.tmod"))
+                .unwrap()
+                .version,
+            "1.2.10"
+        );
+        assert_eq!(
+            parse_tmod_file(&srv_pack_mods.join("UpgradeFromPack.tmod"))
+                .unwrap()
+                .version,
+            "3.0.0"
+        );
+        assert_eq!(
+            parse_tmod_file(&srv_pack_mods.join("RepairCorrupt.tmod"))
+                .unwrap()
+                .version,
+            "1.1.0"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn activate_modpack_with_options_no_sync_back_leaves_pack_tmods_untouched() {
+        let root = make_temp_dir("tl_bp_activate_no_sync_back");
+        let pack_dir = root.join("Pack");
+        let pack_mods = pack_dir.join("Mods");
+        let target_mods = root.join("TargetMods");
+        fs::create_dir_all(&pack_mods).unwrap();
+        fs::create_dir_all(&target_mods).unwrap();
+
+        save_enabled_mods(
+            &pack_mods.join("enabled.json"),
+            &[
+                "KeepTargetNewer".to_string(),
+                "EqualVerDifferentBytes".to_string(),
+                "UpgradeTarget".to_string(),
+            ],
+        )
+        .unwrap();
+
+        write_test_tmod(
+            &pack_mods.join("KeepTargetNewer.tmod"),
+            "KeepTargetNewer",
+            "1.0.0",
+        );
+        write_test_tmod(
+            &target_mods.join("KeepTargetNewer.tmod"),
+            "KeepTargetNewer",
+            "1.5.0",
+        );
+
+        write_test_tmod(
+            &pack_mods.join("EqualVerDifferentBytes.tmod"),
+            "EqualVerDifferentBytes",
+            "2.0.0",
+        );
+        write_test_tmod(
+            &target_mods.join("EqualVerDifferentBytes.tmod"),
+            "EqualVerDifferentBytes",
+            "2.0.0",
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(target_mods.join("EqualVerDifferentBytes.tmod"))
+            .unwrap()
+            .write_all(b"EXTRA")
+            .unwrap();
+        let pack_equal_sha_before =
+            sha1_file_hex(&pack_mods.join("EqualVerDifferentBytes.tmod")).unwrap();
+
+        write_test_tmod(&pack_mods.join("UpgradeTarget.tmod"), "UpgradeTarget", "3.0.0");
+        write_test_tmod(&target_mods.join("UpgradeTarget.tmod"), "UpgradeTarget", "2.0.0");
+
+        let enabled =
+            activate_modpack_with_options(&pack_dir, &target_mods, true, false).unwrap();
+        assert_eq!(
+            enabled,
+            vec!["KeepTargetNewer", "EqualVerDifferentBytes", "UpgradeTarget"]
+        );
+
+        assert_eq!(
+            parse_tmod_file(&target_mods.join("KeepTargetNewer.tmod"))
+                .unwrap()
+                .version,
+            "1.5.0"
+        );
+        assert_eq!(
+            parse_tmod_file(&pack_mods.join("KeepTargetNewer.tmod"))
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+        assert_eq!(
+            sha1_file_hex(&pack_mods.join("EqualVerDifferentBytes.tmod")).unwrap(),
+            pack_equal_sha_before
+        );
+        assert_eq!(
+            parse_tmod_file(&target_mods.join("UpgradeTarget.tmod"))
+                .unwrap()
+                .version,
+            "3.0.0"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_world_backup_filters_non_world_entries_and_rejects_archives_without_wld() {
+        let root = make_temp_dir("tl_bp_restore_filter");
+        let target_dir = root.join("Worlds");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("Existing.wld"), b"KEEP_WLD").unwrap();
+        fs::write(target_dir.join("Existing.twld"), b"KEEP_TWLD").unwrap();
+
+        let hybrid_zip = root.join("hybrid.zip");
+        {
+            let mut writer = ZipWriter::new(File::create(&hybrid_zip).unwrap());
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer.start_file("Worlds/NewWorld.WLD", opts).unwrap();
+            writer.write_all(b"NEW_WLD").unwrap();
+            writer.start_file("Worlds/NewWorld.twld", opts).unwrap();
+            writer.write_all(b"NEW_TWLD").unwrap();
+            writer.start_file("Worlds/NewWorld.wld.bak", opts).unwrap();
+            writer.write_all(b"NEW_BAK").unwrap();
+            writer.start_file("Worlds/NewWorld.wld.bak2", opts).unwrap();
+            writer.write_all(b"NEW_BAK2").unwrap();
+            writer.start_file("Mods/BadMod.tmod", opts).unwrap();
+            writer.write_all(b"SHOULD_NOT_EXTRACT").unwrap();
+            writer.start_file("README.txt", opts).unwrap();
+            writer.write_all(b"IGNORE_ME").unwrap();
+            writer.start_file(BACKUP_META_FILENAME, opts).unwrap();
+            writer.write_all(br#"{"edition":"TModLoader"}"#).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let restored = restore_world_backup(&hybrid_zip, &target_dir).unwrap();
+        assert_eq!(
+            restored,
+            vec![
+                "NewWorld.WLD",
+                "NewWorld.twld",
+                "NewWorld.wld.bak",
+                "NewWorld.wld.bak2"
+            ]
+        );
+        assert!(target_dir.join("NewWorld.WLD").is_file());
+        assert!(target_dir.join("NewWorld.twld").is_file());
+        assert!(target_dir.join("NewWorld.wld.bak").is_file());
+        assert!(target_dir.join("NewWorld.wld.bak2").is_file());
+        assert!(!target_dir.join("BadMod.tmod").exists());
+        assert!(!target_dir.join("README.txt").exists());
+        assert!(!target_dir.join(BACKUP_META_FILENAME).exists());
+
+        let no_wld_zip = root.join("no_wld.zip");
+        {
+            let mut writer = ZipWriter::new(File::create(&no_wld_zip).unwrap());
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer.start_file("Existing.twld", opts).unwrap();
+            writer.write_all(b"OVERWRITE_TWLD").unwrap();
+            writer.start_file("SomeMod.tmod", opts).unwrap();
+            writer.write_all(b"MOD").unwrap();
+            writer.start_file("README.txt", opts).unwrap();
+            writer.write_all(b"TXT").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let err = restore_world_backup(&no_wld_zip, &target_dir).unwrap_err();
+        assert!(matches!(err, LauncherError::InvalidFormat(_)));
+        assert_eq!(fs::read(target_dir.join("Existing.wld")).unwrap(), b"KEEP_WLD");
+        assert_eq!(
+            fs::read(target_dir.join("Existing.twld")).unwrap(),
+            b"KEEP_TWLD"
+        );
+        let has_tmp = fs::read_dir(&target_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".tl_restore_tmp"));
+        assert!(!has_tmp);
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

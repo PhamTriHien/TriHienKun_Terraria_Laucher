@@ -2,10 +2,10 @@
 name = "tl-app"
 version.workspace = true
 edition.workspace = true
-default-run = "TerrariaLauncher"
+default-run = "TriHienKun_Terraria_Launcher"
 
 [[bin]]
-name = "TerrariaLauncher"
+name = "TriHienKun_Terraria_Launcher"
 path = "src/main.rs"
 
 [lints]

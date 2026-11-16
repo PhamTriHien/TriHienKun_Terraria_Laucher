@@ -5,7 +5,8 @@ pub mod modpack_share;
 pub mod paths;
 
 pub use binary_parsers::{
-    activate_modpack, backup_unsaved_enabled_mods_as_modpack, backup_world, create_modpack,
+    activate_modpack, activate_modpack_with_options, backup_unsaved_enabled_mods_as_modpack,
+    backup_world, backup_world_for_edition, compare_mod_version_strings, create_modpack,
     delete_modpack, inspect_world_backup_zip, is_safe_single_dir_component, list_modpacks,
     list_world_backups, load_enabled_mods, parse_tmod_file, parse_world_file,
     prepare_folder_modpack_for_server, restore_world_backup, save_enabled_mods,
@@ -26,8 +27,10 @@ pub use modpack_share::{
 };
 pub use paths::{
     detect_base_dir_for_exe, detect_environment, detect_exact_bundled_dotnet_runtime,
-    is_xna_framework_installed, query_local_dotnet8_runtime, query_system_dotnet8_runtime,
-    version_at_least_patch, EnvironmentStatus, LauncherPaths,
+    is_dotnet8_ready_for_paths, is_xna_framework_installed, parse_dotnet_runtime_version_opt,
+    query_local_dotnet8_runtime, query_system_dotnet8_runtime,
+    read_declared_tml_dotnet_version_opt, version_at_least_patch, EnvironmentStatus,
+    LauncherPaths,
 };
 
 #[cfg(test)]
@@ -211,6 +214,7 @@ mod tests {
                     source: SharedModSource::Workshop {
                         id: "2824688072".to_string(),
                     },
+                    enabled: true,
                 },
                 SharedModEntry {
                     internal_name: "RecipeBrowser".to_string(),
@@ -220,6 +224,7 @@ mod tests {
                         repo: "JavidPack/RecipeBrowser".to_string(),
                         url: String::new(),
                     },
+                    enabled: true,
                 },
                 SharedModEntry {
                     internal_name: "MagicStorage".to_string(),
@@ -229,6 +234,7 @@ mod tests {
                         repo: "blushiemagic/MagicStorage".to_string(),
                         url: "https://github.com/blushiemagic/MagicStorage/releases/download/v0.7.0/MagicStorage.tmod".to_string(),
                     },
+                    enabled: true,
                 },
                 SharedModEntry {
                     internal_name: "CustomUrlMod".to_string(),
@@ -237,12 +243,14 @@ mod tests {
                     source: SharedModSource::Url {
                         url: "https://cdn.example.com/mods/CustomUrlMod.tmod?dl=1".to_string(),
                     },
+                    enabled: true,
                 },
                 SharedModEntry {
                     internal_name: "LocalOnlyMod".to_string(),
                     display_name: "Local Mod".to_string(),
                     version: "1.0".to_string(),
                     source: SharedModSource::ManualOnly,
+                    enabled: true,
                 },
             ],
         };
@@ -276,6 +284,7 @@ mod tests {
                 source: SharedModSource::Workshop {
                     id: "2563309347".to_string(),
                 },
+                enabled: true,
             }],
         };
         let key = encode_modpack_share_key(&payload).unwrap();
@@ -313,6 +322,7 @@ mod tests {
                 display_name: String::new(),
                 version: String::new(),
                 source: SharedModSource::ManualOnly,
+                enabled: true,
             }],
         };
         assert!(encode_modpack_share_key(&bad_version).is_err());
@@ -334,6 +344,7 @@ mod tests {
                 source: SharedModSource::Workshop {
                     id: "123abc".to_string(),
                 },
+                enabled: true,
             }],
         };
         assert!(encode_modpack_share_key(&bad_workshop).is_err());
@@ -349,6 +360,7 @@ mod tests {
                     repo: "owner/repo/extra".to_string(),
                     url: String::new(),
                 },
+                enabled: true,
             }],
         };
         assert!(encode_modpack_share_key(&bad_github).is_err());
@@ -364,6 +376,7 @@ mod tests {
                     repo: "owner/repo".to_string(),
                     url: "ftp://example.com/ModA.tmod".to_string(),
                 },
+                enabled: true,
             }],
         };
         assert!(encode_modpack_share_key(&bad_github_url).is_err());
@@ -378,6 +391,7 @@ mod tests {
                 source: SharedModSource::Url {
                     url: "javascript:alert(1)".to_string(),
                 },
+                enabled: true,
             }],
         };
         assert!(encode_modpack_share_key(&bad_url).is_err());
@@ -553,10 +567,10 @@ mod tests {
         assert!(created.path.join("Mods").join("ModA.tmod").is_file());
         assert!(created.path.join("Mods").join("ModB.tmod").is_file());
 
-        // Calling again with same enabled set (even different order) -> None
+        // Calling again with same enabled set (different order and ASCII case) -> None
         save_enabled_mods(
             &mods_dir.join("enabled.json"),
-            &["ModB".to_string(), "ModA".to_string()],
+            &["modb".to_string(), "MODA".to_string()],
         )
         .unwrap();
         assert!(backup_unsaved_enabled_mods_as_modpack(
@@ -569,9 +583,9 @@ mod tests {
         .unwrap()
         .is_none());
 
-        // Even when active_modpack exists on disk, a changed enabled set creates a backup
+        // When active_modpack exists on disk, update it in place and return Ok(None)
         save_enabled_mods(&mods_dir.join("enabled.json"), &["ModA".to_string()]).unwrap();
-        let second = backup_unsaved_enabled_mods_as_modpack(
+        assert!(backup_unsaved_enabled_mods_as_modpack(
             &modpacks_dir,
             &mods_dir,
             "AutoBackup",
@@ -579,7 +593,35 @@ mod tests {
             "AutoBackup",
         )
         .unwrap()
-        .expect("expected second unique backup pack when enabled set drifted");
+        .is_none());
+        assert_eq!(
+            load_enabled_mods(&modpacks_dir.join("AutoBackup").join("Mods").join("enabled.json"))
+                .unwrap(),
+            vec!["ModA".to_string()]
+        );
+        assert!(modpacks_dir
+            .join("AutoBackup")
+            .join("Mods")
+            .join("ModA.tmod")
+            .is_file());
+        assert!(!modpacks_dir
+            .join("AutoBackup")
+            .join("Mods")
+            .join("ModB.tmod")
+            .exists());
+        assert!(!modpacks_dir.join("AutoBackup_2").exists());
+
+        // When active_modpack is empty and enabled set does not match any existing pack -> creates AutoBackup_2
+        save_enabled_mods(&mods_dir.join("enabled.json"), &["ModB".to_string()]).unwrap();
+        let second = backup_unsaved_enabled_mods_as_modpack(
+            &modpacks_dir,
+            &mods_dir,
+            "",
+            &metas,
+            "AutoBackup",
+        )
+        .unwrap()
+        .expect("expected second unique backup pack when enabled set drifted without active pack");
         assert_eq!(second.name, "AutoBackup_2");
         assert_eq!(second.local_tmod_count, 1);
 
@@ -663,15 +705,17 @@ mod tests {
             &["EnabledMissing".to_string(), "EnabledAlready".to_string()],
         )
         .unwrap();
-        std::fs::write(pack_mods.join("EnabledAlready.tmod"), b"CUSTOM_KEEP").unwrap();
+        write_minimal_tmod(&pack_mods.join("EnabledAlready.tmod"), "EnabledAlready", "3.0.0");
 
         let prepared =
             prepare_folder_modpack_for_server(&modpacks_dir, &mods_dir, " ServerPack ").unwrap();
         assert_eq!(prepared.as_deref(), Some(pack_mods.as_path()));
         assert!(pack_mods.join("EnabledMissing.tmod").is_file());
         assert_eq!(
-            std::fs::read(pack_mods.join("EnabledAlready.tmod")).unwrap(),
-            b"CUSTOM_KEEP"
+            parse_tmod_file(&pack_mods.join("EnabledAlready.tmod"))
+                .unwrap()
+                .version,
+            "3.0.0"
         );
         assert!(!pack_mods.join("DisabledMod.tmod").exists());
         assert_eq!(
@@ -788,6 +832,40 @@ mod tests {
         assert!(pack_mods.join("ModA.tmod").is_file());
         assert!(!pack_mods.join("RenamedStale.tmod").exists());
         assert!(!pack_mods.join("CorruptStale.tmod").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_modpack_matches_enabled_mods_case_insensitively() {
+        let root = make_temp_test_dir("tl_core_create_ci");
+        let modpacks_dir = root.join("ModPacks");
+        let mods_dir = root.join("Mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+
+        write_minimal_tmod(&mods_dir.join("ModAlpha.tmod"), "ModAlpha", "1.0.0");
+        write_minimal_tmod(&mods_dir.join("ModBeta.tmod"), "ModBeta", "1.0.0");
+        let meta_alpha = parse_tmod_file(&mods_dir.join("ModAlpha.tmod")).unwrap();
+        let meta_beta = parse_tmod_file(&mods_dir.join("ModBeta.tmod")).unwrap();
+
+        let pack_mods = modpacks_dir.join("CasePack").join("Mods");
+        std::fs::create_dir_all(&pack_mods).unwrap();
+        write_minimal_tmod(&pack_mods.join("ModBeta.tmod"), "ModBeta", "1.0.0");
+        write_minimal_tmod(&pack_mods.join("StaleMod.tmod"), "StaleMod", "1.0.0");
+
+        let created = create_modpack(
+            &modpacks_dir,
+            &mods_dir,
+            "CasePack",
+            &["  modalpha  ".to_string()],
+            &[meta_alpha, meta_beta],
+        )
+        .unwrap();
+
+        assert_eq!(created.local_tmod_count, 1);
+        assert!(pack_mods.join("ModAlpha.tmod").is_file());
+        assert!(!pack_mods.join("ModBeta.tmod").exists());
+        assert!(!pack_mods.join("StaleMod.tmod").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

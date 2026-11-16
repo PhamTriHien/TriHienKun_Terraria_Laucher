@@ -9,6 +9,8 @@ mod views;
 use state::AppState;
 use std::path::PathBuf;
 
+const APP_TITLE: &str = "TriHienKun Terraria Launcher";
+
 struct TerrariaLauncherApp {
     state: AppState,
 }
@@ -66,7 +68,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Terraria Launcher")
+        .with_title(APP_TITLE)
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([860.0, 580.0])
         .with_drag_and_drop(true);
@@ -81,7 +83,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Terraria Launcher",
+        APP_TITLE,
         options,
         Box::new(|cc| {
             theme::install_unicode_fonts(&cc.egui_ctx);

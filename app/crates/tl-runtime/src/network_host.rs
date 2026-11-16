@@ -1,5 +1,7 @@
 use crate::game_runner::run_elevated_windows;
-use crate::http_client::{build_http_client, ensure_rustls_provider, LAUNCHER_USER_AGENT};
+use crate::http_client::{
+    build_http_client, build_http_client_with_options, ensure_rustls_provider, LAUNCHER_USER_AGENT,
+};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
@@ -155,6 +157,7 @@ pub struct DirectHostConfig {
     pub host_port: u16,
     pub bind_ipv4: Option<Ipv4Addr>,
     pub try_upnp: bool,
+    pub cleanup_local_upnp_on_start: bool,
     pub initial_banned_ips: Vec<IpAddr>,
 }
 
@@ -507,49 +510,72 @@ pub async fn probe_local_tcp_listening(port: u16) -> bool {
     .await
 }
 
-async fn query_public_ipv4_with_client(
+const PUBLIC_IPV4_ENDPOINTS: [&str; 3] = [
+    "https://api.ipify.org",
+    "https://ipv4.icanhazip.com",
+    "https://checkip.amazonaws.com",
+];
+
+async fn query_public_ipv4_endpoints(
     client: &reqwest::Client,
+    endpoints: &[&str],
     per_req_timeout: Duration,
+    overall_timeout: Duration,
 ) -> Option<Ipv4Addr> {
-    for endpoint in [
-        "https://api.ipify.org",
-        "https://ipv4.icanhazip.com",
-        "https://checkip.amazonaws.com",
-    ] {
-        if let Ok(resp) = client.get(endpoint).timeout(per_req_timeout).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    if let Ok(parsed) = text.trim().parse::<Ipv4Addr>() {
-                        return Some(parsed);
+    tokio::time::timeout(overall_timeout, async {
+        for &endpoint in endpoints {
+            if let Ok(resp) = client.get(endpoint).timeout(per_req_timeout).send().await {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        if let Ok(parsed) = text.trim().parse::<Ipv4Addr>() {
+                            return Some(parsed);
+                        }
                     }
                 }
             }
         }
-    }
-    None
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
-pub async fn probe_network_snapshot(port: u16, proxy_url: Option<&str>) -> NetworkSnapshot {
+async fn query_public_ipv4_with_client(
+    client: &reqwest::Client,
+    per_req_timeout: Duration,
+) -> Option<Ipv4Addr> {
+    query_public_ipv4_endpoints(
+        client,
+        &PUBLIC_IPV4_ENDPOINTS,
+        per_req_timeout,
+        Duration::from_secs(4),
+    )
+    .await
+}
+
+async fn probe_network_snapshot_with_client(
+    server_port: u16,
+    firewall_port: u16,
+    client_result: LauncherResult<reqwest::Client>,
+) -> NetworkSnapshot {
     let (primary_lan_ip, interfaces) = collect_local_interfaces();
     let global_ipv6 = detect_primary_global_ipv6();
     let has_vpn_or_virtual = interfaces.iter().any(|i| i.is_vpn);
-    let firewall_rule_active = Some(check_firewall_rule_exists(port));
-    let local_port_listening = probe_local_tcp_listening(port).await;
+    let firewall_rule_active = Some(check_firewall_rule_exists(firewall_port));
+    let local_port_listening = probe_local_tcp_listening(server_port).await;
 
-    let mut public_ip = None;
-    let mut public_ip_error = None;
-
-    match build_http_client(proxy_url) {
+    let (public_ip, public_ip_error) = match client_result {
         Ok(client) => {
-            public_ip = query_public_ipv4_with_client(&client, Duration::from_secs(6)).await;
-            if public_ip.is_none() {
-                public_ip_error = Some("Không lấy được IP Public từ internet".to_string());
-            }
+            let ip =
+                query_public_ipv4_with_client(&client, Duration::from_millis(1500)).await;
+            let err = ip
+                .is_none()
+                .then(|| "Không lấy được IP Public từ internet".to_string());
+            (ip, err)
         }
-        Err(e) => {
-            public_ip_error = Some(e.to_string());
-        }
-    }
+        Err(e) => (None, Some(e.to_string())),
+    };
 
     NetworkSnapshot {
         primary_lan_ip,
@@ -561,6 +587,19 @@ pub async fn probe_network_snapshot(port: u16, proxy_url: Option<&str>) -> Netwo
         has_vpn_or_virtual,
         local_port_listening,
     }
+}
+
+pub async fn probe_network_snapshot_ports(server_port: u16, firewall_port: u16) -> NetworkSnapshot {
+    probe_network_snapshot_with_client(
+        server_port,
+        firewall_port,
+        build_http_client_with_options(None, true, true),
+    )
+    .await
+}
+
+pub async fn probe_network_snapshot(port: u16, proxy_url: Option<&str>) -> NetworkSnapshot {
+    probe_network_snapshot_with_client(port, port, build_http_client(proxy_url)).await
 }
 
 pub fn firewall_rule_name(port: u16) -> String {
@@ -1008,13 +1047,12 @@ pub async fn open_upnp_port(port: u16) -> LauncherResult<UpnpLeaseInfo> {
         .map(|(lease, _)| lease)
 }
 
-pub async fn close_upnp_port(lease: &UpnpLeaseInfo) -> LauncherResult<()> {
-    if lease.port == 0 {
-        return Err(LauncherError::InvalidInput(
-            "Cổng UPnP không hợp lệ (port = 0)".to_string(),
-        ));
-    }
-    let client = build_lan_upnp_client()?;
+async fn send_upnp_delete_port_mapping(
+    client: &reqwest::Client,
+    control_url: &str,
+    service_type: &str,
+    external_port: u16,
+) -> LauncherResult<()> {
     let del_body = format!(
         r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -1026,15 +1064,15 @@ pub async fn close_upnp_port(lease: &UpnpLeaseInfo) -> LauncherResult<()> {
     </u:DeletePortMapping>
   </s:Body>
 </s:Envelope>"#,
-        lease.service_type, lease.port
+        service_type, external_port
     );
 
     let resp = client
-        .post(&lease.control_url)
+        .post(control_url)
         .header("Content-Type", "text/xml; charset=\"utf-8\"")
         .header(
             "SOAPAction",
-            format!("\"{}#DeletePortMapping\"", lease.service_type),
+            format!("\"{}#DeletePortMapping\"", service_type),
         )
         .body(del_body)
         .send()
@@ -1049,6 +1087,22 @@ pub async fn close_upnp_port(lease: &UpnpLeaseInfo) -> LauncherResult<()> {
         )));
     }
     Ok(())
+}
+
+pub async fn close_upnp_port(lease: &UpnpLeaseInfo) -> LauncherResult<()> {
+    if lease.port == 0 {
+        return Err(LauncherError::InvalidInput(
+            "Cổng UPnP không hợp lệ (port = 0)".to_string(),
+        ));
+    }
+    let client = build_lan_upnp_client()?;
+    send_upnp_delete_port_mapping(
+        &client,
+        &lease.control_url,
+        &lease.service_type,
+        lease.port,
+    )
+    .await
 }
 
 async fn resolve_upnp_port_status(
@@ -1070,7 +1124,7 @@ async fn resolve_upnp_port_status(
         });
     }
 
-    let fallback_pub = match build_http_client(None) {
+    let fallback_pub = match build_http_client_with_options(None, true, true) {
         Ok(client) => {
             tokio::select! {
                 _ = cancel.cancelled() => return None,
@@ -1100,8 +1154,11 @@ async fn resolve_upnp_port_status(
 }
 
 async fn setup_direct_host_upnp(
+    local_target_port: u16,
     host_port: u16,
     bind_ipv4: Option<Ipv4Addr>,
+    try_upnp: bool,
+    cleanup_local_upnp_on_start: bool,
     cancel: &CancellationToken,
     has_upnp_lease: &AtomicBool,
 ) -> (
@@ -1109,21 +1166,46 @@ async fn setup_direct_host_upnp(
     Option<reqwest::Client>,
     Option<UpnpPortStatus>,
 ) {
+    let discover_port = if try_upnp {
+        host_port
+    } else {
+        local_target_port
+    };
     let endpoint = tokio::select! {
         _ = cancel.cancelled() => return (None, None, None),
-        res = discover_upnp_service_endpoint(host_port, host_port, bind_ipv4) => match res {
+        res = discover_upnp_service_endpoint(discover_port, discover_port, bind_ipv4) => match res {
             Ok(ep) => ep,
             Err(err) => {
-                return (
-                    None,
-                    None,
-                    Some(UpnpPortStatus::Unavailable(clean_launcher_error_msg(err))),
-                );
+                return if try_upnp {
+                    (
+                        None,
+                        None,
+                        Some(UpnpPortStatus::Unavailable(clean_launcher_error_msg(err))),
+                    )
+                } else {
+                    (None, None, None)
+                };
             }
         },
     };
 
     if cancel.is_cancelled() {
+        return (None, None, None);
+    }
+
+    if cleanup_local_upnp_on_start && (!try_upnp || host_port != local_target_port) {
+        tokio::select! {
+            _ = cancel.cancelled() => return (None, None, None),
+            _ = send_upnp_delete_port_mapping(
+                &endpoint.client,
+                &endpoint.control_url,
+                &endpoint.service_type,
+                local_target_port,
+            ) => {}
+        }
+    }
+
+    if !try_upnp || cancel.is_cancelled() {
         return (None, None, None);
     }
 
@@ -2131,32 +2213,36 @@ pub fn start_direct_port_host(
         }
         wake_ui.wake();
 
-        let (active_lease, upnp_client) = if config.try_upnp {
-            let (lease, client, upnp_status) = setup_direct_host_upnp(
-                config.host_port,
-                config.bind_ipv4,
-                &cancel,
-                &has_upnp_lease,
-            )
-            .await;
+        let (active_lease, upnp_client) =
+            if config.try_upnp || config.cleanup_local_upnp_on_start {
+                let (lease, client, upnp_status) = setup_direct_host_upnp(
+                    config.local_target_port,
+                    config.host_port,
+                    config.bind_ipv4,
+                    config.try_upnp,
+                    config.cleanup_local_upnp_on_start,
+                    &cancel,
+                    &has_upnp_lease,
+                )
+                .await;
 
-            if let Some(resolved_upnp) = upnp_status {
-                let mut updated = false;
-                {
-                    let mut guard = status.write().unwrap_or_else(|e| e.into_inner());
-                    if let DirectHostStatus::Running(ref mut info) = *guard {
-                        info.upnp_status = resolved_upnp;
-                        updated = true;
+                if let Some(resolved_upnp) = upnp_status {
+                    let mut updated = false;
+                    {
+                        let mut guard = status.write().unwrap_or_else(|e| e.into_inner());
+                        if let DirectHostStatus::Running(ref mut info) = *guard {
+                            info.upnp_status = resolved_upnp;
+                            updated = true;
+                        }
+                    }
+                    if updated {
+                        wake_ui.wake();
                     }
                 }
-                if updated {
-                    wake_ui.wake();
-                }
-            }
-            (lease, client)
-        } else {
-            (None, None)
-        };
+                (lease, client)
+            } else {
+                (None, None)
+            };
 
         loop {
             if let (Some(lease), Some(client)) = (active_lease.as_ref(), upnp_client.as_ref()) {
@@ -2593,6 +2679,7 @@ mod tests {
                     host_port: 7777,
                     bind_ipv4: None,
                     try_upnp: false,
+                    cleanup_local_upnp_on_start: false,
                     initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -2638,6 +2725,7 @@ mod tests {
                     host_port,
                     bind_ipv4: None,
                     try_upnp: false,
+                    cleanup_local_upnp_on_start: false,
                     initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -2946,6 +3034,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                     host_port,
                     bind_ipv4: None,
                     try_upnp: false,
+                    cleanup_local_upnp_on_start: false,
                     initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -3325,6 +3414,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                     host_port: server_port,
                     bind_ipv4: None,
                     try_upnp: false,
+                    cleanup_local_upnp_on_start: false,
                     initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -3491,6 +3581,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                     host_port,
                     bind_ipv4: None,
                     try_upnp: false,
+                    cleanup_local_upnp_on_start: false,
                     initial_banned_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -3646,6 +3737,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                                 host_port: host_port_2,
                                 bind_ipv4: None,
                                 try_upnp: false,
+                                cleanup_local_upnp_on_start: false,
                                 initial_banned_ips: vec![mapped_ban],
                             },
                             crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -3705,6 +3797,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                     host_port: server_port,
                     bind_ipv4: Some(probe_ip),
                     try_upnp: false,
+                    cleanup_local_upnp_on_start: false,
                     initial_banned_ips: Vec::new(),
                 },
                 crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -3747,6 +3840,7 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
                 host_port: 0,
                 bind_ipv4: None,
                 try_upnp: false,
+                cleanup_local_upnp_on_start: false,
                 initial_banned_ips: Vec::new(),
             },
             crate::server_manager::egui_repaint::RepaintHandle::default(),
@@ -3892,6 +3986,131 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:2\r\n\r\n";
             assert!(captured[0].contains("<NewLeaseDuration>0</NewLeaseDuration>"));
             assert!(captured[1].contains("<NewLeaseDuration>3600</NewLeaseDuration>"));
             assert!(captured[2].contains("<NewLeaseDuration>1800</NewLeaseDuration>"));
+        });
+    }
+
+    #[test]
+    fn probe_network_snapshot_with_client_probes_distinct_server_and_firewall_ports() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let listening_port = listener.local_addr().unwrap().port();
+
+            let snap = probe_network_snapshot_with_client(
+                listening_port,
+                0,
+                build_http_client(Some("://invalid-proxy")),
+            )
+            .await;
+
+            assert!(snap.local_port_listening);
+            assert_eq!(snap.firewall_rule_active, Some(false));
+            assert!(snap.public_ip.is_none());
+            assert!(snap.public_ip_error.is_some());
+
+            drop(listener);
+
+            let snap_closed = probe_network_snapshot_with_client(
+                listening_port,
+                0,
+                build_http_client(Some("://invalid-proxy")),
+            )
+            .await;
+            assert!(!snap_closed.local_port_listening);
+            assert_eq!(snap_closed.firewall_rule_active, Some(false));
+        });
+    }
+
+    #[test]
+    fn query_public_ipv4_endpoints_enforces_overall_timeout_cap() {
+        use tokio::io::AsyncReadExt;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let stall_1 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port_1 = stall_1.local_addr().unwrap().port();
+            let stall_2 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port_2 = stall_2.local_addr().unwrap().port();
+
+            let hold_task = tokio::spawn(async move {
+                let mut kept = Vec::new();
+                for listener in [stall_1, stall_2] {
+                    if let Ok(Ok((mut s, _))) =
+                        tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+                    {
+                        let mut buf = [0u8; 256];
+                        let _ = tokio::time::timeout(Duration::from_millis(50), s.read(&mut buf))
+                            .await;
+                        kept.push(s);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                drop(kept);
+            });
+
+            let url_1 = format!("http://127.0.0.1:{port_1}/");
+            let url_2 = format!("http://127.0.0.1:{port_2}/");
+            let client = build_http_client_with_options(None, true, true).unwrap();
+            let endpoints = [url_1.as_str(), url_2.as_str()];
+
+            let started = Instant::now();
+            let res = query_public_ipv4_endpoints(
+                &client,
+                &endpoints,
+                Duration::from_secs(5),
+                Duration::from_millis(350),
+            )
+            .await;
+            assert!(res.is_none());
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            tokio::time::timeout(Duration::from_secs(3), hold_task)
+                .await
+                .expect("hold_task should finish cleanly")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn send_upnp_delete_port_mapping_posts_valid_soap_envelope() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let server_task = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                req
+            });
+
+            let client = build_lan_upnp_client().unwrap();
+            let control_url = format!("http://127.0.0.1:{port}/ctl/IPConn");
+            let service_type = "urn:schemas-upnp-org:service:WANIPConnection:1";
+            send_upnp_delete_port_mapping(&client, &control_url, service_type, 7777)
+                .await
+                .unwrap();
+
+            let captured = server_task.await.unwrap();
+            assert!(captured.contains("#DeletePortMapping\""));
+            assert!(captured.contains("<NewExternalPort>7777</NewExternalPort>"));
+            assert!(captured.contains("<NewProtocol>TCP</NewProtocol>"));
         });
     }
 }

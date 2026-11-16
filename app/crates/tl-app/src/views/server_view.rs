@@ -102,6 +102,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         .clicked()
         {
             state.server_tab = ServerSubTab::Network;
+            state.spawn_network_probe();
         }
 
         let console_label = if online_players_cnt > 0 {
@@ -140,6 +141,49 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 super::host_view::render_players_and_banlist_card(state, ui, p);
             }
         }
+    }
+}
+
+pub(super) fn server_edition_missing_reason(
+    state: &AppState,
+    edition: GameEdition,
+) -> Option<&'static str> {
+    match edition {
+        GameEdition::Vanilla => {
+            if !state.env.terraria_server_installed {
+                Some("Chưa cài TerrariaServer.exe. Vào Cài đặt để cài đặt Terraria.")
+            } else if !state.env.xna_installed {
+                Some("Thiếu Microsoft XNA Framework 4.0 cho TerrariaServer.exe.")
+            } else {
+                None
+            }
+        }
+        GameEdition::TModLoader => {
+            if !state.env.tmodloader_installed {
+                Some("Chưa cài tModLoader. Vào Cài đặt để cài đặt.")
+            } else if !state.env.terraria_content_available {
+                Some("Thiếu thư mục Content của Terraria cho tModLoader.")
+            } else if !state.env.dotnet8_ready {
+                Some("Chưa sẵn sàng .NET 8 đúng phiên bản cho tModLoader.")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn join_server_availability(state: &AppState, edition: GameEdition) -> (bool, &'static str) {
+    if state.install_busy {
+        (false, "Đang cài đặt thành phần...")
+    } else if state.active_game.is_some()
+        || state.has_active_client_ipv6_bridge()
+        || state.is_edition_client_running(edition)
+    {
+        (false, "Đóng cửa sổ game đang mở trước")
+    } else if edition == GameEdition::TModLoader && state.is_mod_operation_busy() {
+        (false, "Đang tải hoặc đồng bộ Mod...")
+    } else {
+        (true, "")
     }
 }
 
@@ -343,6 +387,10 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
             .active_server()
             .map(|s| s.config.maxplayers)
             .unwrap_or(8);
+        let readiness_err = match state.config.active_server() {
+            Some(profile) => server_edition_missing_reason(state, profile.edition),
+            None => Some("Chưa có hồ sơ server nào."),
+        };
 
         let hover_metrics = if let Some(ext) = &ext_server {
             Some(format!(
@@ -433,6 +481,9 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                         p.accent_amber,
                     );
                 }
+                if let Some(err) = readiness_err {
+                    status_pill(ui, err, p.accent_red);
+                }
             }
 
             if let Some(ep) = state.active_online_endpoint() {
@@ -488,6 +539,22 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
         let is_running = matches!(active_snap_state, Some(ServerLifecycleState::Running));
         let is_stopping =
             matches!(active_snap_state, Some(ServerLifecycleState::Stopping)) || is_stopping_sup;
+        let active_srv_edition = if is_active {
+            active_snap
+                .as_ref()
+                .map(|s| s.edition)
+                .or_else(|| state.config.active_server().map(|s| s.edition))
+                .unwrap_or(state.config.active_edition)
+        } else if let Some(ext) = &ext_server {
+            ext.edition
+        } else {
+            state
+                .config
+                .active_server()
+                .map(|s| s.edition)
+                .unwrap_or(state.config.active_edition)
+        };
+        let (can_join, join_hint) = join_server_availability(state, active_srv_edition);
 
         ui.horizontal_wrapped(|ui| {
             if is_active {
@@ -521,12 +588,6 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                     state.force_kill_server();
                 }
 
-                let can_join = !state.install_busy && !state.is_game_running();
-                let join_hint = if state.install_busy {
-                    "Đang cài đặt thành phần..."
-                } else {
-                    "Đóng cửa sổ game đang mở trước"
-                };
                 if is_running
                     && ui
                         .add_enabled_ui(can_join, |ui| {
@@ -578,6 +639,7 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                 {
                     state.start_self_host_online();
                     state.server_tab = ServerSubTab::Network;
+                    state.spawn_network_probe();
                 }
             } else if ext_server.is_some() {
                 if rpg_button(
@@ -593,12 +655,6 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                     state.stop_external_server();
                 }
 
-                let can_join = !state.install_busy && !state.is_game_running();
-                let join_hint = if state.install_busy {
-                    "Đang cài đặt thành phần..."
-                } else {
-                    "Đóng cửa sổ game đang mở trước"
-                };
                 if !ext_starting
                     && ui
                         .add_enabled_ui(can_join, |ui| {
@@ -649,9 +705,15 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                 {
                     state.start_self_host_online();
                     state.server_tab = ServerSubTab::Network;
+                    state.spawn_network_probe();
                 }
             } else {
-                let can_launch_server = !state.install_busy;
+                let can_launch_server = !state.install_busy && readiness_err.is_none();
+                let launch_hint = if state.install_busy {
+                    "Đang cài đặt thành phần..."
+                } else {
+                    readiness_err.unwrap_or("")
+                };
                 if ui
                     .add_enabled_ui(can_launch_server, |ui| {
                         rpg_button(
@@ -664,7 +726,7 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                         )
                     })
                     .inner
-                    .on_disabled_hover_text("Đang cài đặt thành phần...")
+                    .on_disabled_hover_text(launch_hint)
                     .clicked()
                 {
                     state.start_selected_server();
@@ -682,11 +744,12 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                         )
                     })
                     .inner
-                    .on_disabled_hover_text("Đang cài đặt thành phần...")
+                    .on_disabled_hover_text(launch_hint)
                     .clicked()
                 {
                     state.start_self_host_online();
                     state.server_tab = ServerSubTab::Network;
+                    state.spawn_network_probe();
                 }
             }
         });
@@ -1006,10 +1069,14 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
 
     let mut save_clicked = false;
     let mut port_edited = false;
+    let mut port_committed = false;
     let mut backup_clicked = false;
     let mut clear_missing_modpack = false;
     let mut upnp_synced: Option<bool> = None;
+    let mut auto_restart_changed: Option<bool> = None;
+    let mut config_toggle_changed = false;
     let modpacks_dir = state.paths.tml_modpacks_dir();
+    let resolved_active_world = state.resolve_active_server_world_path();
 
     {
         let modpacks = &state.modpacks;
@@ -1050,11 +1117,16 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                 .spacing([14.0, 8.0])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Tên hồ sơ:").color(p.text_muted));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut profile.name)
-                            .desired_width(200.0)
-                            .hint_text("Tên hồ sơ"),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut profile.name)
+                                .desired_width(200.0)
+                                .hint_text("Tên hồ sơ"),
+                        )
+                        .lost_focus()
+                    {
+                        config_toggle_changed = true;
+                    }
                     ui.end_row();
 
                     ui.label(RichText::new("Thế giới:").color(p.text_muted));
@@ -1064,12 +1136,21 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                 .desired_width(180.0)
                                 .hint_text("Tên thế giới"),
                         );
+                        if worldname_resp.lost_focus() {
+                            config_toggle_changed = true;
+                        }
+                        let mut world_reassigned = false;
                         if worldname_resp.changed() {
+                            let active_world_ref = resolved_active_world
+                                .as_deref()
+                                .unwrap_or_else(|| std::path::Path::new(&profile.config.world));
                             let matches_selected_existing = existing_worlds.iter().any(|w| {
                                 w.world_name == profile.config.worldname
-                                    && w.file_path
-                                        .to_string_lossy()
-                                        .eq_ignore_ascii_case(&profile.config.world)
+                                    && !active_world_ref.as_os_str().is_empty()
+                                    && AppState::paths_match_world_key(
+                                        &w.file_path,
+                                        active_world_ref,
+                                    )
                             });
                             if !matches_selected_existing {
                                 let file_stem = sanitize_world_stem(&profile.config.worldname);
@@ -1079,22 +1160,32 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                     .into_owned();
                                 profile.config.worldpath =
                                     edition_worlds_dir.to_string_lossy().into_owned();
+                                world_reassigned = true;
                             }
                         }
 
-                        let matched_existing = existing_worlds.iter().find(|w| {
-                            profile
-                                .config
-                                .world
-                                .eq_ignore_ascii_case(&w.file_path.to_string_lossy())
-                        });
-                        let world_file_exists = !profile.config.world.trim().is_empty()
-                            && std::path::Path::new(&profile.config.world).is_file();
+                        let active_world_path = if world_reassigned {
+                            Some(std::path::Path::new(&profile.config.world))
+                        } else {
+                            resolved_active_world.as_deref().or_else(|| {
+                                let raw = profile.config.world.trim();
+                                (!raw.is_empty()).then(|| std::path::Path::new(raw))
+                            })
+                        };
+                        let world_file_exists = active_world_path.is_some_and(|p| p.is_file());
+                        let matched_existing_idx = active_world_path
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .and_then(|target| {
+                                existing_worlds.iter().position(|w| {
+                                    AppState::paths_match_world_key(&w.file_path, target)
+                                })
+                            });
+                        let matched_existing = matched_existing_idx.map(|idx| &existing_worlds[idx]);
                         let selected_world_text = if let Some(w) = matched_existing {
                             w.world_name.clone()
                         } else if world_file_exists {
-                            std::path::Path::new(&profile.config.world)
-                                .file_stem()
+                            active_world_path
+                                .and_then(|p| p.file_stem())
                                 .map(|s| s.to_string_lossy().into_owned())
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or_else(|| "Thế giới (.wld)".to_string())
@@ -1130,6 +1221,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                         candidate.to_string_lossy().into_owned();
                                     profile.config.worldpath =
                                         edition_worlds_dir.to_string_lossy().into_owned();
+                                    config_toggle_changed = true;
                                 }
                                 if !existing_worlds.is_empty() {
                                     ui.separator();
@@ -1140,13 +1232,10 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                             .color(p.text_muted),
                                     );
                                 } else {
-                                    for w in &existing_worlds {
+                                    for (idx, w) in existing_worlds.iter().enumerate() {
                                         let w_path_str =
                                             w.file_path.to_string_lossy().into_owned();
-                                        let selected = profile
-                                            .config
-                                            .world
-                                            .eq_ignore_ascii_case(&w_path_str);
+                                        let selected = matched_existing_idx == Some(idx);
                                         let item_label = format!(
                                             "{} ({}, {})",
                                             w.world_name,
@@ -1159,6 +1248,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                             profile.config.worldpath = edition_worlds_dir
                                                 .to_string_lossy()
                                                 .into_owned();
+                                            config_toggle_changed = true;
                                         }
                                     }
                                 }
@@ -1204,6 +1294,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                         Some(3) => "Tự tạo Lớn",
                         _ => "Không tự tạo",
                     };
+                    let prev_autocreate = profile.config.autocreate;
                     egui::ComboBox::from_id_salt("srv_autocreate")
                         .selected_text(autocreate_label)
                         .width(150.0)
@@ -1229,11 +1320,15 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                 "Tự tạo Lớn",
                             );
                         });
+                    if profile.config.autocreate != prev_autocreate {
+                        config_toggle_changed = true;
+                    }
                     ui.end_row();
 
                     if profile.config.autocreate.is_some() {
                         ui.label(RichText::new("Độ khó thế giới mới:").color(p.text_muted));
                         let diff = WorldDifficultyOption::from_u8(profile.config.difficulty);
+                        let prev_difficulty = profile.config.difficulty;
                         egui::ComboBox::from_id_salt("srv_difficulty")
                             .selected_text(difficulty_vn_label(diff))
                             .width(130.0)
@@ -1251,53 +1346,52 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                     );
                                 }
                             });
+                        if profile.config.difficulty != prev_difficulty {
+                            config_toggle_changed = true;
+                        }
                         ui.end_row();
 
                         ui.label(RichText::new("Seed thế giới mới:").color(p.text_muted));
                         ui.vertical(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut profile.config.seed)
-                                    .desired_width(200.0)
-                                    .hint_text("Để trống = ngẫu nhiên"),
-                            );
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut profile.config.seed)
+                                        .desired_width(200.0)
+                                        .hint_text("Để trống = ngẫu nhiên"),
+                                )
+                                .lost_focus()
+                            {
+                                config_toggle_changed = true;
+                            }
                             if profile.edition == GameEdition::Vanilla {
                                 egui::CollapsingHeader::new("Seed đặc biệt (1.4.5)")
                                     .id_salt("srv_special_seeds_145")
                                     .default_open(false)
                                     .show(ui, |ui| {
                                         ui.horizontal_wrapped(|ui| {
-                                            ui.checkbox(
-                                                &mut profile.config.seed_celebration,
-                                                "celebrationmk10",
-                                            );
-                                            ui.checkbox(
-                                                &mut profile.config.seed_theconstant,
-                                                "constant",
-                                            );
-                                            ui.checkbox(
-                                                &mut profile.config.seed_notthebees,
-                                                "not the bees",
-                                            );
-                                            ui.checkbox(
-                                                &mut profile.config.seed_notraps,
-                                                "no traps",
-                                            );
-                                            ui.checkbox(
-                                                &mut profile.config.seed_fortheworthy,
-                                                "for the worthy",
-                                            );
-                                            ui.checkbox(
-                                                &mut profile.config.seed_remix,
-                                                "don't dig up",
-                                            );
-                                            ui.checkbox(
-                                                &mut profile.config.seed_drunk,
-                                                "drunk world",
-                                            );
-                                            ui.checkbox(
-                                                &mut profile.config.seed_zenith,
-                                                "get fixed boi",
-                                            );
+                                            for (flag, label) in [
+                                                (
+                                                    &mut profile.config.seed_celebration,
+                                                    "celebrationmk10",
+                                                ),
+                                                (&mut profile.config.seed_theconstant, "constant"),
+                                                (
+                                                    &mut profile.config.seed_notthebees,
+                                                    "not the bees",
+                                                ),
+                                                (&mut profile.config.seed_notraps, "no traps"),
+                                                (
+                                                    &mut profile.config.seed_fortheworthy,
+                                                    "for the worthy",
+                                                ),
+                                                (&mut profile.config.seed_remix, "don't dig up"),
+                                                (&mut profile.config.seed_drunk, "drunk world"),
+                                                (&mut profile.config.seed_zenith, "get fixed boi"),
+                                            ] {
+                                                if ui.checkbox(flag, label).changed() {
+                                                    config_toggle_changed = true;
+                                                }
+                                            }
                                         });
                                     });
                             }
@@ -1312,26 +1406,36 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                 .desired_width(76.0)
                                 .hint_text("7777"),
                         );
+                        let parsed_port = server_port_input
+                            .trim()
+                            .parse::<u16>()
+                            .ok()
+                            .filter(|&pt| pt > 0);
                         if port_resp.changed() {
-                            if let Some(p_val) = server_port_input
-                                .trim()
-                                .parse::<u16>()
-                                .ok()
-                                .filter(|&pt| pt > 0)
-                            {
+                            if let Some(p_val) = parsed_port {
                                 profile.config.port = p_val;
                                 port_edited = true;
+                                ui.data_mut(|d| d.insert_temp(port_resp.id, true));
                             }
                         }
-                        if port_resp.lost_focus()
-                            && server_port_input
-                                .trim()
-                                .parse::<u16>()
-                                .ok()
-                                .filter(|&pt| pt > 0)
-                                .is_none()
-                        {
-                            *server_port_input = profile.config.port.max(1).to_string();
+                        if port_resp.lost_focus() {
+                            let had_pending_edit = ui
+                                .data_mut(|d| d.remove_temp::<bool>(port_resp.id))
+                                .unwrap_or(false);
+                            if let Some(p_val) = parsed_port {
+                                *server_port_input = p_val.to_string();
+                                if had_pending_edit || port_edited {
+                                    port_committed = true;
+                                }
+                            } else {
+                                *server_port_input = profile.config.port.max(1).to_string();
+                                if had_pending_edit {
+                                    port_committed = true;
+                                }
+                            }
+                            if port_committed {
+                                config_toggle_changed = true;
+                            }
                         }
 
                         ui.add_space(4.0);
@@ -1342,25 +1446,36 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                             .changed()
                         {
                             profile.config.maxplayers = mp.clamp(1, 255) as u16;
+                            config_toggle_changed = true;
                         }
                     });
                     ui.end_row();
 
                     ui.label(RichText::new("Mật khẩu phòng:").color(p.text_muted));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut profile.config.password)
-                            .password(true)
-                            .desired_width(220.0)
-                            .hint_text("Tùy chọn — để trống nếu không đặt"),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut profile.config.password)
+                                .password(true)
+                                .desired_width(220.0)
+                                .hint_text("Tùy chọn — để trống nếu không đặt"),
+                        )
+                        .lost_focus()
+                    {
+                        config_toggle_changed = true;
+                    }
                     ui.end_row();
 
                     ui.label(RichText::new("Lời chào (MOTD):").color(p.text_muted));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut profile.config.motd)
-                            .desired_width(240.0)
-                            .hint_text("Thông điệp hiện khi người chơi vào server"),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut profile.config.motd)
+                                .desired_width(240.0)
+                                .hint_text("Thông điệp hiện khi người chơi vào server"),
+                        )
+                        .lost_focus()
+                    {
+                        config_toggle_changed = true;
+                    }
                     ui.end_row();
 
                     if profile.edition == GameEdition::TModLoader {
@@ -1382,6 +1497,7 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                             } else {
                                 profile.config.modpack.clone()
                             };
+                            let prev_modpack = profile.config.modpack.clone();
                             egui::ComboBox::from_id_salt("srv_modpack")
                                 .selected_text(mp_label)
                                 .width(220.0)
@@ -1399,6 +1515,9 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
                                         );
                                     }
                                 });
+                            if profile.config.modpack != prev_modpack {
+                                config_toggle_changed = true;
+                            }
 
                             if !pack_exists {
                                 ui.horizontal_wrapped(|ui| {
@@ -1430,33 +1549,62 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
 
                     ui.label(RichText::new("Tùy chọn:").color(p.text_muted));
                     ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut profile.auto_restart, "Tự khởi động lại nếu sập");
-                        ui.checkbox(&mut profile.config.secure, "Chống gian lận");
+                        if ui
+                            .checkbox(&mut profile.auto_restart, "Tự khởi động lại nếu sập")
+                            .changed()
+                        {
+                            auto_restart_changed = Some(profile.auto_restart);
+                        }
+                        if ui
+                            .checkbox(&mut profile.config.secure, "Chống gian lận")
+                            .changed()
+                        {
+                            config_toggle_changed = true;
+                        }
                         if ui
                             .checkbox(&mut profile.config.upnp, "Tự mở cổng UPnP")
                             .changed()
                         {
                             upnp_synced = Some(profile.config.upnp);
+                            config_toggle_changed = true;
                         }
                         if profile.edition == GameEdition::Vanilla {
-                            ui.checkbox(&mut profile.config.slowliquids, "Giảm tải nước chảy");
+                            if ui
+                                .checkbox(&mut profile.config.slowliquids, "Giảm tải nước chảy")
+                                .changed()
+                            {
+                                config_toggle_changed = true;
+                            }
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Số bản lưu lùi:").color(p.text_muted));
-                                ui.add(
-                                    egui::DragValue::new(&mut profile.config.worldrollbackstokeep)
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut profile.config.worldrollbackstokeep,
+                                        )
                                         .range(0..=20),
-                                );
+                                    )
+                                    .changed()
+                                {
+                                    config_toggle_changed = true;
+                                }
                             });
                         }
                     });
                     ui.end_row();
 
                     ui.label(RichText::new("Tham số nâng cao:").color(p.text_muted));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut profile.extra_args)
-                            .desired_width(240.0)
-                            .hint_text("Tùy chọn"),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut profile.extra_args)
+                                .desired_width(240.0)
+                                .hint_text("Tùy chọn"),
+                        )
+                        .lost_focus()
+                    {
+                        config_toggle_changed = true;
+                        port_committed = true;
+                    }
                     ui.end_row();
                 });
         });
@@ -1469,17 +1617,26 @@ fn render_config_editor(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette
         state.backup_active_server_world();
     }
 
-    if port_edited && !direct_host_active {
+    if (port_edited || port_committed) && !direct_host_active {
         let port_str = state.active_server_port().to_string();
         state.port_probe_port = port_str.clone();
         state.direct_host_port_input = port_str;
     }
-    if clear_missing_modpack && !save_clicked {
+    if let Some(auto_restart) = auto_restart_changed {
+        state.set_active_server_auto_restart(auto_restart);
+    }
+    if (config_toggle_changed || clear_missing_modpack)
+        && !save_clicked
+        && auto_restart_changed.is_none()
+    {
         state.save_config();
     }
     if save_clicked {
         state.save_config();
         state.notify_ok("Đã lưu cấu hình server.");
+    }
+    if port_committed || save_clicked {
+        state.spawn_network_probe();
     }
 }
 

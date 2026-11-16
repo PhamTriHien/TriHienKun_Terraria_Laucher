@@ -1,6 +1,7 @@
 use crate::game_runner::install_xna_framework_elevated;
 use crate::http_client::{
-    build_http_client, ensure_rustls_provider, normalize_proxy_url, LAUNCHER_USER_AGENT,
+    build_http_client, build_http_client_with_options, ensure_rustls_provider,
+    normalize_proxy_url, GITHUB_API_VERSION, LAUNCHER_USER_AGENT,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -125,6 +126,8 @@ pub struct InstalledTerrariaReceipt {
     pub version: String,
     pub sha256: String,
     pub source: String,
+    #[serde(default)]
+    pub install_dir: String,
 }
 
 struct TempFileGuard {
@@ -164,7 +167,10 @@ fn emit_progress(
     });
 }
 
-fn build_download_client(proxy_url: Option<&str>) -> LauncherResult<Client> {
+fn build_download_client_with_mode(
+    proxy_url: Option<&str>,
+    bypass_system_proxy: bool,
+) -> LauncherResult<Client> {
     ensure_rustls_provider();
 
     let mut builder = Client::builder()
@@ -176,6 +182,8 @@ fn build_download_client(proxy_url: Option<&str>) -> LauncherResult<Client> {
         let proxy = reqwest::Proxy::all(&proxy_str)
             .map_err(|e| LauncherError::InvalidInput(format!("Proxy không hợp lệ: {e}")))?;
         builder = builder.proxy(proxy);
+    } else if bypass_system_proxy {
+        builder = builder.no_proxy();
     }
 
     builder
@@ -183,6 +191,11 @@ fn build_download_client(proxy_url: Option<&str>) -> LauncherResult<Client> {
         .map_err(|e| LauncherError::Network(format!("Không thể khởi tạo HTTP client: {e}")))
 }
 
+fn build_download_client(proxy_url: Option<&str>) -> LauncherResult<Client> {
+    build_download_client_with_mode(proxy_url, false)
+}
+
+#[derive(Clone, Copy)]
 struct DownloadSpec<'a> {
     url: &'a str,
     dest_part: &'a Path,
@@ -191,6 +204,24 @@ struct DownloadSpec<'a> {
     fallback_total: Option<u64>,
     accept_header: Option<&'a str>,
     bearer_token: Option<&'a str>,
+}
+
+fn should_retry_without_system_proxy(err: &LauncherError) -> bool {
+    let LauncherError::Network(msg) = err else {
+        return false;
+    };
+    msg.starts_with("Lỗi kết nối")
+        || msg.starts_with("Lỗi đọc dữ liệu")
+        || [
+            "HTTP 403",
+            "HTTP 407",
+            "HTTP 429",
+            "HTTP 502",
+            "HTTP 503",
+            "HTTP 504",
+        ]
+        .iter()
+        .any(|code| msg.contains(code))
 }
 
 async fn download_to_part_file(
@@ -220,9 +251,9 @@ async fn download_to_part_file(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let host = resp.url().host_str().unwrap_or("unknown");
         return Err(LauncherError::Network(format!(
-            "Máy chủ trả về HTTP {} khi tải {}",
-            status,
+            "Máy chủ {host} trả về HTTP {status} khi tải {}",
             spec.target.label()
         )));
     }
@@ -268,44 +299,37 @@ async fn download_to_part_file(
     Ok(())
 }
 
-pub async fn fetch_tmodloader_releases(
+async fn download_to_part_file_resilient(
     proxy_url: Option<&str>,
-    github_token: Option<&str>,
-) -> LauncherResult<Vec<TmodLoaderReleaseInfo>> {
-    let client = build_http_client(proxy_url)?;
-    let url = format!(
-        "https://api.github.com/repos/{TMODLOADER_GITHUB_REPO}/releases?per_page=10"
-    );
-
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json");
-    if let Some(tok) = github_token.map(str::trim).filter(|s| !s.is_empty()) {
-        req = req.bearer_auth(tok);
+    spec: DownloadSpec<'_>,
+    on_progress: &ProgressCallback,
+) -> LauncherResult<()> {
+    let client = build_download_client_with_mode(proxy_url, false)?;
+    match download_to_part_file(&client, spec, on_progress).await {
+        Ok(()) => Ok(()),
+        Err(err)
+            if proxy_url.and_then(normalize_proxy_url).is_none()
+                && should_retry_without_system_proxy(&err) =>
+        {
+            let _ = fs::remove_file(spec.dest_part);
+            let direct_client = build_download_client_with_mode(None, true)?;
+            download_to_part_file(&direct_client, spec, on_progress).await
+        }
+        Err(err) => Err(err),
     }
+}
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| LauncherError::Network(format!("Lỗi kết nối GitHub API: {e}")))?;
+struct ApiAttemptError {
+    message: String,
+    retry_without_proxy: bool,
+}
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let detail = if status.as_u16() == 403 {
-            " (có thể đã vượt giới hạn tốc độ GitHub API)"
-        } else {
-            ""
-        };
-        return Err(LauncherError::Network(format!(
-            "GitHub API trả về HTTP {status}{detail}"
-        )));
-    }
+fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    let code = status.as_u16();
+    code == 403 || code == 407 || code == 429 || status.is_server_error()
+}
 
-    let json: Value = resp
-        .json()
-        .await
-        .map_err(|e| LauncherError::Network(format!("Phản hồi JSON từ GitHub không hợp lệ: {e}")))?;
-
+fn parse_tmodloader_releases_json(json: &Value) -> LauncherResult<Vec<TmodLoaderReleaseInfo>> {
     let releases = json.as_array().ok_or_else(|| {
         LauncherError::InvalidFormat("Dữ liệu releases từ GitHub không phải mảng JSON.".to_string())
     })?;
@@ -360,6 +384,545 @@ pub async fn fetch_tmodloader_releases(
     Ok(out)
 }
 
+async fn send_github_api_get(
+    client: &Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<reqwest::Response, ApiAttemptError> {
+    let mut req = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
+    if let Some(tok) = token {
+        req = req.bearer_auth(tok);
+    }
+
+    req.send().await.map_err(|e| ApiAttemptError {
+        message: format!("Lỗi kết nối GitHub API: {}", format_reqwest_error_chain(&e)),
+        retry_without_proxy: true,
+    })
+}
+
+async fn fetch_tmodloader_releases_api_once(
+    client: &Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<Vec<TmodLoaderReleaseInfo>, ApiAttemptError> {
+    let mut resp = send_github_api_get(client, url, token).await?;
+    if token.is_some() && matches!(resp.status().as_u16(), 401 | 403) {
+        resp = send_github_api_get(client, url, None).await?;
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = if status.as_u16() == 403 {
+            " (có thể đã vượt giới hạn tốc độ GitHub API)"
+        } else {
+            ""
+        };
+        return Err(ApiAttemptError {
+            message: format!("GitHub API trả về HTTP {status}{detail}"),
+            retry_without_proxy: is_retryable_http_status(status),
+        });
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| ApiAttemptError {
+        message: format!(
+            "Lỗi đọc dữ liệu GitHub API: {}",
+            format_reqwest_error_chain(&e)
+        ),
+        retry_without_proxy: true,
+    })?;
+
+    let json: Value = serde_json::from_slice(&bytes).map_err(|e| ApiAttemptError {
+        message: format!("Phản hồi JSON từ GitHub không hợp lệ: {e}"),
+        retry_without_proxy: false,
+    })?;
+
+    let list = parse_tmodloader_releases_json(&json).map_err(|e| ApiAttemptError {
+        message: e.to_string(),
+        retry_without_proxy: false,
+    })?;
+
+    if list.is_empty() {
+        return Err(ApiAttemptError {
+            message: "GitHub API không trả về bản phát hành tModLoader nào có tệp tModLoader.zip."
+                .to_string(),
+            retry_without_proxy: false,
+        });
+    }
+
+    Ok(list)
+}
+
+fn is_valid_release_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag != "."
+        && tag != ".."
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn extract_release_tag_from_location(location: &str) -> Option<String> {
+    let trimmed = location.trim();
+    let without_query = trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+
+    let rest = without_query
+        .split("/releases/download/")
+        .nth(1)
+        .or_else(|| without_query.split("/releases/tag/").nth(1))?;
+    let candidate = rest.split('/').next().unwrap_or("");
+
+    if is_valid_release_tag(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+async fn resolve_latest_stable_tml_tag_via_web(
+    web_base: &str,
+    proxy_url: Option<&str>,
+) -> Option<String> {
+    let web_base = web_base.trim().trim_end_matches('/');
+    let allow_bypass = proxy_url.and_then(normalize_proxy_url).is_none();
+    let modes: &[bool] = if allow_bypass { &[false, true] } else { &[false] };
+    let urls = [
+        format!("{web_base}/{TMODLOADER_GITHUB_REPO}/releases/latest/download/tModLoader.zip"),
+        format!("{web_base}/{TMODLOADER_GITHUB_REPO}/releases/latest"),
+    ];
+
+    for &bypass in modes {
+        let Ok(client) = build_http_client_with_options(proxy_url, bypass, false) else {
+            continue;
+        };
+        for url in &urls {
+            let Ok(resp) = client.get(url).send().await else {
+                continue;
+            };
+            if resp.status().is_redirection() {
+                if let Some(tag) = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(extract_release_tag_from_location)
+                {
+                    return Some(tag);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn fetch_tmodloader_releases_html(
+    web_base: &str,
+    proxy_url: Option<&str>,
+) -> Result<String, String> {
+    let web_base = web_base.trim().trim_end_matches('/');
+    let url = format!("{web_base}/{TMODLOADER_GITHUB_REPO}/releases");
+    let allow_bypass = proxy_url.and_then(normalize_proxy_url).is_none();
+    let modes: &[bool] = if allow_bypass { &[false, true] } else { &[false] };
+    let mut last_err = String::new();
+
+    for &bypass in modes {
+        let client = match build_http_client_with_options(proxy_url, bypass, true) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
+        };
+        let resp = match client
+            .get(&url)
+            .header("Accept", "text/html,application/xhtml+xml")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!(
+                    "Lỗi kết nối trang GitHub Releases: {}",
+                    format_reqwest_error_chain(&e)
+                );
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let host = resp.url().host_str().unwrap_or("unknown");
+            last_err = format!("Máy chủ {host} trả về HTTP {status}");
+            continue;
+        }
+        match resp.text().await {
+            Ok(text) => return Ok(text),
+            Err(e) => {
+                last_err = format!(
+                    "Lỗi đọc HTML từ GitHub Releases: {}",
+                    format_reqwest_error_chain(&e)
+                );
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+fn find_open_tag_end(html: &str, start: usize, max_len: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let limit = start.saturating_add(max_len).min(bytes.len());
+    let mut quote: Option<u8> = None;
+    let mut i = start;
+    while i < limit {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn extract_href_from_open_tag(open_tag: &str) -> Option<&str> {
+    let bytes = open_tag.as_bytes();
+    let mut i = 2;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if bytes[i - 1].is_ascii_whitespace()
+            && bytes
+                .get(i..i + 4)
+                .is_some_and(|s| s.eq_ignore_ascii_case(b"href"))
+        {
+            let mut j = i + 4;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'=') {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if let Some(&q) = bytes.get(j) {
+                    if q == b'"' || q == b'\'' {
+                        let val_start = j + 1;
+                        if let Some(rel_end) = bytes[val_start..].iter().position(|&c| c == q) {
+                            return Some(&open_tag[val_start..val_start + rel_end]);
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn extract_tag_from_release_href(href_val: &str) -> Option<String> {
+    let trimmed = href_val.trim();
+    if trimmed.contains("releases.atom") {
+        return None;
+    }
+    let marker = format!("/{TMODLOADER_GITHUB_REPO}/releases/tag/");
+    let idx = trimmed.find(&marker)?;
+    let prefix = &trimmed[..idx];
+    let valid_prefix =
+        prefix.is_empty() || prefix.starts_with("http://") || prefix.starts_with("https://");
+    if !valid_prefix || prefix.contains(char::is_whitespace) {
+        return None;
+    }
+    let after = &trimmed[idx + marker.len()..];
+    let tag = after
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if is_valid_release_tag(tag) {
+        Some(tag.to_string())
+    } else {
+        None
+    }
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_html_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp_idx) = rest.find('&') {
+        out.push_str(&rest[..amp_idx]);
+        let after_amp = &rest[amp_idx..];
+        if let Some(trimmed) = after_amp.strip_prefix("&amp;") {
+            out.push('&');
+            rest = trimmed;
+        } else if let Some(trimmed) = after_amp.strip_prefix("&lt;") {
+            out.push('<');
+            rest = trimmed;
+        } else if let Some(trimmed) = after_amp.strip_prefix("&gt;") {
+            out.push('>');
+            rest = trimmed;
+        } else if let Some(trimmed) = after_amp.strip_prefix("&quot;") {
+            out.push('"');
+            rest = trimmed;
+        } else if let Some(trimmed) = after_amp.strip_prefix("&#39;") {
+            out.push('\'');
+            rest = trimmed;
+        } else if let Some(trimmed) = after_amp.strip_prefix("&#x27;") {
+            out.push('\'');
+            rest = trimmed;
+        } else {
+            out.push('&');
+            rest = &after_amp[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_first_datetime_attr(slice: &str) -> String {
+    let Some(idx) = slice.find("datetime=\"") else {
+        return String::new();
+    };
+    let rest = &slice[idx + "datetime=\"".len()..];
+    let Some(end) = rest.find('"') else {
+        return String::new();
+    };
+    rest[..end].trim().to_string()
+}
+
+fn tmodloader_zip_download_url(web_base: &str, tag: &str) -> String {
+    format!("{web_base}/{TMODLOADER_GITHUB_REPO}/releases/download/{tag}/tModLoader.zip")
+}
+
+fn make_fallback_tmodloader_release(tag: &str, web_base: &str) -> TmodLoaderReleaseInfo {
+    TmodLoaderReleaseInfo {
+        tag_name: tag.to_string(),
+        name: format!("tModLoader {tag}"),
+        prerelease: false,
+        published_at: String::new(),
+        asset_name: "tModLoader.zip".to_string(),
+        download_url: tmodloader_zip_download_url(web_base, tag),
+        size: 0,
+    }
+}
+
+struct HtmlReleaseLink {
+    start: usize,
+    tag: String,
+    display_name: Option<String>,
+}
+
+fn parse_tmodloader_releases_html(
+    html: &str,
+    web_base: &str,
+    latest_stable_tag: Option<&str>,
+) -> Vec<TmodLoaderReleaseInfo> {
+    let web_base = web_base.trim().trim_end_matches('/');
+    let normalized_latest = latest_stable_tag
+        .map(str::trim)
+        .filter(|t| is_valid_release_tag(t));
+
+    let bytes = html.as_bytes();
+    let mut matches = Vec::new();
+    let mut pos = 0;
+
+    while pos + 2 < bytes.len() {
+        let Some(rel_lt) = bytes[pos..]
+            .windows(2)
+            .position(|w| w[0] == b'<' && (w[1] == b'a' || w[1] == b'A'))
+        else {
+            break;
+        };
+        let lt_pos = pos + rel_lt;
+        if !bytes.get(lt_pos + 2).is_some_and(|b| b.is_ascii_whitespace()) {
+            pos = lt_pos + 2;
+            continue;
+        }
+        let Some(gt_pos) = find_open_tag_end(html, lt_pos, 2048) else {
+            pos = lt_pos + 2;
+            continue;
+        };
+        let open_tag = &html[lt_pos..=gt_pos];
+        if let Some(tag) = extract_href_from_open_tag(open_tag).and_then(extract_tag_from_release_href) {
+            let after_open = &html[gt_pos + 1..];
+            let display_name = after_open
+                .as_bytes()
+                .windows(4)
+                .take(4096)
+                .position(|w| w.eq_ignore_ascii_case(b"</a>"))
+                .and_then(|close_rel| {
+                    let raw = &after_open[..close_rel];
+                    let cleaned: String = decode_html_entities(&strip_html_tags(raw))
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if cleaned.is_empty() {
+                        None
+                    } else {
+                        Some(cleaned)
+                    }
+                });
+            matches.push(HtmlReleaseLink {
+                start: lt_pos,
+                tag,
+                display_name,
+            });
+        }
+        pos = gt_pos + 1;
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+
+    for (i, item) in matches.iter().enumerate() {
+        if !seen.insert(item.tag.clone()) {
+            continue;
+        }
+
+        let raw_end = matches[i + 1..]
+            .iter()
+            .find(|m| m.tag != item.tag)
+            .map_or(html.len(), |m| m.start);
+        let mut end = raw_end.min(item.start.saturating_add(32_768)).min(html.len());
+        while end > item.start && !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        let card_slice = &html[item.start..end];
+
+        let name = matches[i..]
+            .iter()
+            .take_while(|m| m.start < end)
+            .find(|m| m.tag == item.tag && m.display_name.is_some())
+            .and_then(|m| m.display_name.clone())
+            .unwrap_or_else(|| item.tag.clone());
+        let published_at = extract_first_datetime_attr(card_slice);
+        let prerelease = (Some(item.tag.as_str()) != normalized_latest)
+            && (card_slice.contains(">Pre-release<") || card_slice.contains("Pre-release</span>"));
+
+        out.push(TmodLoaderReleaseInfo {
+            tag_name: item.tag.clone(),
+            name,
+            prerelease,
+            published_at,
+            asset_name: "tModLoader.zip".to_string(),
+            download_url: tmodloader_zip_download_url(web_base, &item.tag),
+            size: 0,
+        });
+
+        if out.len() >= 10 {
+            break;
+        }
+    }
+
+    if let Some(stable) = normalized_latest {
+        if let Some(existing) = out.iter_mut().find(|r| r.tag_name == stable) {
+            existing.prerelease = false;
+        } else {
+            out.insert(0, make_fallback_tmodloader_release(stable, web_base));
+            if out.len() > 10 {
+                out.truncate(10);
+            }
+        }
+    }
+
+    out
+}
+
+async fn fetch_tmodloader_releases_with_bases(
+    api_base: &str,
+    web_base: &str,
+    proxy_url: Option<&str>,
+    github_token: Option<&str>,
+) -> LauncherResult<Vec<TmodLoaderReleaseInfo>> {
+    let api_base = api_base.trim().trim_end_matches('/');
+    let web_base = web_base.trim().trim_end_matches('/');
+    let token = github_token.map(str::trim).filter(|s| !s.is_empty());
+    let has_explicit_proxy = proxy_url.and_then(normalize_proxy_url).is_some();
+
+    let api_url = format!("{api_base}/repos/{TMODLOADER_GITHUB_REPO}/releases?per_page=10");
+    let api_client = build_http_client_with_options(proxy_url, false, true)?;
+
+    let api_err = match fetch_tmodloader_releases_api_once(&api_client, &api_url, token).await {
+        Ok(list) => return Ok(list),
+        Err(err) if !has_explicit_proxy && err.retry_without_proxy => {
+            let direct_client = build_http_client_with_options(None, true, true)?;
+            match fetch_tmodloader_releases_api_once(&direct_client, &api_url, token).await {
+                Ok(list) => return Ok(list),
+                Err(err2) => err2.message,
+            }
+        }
+        Err(err) => err.message,
+    };
+
+    let latest_stable_tag = resolve_latest_stable_tml_tag_via_web(web_base, proxy_url).await;
+    let web_err = match fetch_tmodloader_releases_html(web_base, proxy_url).await {
+        Ok(html) => {
+            let parsed =
+                parse_tmodloader_releases_html(&html, web_base, latest_stable_tag.as_deref());
+            if !parsed.is_empty() {
+                return Ok(parsed);
+            }
+            "Không tìm thấy bản phát hành nào trên trang GitHub Releases.".to_string()
+        }
+        Err(err) => err,
+    };
+
+    if let Some(stable) = latest_stable_tag.filter(|t| is_valid_release_tag(t)) {
+        return Ok(vec![make_fallback_tmodloader_release(&stable, web_base)]);
+    }
+
+    Err(LauncherError::Network(format!(
+        "{api_err}; dự phòng trang GitHub Releases cũng thất bại: {web_err}"
+    )))
+}
+
+pub async fn fetch_tmodloader_releases(
+    proxy_url: Option<&str>,
+    github_token: Option<&str>,
+) -> LauncherResult<Vec<TmodLoaderReleaseInfo>> {
+    fetch_tmodloader_releases_with_bases(
+        "https://api.github.com",
+        "https://github.com",
+        proxy_url,
+        github_token,
+    )
+    .await
+}
+
 fn is_valid_dotnet_version(raw: &str) -> bool {
     let ver = raw.trim();
     if ver.is_empty() {
@@ -380,7 +943,8 @@ fn is_valid_dotnet_version(raw: &str) -> bool {
 }
 
 pub fn parse_dotnet_runtime_version(runtimeconfig_json: &str) -> LauncherResult<String> {
-    let root: Value = serde_json::from_str(runtimeconfig_json)?;
+    let clean = runtimeconfig_json.trim_start_matches('\u{feff}');
+    let root: Value = serde_json::from_str(clean)?;
     let runtime_options = root.get("runtimeOptions").ok_or_else(|| {
         LauncherError::InvalidFormat("Thiếu mục runtimeOptions trong runtimeconfig.json.".to_string())
     })?;
@@ -441,20 +1005,23 @@ pub fn read_required_tml_dotnet_version(paths: &LauncherPaths) -> String {
     read_declared_tml_dotnet_version(paths).unwrap_or_else(|| "8.0.0".to_string())
 }
 
-fn tmodloader_needs_dotnet8_install_with<FExact, FSys, FAny>(
+fn tmodloader_needs_dotnet8_install_with<FExact, FLocal, FSys, FAny>(
     paths: &LauncherPaths,
     detect_exact: FExact,
+    query_local: FLocal,
     query_system: FSys,
     detect_any: FAny,
 ) -> bool
 where
     FExact: Fn(&LauncherPaths, &str) -> bool,
+    FLocal: Fn(&LauncherPaths) -> Option<String>,
     FSys: Fn() -> Option<String>,
     FAny: Fn(&LauncherPaths) -> bool,
 {
     match read_declared_tml_dotnet_version(paths) {
         Some(req) => {
             !detect_exact(paths, &req)
+                && !query_local(paths).is_some_and(|v| tl_core::version_at_least_patch(&v, &req))
                 && !query_system().is_some_and(|v| tl_core::version_at_least_patch(&v, &req))
         }
         None => !detect_any(paths),
@@ -464,7 +1031,12 @@ where
 fn tmodloader_needs_dotnet8_install(paths: &LauncherPaths) -> bool {
     tmodloader_needs_dotnet8_install_with(
         paths,
-        detect_exact_bundled_dotnet_runtime,
+        |p, req| {
+            detect_exact_bundled_dotnet_runtime(p, req)
+                && tl_core::query_local_dotnet8_runtime(p)
+                    .is_some_and(|v| tl_core::version_at_least_patch(&v, req))
+        },
+        tl_core::query_local_dotnet8_runtime,
         tl_core::query_system_dotnet8_runtime,
         |p| detect_dotnet8_runtime(p).is_some(),
     )
@@ -487,8 +1059,8 @@ pub async fn install_dotnet8_portable(
     let ver = parse_dotnet_runtime_version(&runtimeconfig_json)?;
 
     let urls = [
-        format!("https://dotnetcli.azureedge.net/dotnet/Runtime/{ver}/dotnet-runtime-{ver}-win-x64.zip"),
         format!("https://builds.dotnet.microsoft.com/dotnet/Runtime/{ver}/dotnet-runtime-{ver}-win-x64.zip"),
+        format!("https://dotnetcli.azureedge.net/dotnet/Runtime/{ver}/dotnet-runtime-{ver}-win-x64.zip"),
     ];
 
     let cache_dir = paths.data_dir.join("cache");
@@ -499,14 +1071,13 @@ pub async fn install_dotnet8_portable(
     ));
     let _part_guard = TempFileGuard::new(part_path.clone());
 
-    let client = build_download_client(proxy_url)?;
     let stage = format!("Đang tải .NET {ver} portable...");
     let mut last_err: Option<LauncherError> = None;
 
     for url in &urls {
         let _ = fs::remove_file(&part_path);
-        match download_to_part_file(
-            &client,
+        match download_to_part_file_resilient(
+            proxy_url,
             DownloadSpec {
                 url,
                 dest_part: &part_path,
@@ -573,24 +1144,50 @@ pub async fn install_tmodloader_release(
     let part_path = cache_dir.join(format!("tModLoader-{}.zip.part", uuid::Uuid::new_v4()));
     let _part_guard = TempFileGuard::new(part_path.clone());
 
-    let client = build_download_client(proxy_url)?;
     let fallback_size = if release.size > 0 { Some(release.size) } else { None };
     let dl_stage = format!("Đang tải tModLoader {}...", release.tag_name);
 
-    download_to_part_file(
-        &client,
-        DownloadSpec {
-            url,
-            dest_part: &part_path,
-            target: InstallTarget::TModLoader,
-            stage: &dl_stage,
-            fallback_total: fallback_size,
-            accept_header: None,
-            bearer_token: None,
-        },
-        &on_progress,
-    )
-    .await?;
+    let mut candidate_urls = vec![url.to_string()];
+    if !release.prerelease && url.starts_with("https://github.com/") {
+        let latest_url = format!(
+            "https://github.com/{TMODLOADER_GITHUB_REPO}/releases/latest/download/tModLoader.zip"
+        );
+        if latest_url != url {
+            candidate_urls.push(latest_url);
+        }
+    }
+
+    let mut last_err: Option<LauncherError> = None;
+    for candidate_url in &candidate_urls {
+        let _ = fs::remove_file(&part_path);
+        match download_to_part_file_resilient(
+            proxy_url,
+            DownloadSpec {
+                url: candidate_url,
+                dest_part: &part_path,
+                target: InstallTarget::TModLoader,
+                stage: &dl_stage,
+                fallback_total: fallback_size,
+                accept_header: None,
+                bearer_token: None,
+            },
+            &on_progress,
+        )
+        .await
+        {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+
+    if let Some(err) = last_err {
+        return Err(err);
+    }
 
     verify_zip_contains_required_file_blocking(part_path.clone(), "tmodloader.dll").await?;
 
@@ -1219,12 +1816,41 @@ fn installed_terraria_receipt_path(paths: &LauncherPaths) -> PathBuf {
     paths.data_dir.join(TERRARIA_RECEIPT_FILENAME)
 }
 
+fn normalize_terraria_install_dir(raw: &str) -> String {
+    let slash_norm = raw.trim().replace('\\', "/");
+    let trimmed = slash_norm.trim_end_matches('/');
+    let mut out = if trimmed.is_empty() && slash_norm.starts_with('/') {
+        "/".to_string()
+    } else if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' && slash_norm.len() > 2 {
+        format!("{trimmed}/")
+    } else {
+        trimmed.to_string()
+    };
+    #[cfg(windows)]
+    out.make_ascii_lowercase();
+    out
+}
+
 pub fn load_installed_terraria_receipt(paths: &LauncherPaths) -> Option<InstalledTerrariaReceipt> {
     if !paths.terraria_exe().is_file() {
         return None;
     }
     let raw = fs::read_to_string(installed_terraria_receipt_path(paths)).ok()?;
-    serde_json::from_str::<InstalledTerrariaReceipt>(raw.trim_start_matches('\u{feff}')).ok()
+    let receipt =
+        serde_json::from_str::<InstalledTerrariaReceipt>(raw.trim_start_matches('\u{feff}')).ok()?;
+    let current_norm = normalize_terraria_install_dir(&paths.terraria_dir.to_string_lossy());
+    if !receipt.install_dir.trim().is_empty() {
+        if normalize_terraria_install_dir(&receipt.install_dir) != current_norm {
+            return None;
+        }
+    } else {
+        let default_norm =
+            normalize_terraria_install_dir(&paths.base_dir.join("Terraria").to_string_lossy());
+        if current_norm != default_norm {
+            return None;
+        }
+    }
+    Some(receipt)
 }
 
 fn save_installed_terraria_receipt(
@@ -1232,7 +1858,9 @@ fn save_installed_terraria_receipt(
     receipt: &InstalledTerrariaReceipt,
 ) -> LauncherResult<()> {
     fs::create_dir_all(&paths.data_dir)?;
-    let json = serde_json::to_string_pretty(receipt)?;
+    let mut stored = receipt.clone();
+    stored.install_dir = paths.terraria_dir.to_string_lossy().into_owned();
+    let json = serde_json::to_string_pretty(&stored)?;
     tl_core::config::write_atomic(&installed_terraria_receipt_path(paths), json.as_bytes())?;
     Ok(())
 }
@@ -1412,6 +2040,7 @@ where
         version: version.to_string(),
         sha256: full_sha256,
         source: source.trim().to_string(),
+        install_dir: paths.terraria_dir.to_string_lossy().into_owned(),
     };
     save_installed_terraria_receipt(paths, &receipt)?;
 
@@ -1945,10 +2574,7 @@ fn winget_http_proxy(proxy_url: Option<&str>) -> Option<String> {
     }
 }
 
-pub(crate) async fn run_winget_install_steamcmd(
-    on_line: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    proxy_url: Option<&str>,
-) -> LauncherResult<String> {
+fn build_winget_steamcmd_command(proxy_url: Option<&str>) -> Command {
     let mut cmd = Command::new("winget");
     cmd.args([
         "install",
@@ -1961,13 +2587,22 @@ pub(crate) async fn run_winget_install_steamcmd(
     ]);
     if let Some(norm) = winget_http_proxy(proxy_url) {
         cmd.arg("--proxy").arg(&norm);
-        cmd.env("HTTP_PROXY", &norm).env("HTTPS_PROXY", &norm);
     }
+    crate::mods_manager::apply_proxy_env(&mut cmd, proxy_url);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
+pub(crate) async fn run_winget_install_steamcmd(
+    on_line: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    proxy_url: Option<&str>,
+) -> LauncherResult<String> {
+    let mut cmd = build_winget_steamcmd_command(proxy_url);
 
     let mut child = cmd
         .spawn()
@@ -2775,6 +3410,46 @@ mod tests {
             Some("https://proxy.example:8443".to_string())
         );
         assert_eq!(winget_http_proxy(Some("socks5://127.0.0.1:1080")), None);
+
+        let inspect_cmd = |proxy| {
+            let cmd = build_winget_steamcmd_command(proxy);
+            let args: Vec<_> = cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let envs: std::collections::HashMap<String, String> = cmd
+                .as_std()
+                .get_envs()
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.to_string_lossy().into_owned(),
+                        v?.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect();
+            (args, envs)
+        };
+
+        let (http_args, http_envs) = inspect_cmd(Some("127.0.0.1:7890"));
+        assert!(http_args
+            .windows(2)
+            .any(|w| w == ["--proxy", "http://127.0.0.1:7890"]));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                http_envs.get(key).map(String::as_str),
+                Some("http://127.0.0.1:7890")
+            );
+        }
+
+        let (socks_args, socks_envs) = inspect_cmd(Some("socks5://127.0.0.1:1080"));
+        assert!(!socks_args.iter().any(|a| a == "--proxy"));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                socks_envs.get(key).map(String::as_str),
+                Some("socks5://127.0.0.1:1080")
+            );
+        }
     }
 
     #[test]
@@ -3273,6 +3948,7 @@ mod tests {
                     version: "1.4.5.8".to_string(),
                     sha256: manifest.sha256.clone(),
                     source: "owner/repo#terraria-game".to_string(),
+                    install_dir: paths.terraria_dir.to_string_lossy().into_owned(),
                 }
             );
 
@@ -3780,12 +4456,14 @@ mod tests {
         assert!(tmodloader_needs_dotnet8_install_with(
             &paths,
             |_, _| false,
+            |_| None,
             || Some("8.0.25".to_string()),
             |_| false,
         ));
         assert!(!tmodloader_needs_dotnet8_install_with(
             &paths,
             |_, _| false,
+            |_| None,
             || Some("8.0.25".to_string()),
             |_| true,
         ));
@@ -3803,18 +4481,35 @@ mod tests {
         assert!(!tmodloader_needs_dotnet8_install_with(
             &paths,
             |_, req| req == "8.0.23",
+            |_| None,
             || None,
             |_| false,
         ));
         assert!(!tmodloader_needs_dotnet8_install_with(
             &paths,
             |_, _| false,
+            |_| Some("8.0.25".to_string()),
+            || None,
+            |_| false,
+        ));
+        assert!(tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |_, _| false,
+            |_| Some("8.0.14".to_string()),
+            || None,
+            |_| true,
+        ));
+        assert!(!tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |_, _| false,
+            |_| Some("8.0.14".to_string()),
             || Some("8.0.24".to_string()),
             |_| false,
         ));
         assert!(tmodloader_needs_dotnet8_install_with(
             &paths,
             |_, _| false,
+            |_| None,
             || Some("8.0.14".to_string()),
             |_| true,
         ));
@@ -3920,5 +4615,525 @@ mod tests {
                 b"MZ-DIRECT-ZIP"
             );
         });
+    }
+
+    async fn read_http_request_head(socket: &mut tokio::net::TcpStream) -> String {
+        let mut data = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    data.extend_from_slice(&chunk[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") || data.len() >= 16_384 {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
+    #[test]
+    fn fetch_tmodloader_releases_retries_unauthenticated_when_token_gets_403() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let recorded = Arc::new(Mutex::new(Vec::<(String, bool, bool, bool)>::new()));
+            let recorded_srv = Arc::clone(&recorded);
+
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let recorded_req = Arc::clone(&recorded_srv);
+                    tokio::spawn(async move {
+                        let req_text = read_http_request_head(&mut socket).await;
+                        let target = req_text
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+
+                        let mut has_auth = false;
+                        let mut has_api_ver = false;
+                        let mut has_accept = false;
+                        for line in req_text.lines().skip(1) {
+                            let lower = line.to_ascii_lowercase();
+                            if lower.starts_with("authorization:") {
+                                has_auth = true;
+                            } else if lower.starts_with("x-github-api-version:")
+                                && lower.contains("2022-11-28")
+                            {
+                                has_api_ver = true;
+                            } else if lower.starts_with("accept:")
+                                && lower.contains("application/vnd.github+json")
+                            {
+                                has_accept = true;
+                            }
+                        }
+
+                        recorded_req
+                            .lock()
+                            .unwrap()
+                            .push((target.clone(), has_auth, has_api_ver, has_accept));
+
+                        let (status, content_type, body) = if has_auth {
+                            ("403 Forbidden", "application/json", r#"{"message":"Bad credentials"}"#.to_string())
+                        } else {
+                            (
+                                "200 OK",
+                                "application/json",
+                                serde_json::json!([
+                                    {
+                                        "tag_name": "v2026.09.3.1",
+                                        "name": "tModLoader v2026.09.3.1",
+                                        "prerelease": false,
+                                        "published_at": "2026-09-20T08:00:00Z",
+                                        "assets": [
+                                            {
+                                                "name": "tModLoader.zip",
+                                                "browser_download_url": "https://github.com/tModLoader/tModLoader/releases/download/v2026.09.3.1/tModLoader.zip",
+                                                "size": 9876543u64
+                                            }
+                                        ]
+                                    }
+                                ])
+                                .to_string(),
+                            )
+                        };
+
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+
+            let base = format!("http://127.0.0.1:{port}");
+            let releases =
+                fetch_tmodloader_releases_with_bases(&base, &base, None, Some("bad-token"))
+                    .await
+                    .unwrap();
+            server.abort();
+
+            assert_eq!(releases.len(), 1);
+            assert_eq!(releases[0].tag_name, "v2026.09.3.1");
+            assert_eq!(releases[0].size, 9_876_543);
+
+            let log = recorded.lock().unwrap();
+            assert_eq!(log.len(), 2);
+            assert_eq!(log[0].0, "/repos/tModLoader/tModLoader/releases?per_page=10");
+            assert!(log[0].1);
+            assert!(log[0].2);
+            assert!(log[0].3);
+            assert!(!log[1].1);
+            assert!(log[1].2);
+            assert!(log[1].3);
+        });
+    }
+
+    #[test]
+    fn fetch_tmodloader_releases_falls_back_to_web_html_on_api_403() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let paths_hit = Arc::new(Mutex::new(Vec::<String>::new()));
+            let paths_srv = Arc::clone(&paths_hit);
+
+            let html_body = concat!(
+                "<html><head>",
+                "<link rel=\"alternate\" type=\"application/atom+xml\" href=\"/tModLoader/tModLoader/releases.atom\">",
+                "</head><body>",
+                "<a href=\"/tModLoader/tModLoader/releases.atom\">Atom</a>",
+                "<section>",
+                "<a href=\"/tModLoader/tModLoader/releases/tag/v2026.10.2.3\">tModLoader v2026.10.2.3</a>",
+                "<span>Pre-release</span>",
+                "<relative-time datetime=\"2026-10-15T12:00:00Z\"></relative-time>",
+                "</section>",
+                "<section>",
+                "<a href=\"/tModLoader/tModLoader/releases/tag/v2026.09.3.1\">tModLoader v2026.09.3.1</a>",
+                "<span>Latest</span>",
+                "<relative-time datetime=\"2026-09-20T08:00:00Z\"></relative-time>",
+                "</section>",
+                "</body></html>"
+            );
+
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let paths_req = Arc::clone(&paths_srv);
+                    tokio::spawn(async move {
+                        let req_text = read_http_request_head(&mut socket).await;
+                        let target = req_text
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        paths_req.lock().unwrap().push(target.clone());
+
+                        let resp = match target.as_str() {
+                            "/repos/tModLoader/tModLoader/releases?per_page=10" => {
+                                let body = r#"{"message":"rate limit exceeded"}"#;
+                                format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            }
+                            "/tModLoader/tModLoader/releases/latest/download/tModLoader.zip" => {
+                                "HTTP/1.1 302 Found\r\nLocation: /tModLoader/tModLoader/releases/download/v2026.09.3.1/tModLoader.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                            }
+                            "/tModLoader/tModLoader/releases" => {
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html_body}",
+                                    html_body.len()
+                                )
+                            }
+                            _ => {
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                            }
+                        };
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+
+            let base = format!("http://127.0.0.1:{port}");
+            let releases = fetch_tmodloader_releases_with_bases(&base, &base, None, None)
+                .await
+                .unwrap();
+            server.abort();
+
+            assert_eq!(releases.len(), 2);
+            assert_eq!(releases[0].tag_name, "v2026.10.2.3");
+            assert!(releases[0].prerelease);
+            assert_eq!(releases[0].published_at, "2026-10-15T12:00:00Z");
+            assert_eq!(releases[0].asset_name, "tModLoader.zip");
+            assert_eq!(
+                releases[0].download_url,
+                format!("{base}/tModLoader/tModLoader/releases/download/v2026.10.2.3/tModLoader.zip")
+            );
+
+            assert_eq!(releases[1].tag_name, "v2026.09.3.1");
+            assert!(!releases[1].prerelease);
+            assert_eq!(releases[1].published_at, "2026-09-20T08:00:00Z");
+            assert_eq!(
+                releases[1].download_url,
+                format!("{base}/tModLoader/tModLoader/releases/download/v2026.09.3.1/tModLoader.zip")
+            );
+
+            let hit = paths_hit.lock().unwrap();
+            assert!(!hit.iter().any(|p| p.contains("releases.atom")));
+        });
+    }
+
+    #[test]
+    fn fetch_tmodloader_releases_falls_back_to_redirect_only_when_api_and_html_fail() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let fail_redirect = Arc::new(AtomicBool::new(false));
+            let fail_redirect_srv = Arc::clone(&fail_redirect);
+
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let fail_flag = Arc::clone(&fail_redirect_srv);
+                    tokio::spawn(async move {
+                        let req_text = read_http_request_head(&mut socket).await;
+                        let target = req_text
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+
+                        let resp = match target {
+                            "/tModLoader/tModLoader/releases/latest/download/tModLoader.zip"
+                                if !fail_flag.load(Ordering::Relaxed) =>
+                            {
+                                "HTTP/1.1 302 Found\r\nLocation: https://github.com/tModLoader/tModLoader/releases/download/v2026.09.3.1/tModLoader.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                            }
+                            _ => {
+                                let body = "forbidden";
+                                format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            }
+                        };
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+
+            let base = format!("http://127.0.0.1:{port}");
+            let releases = fetch_tmodloader_releases_with_bases(&base, &base, None, None)
+                .await
+                .unwrap();
+            assert_eq!(releases.len(), 1);
+            assert_eq!(releases[0].tag_name, "v2026.09.3.1");
+            assert_eq!(releases[0].name, "tModLoader v2026.09.3.1");
+            assert!(!releases[0].prerelease);
+            assert_eq!(releases[0].asset_name, "tModLoader.zip");
+            assert_eq!(releases[0].size, 0);
+            assert_eq!(
+                releases[0].download_url,
+                format!("{base}/tModLoader/tModLoader/releases/download/v2026.09.3.1/tModLoader.zip")
+            );
+
+            fail_redirect.store(true, Ordering::Relaxed);
+            let err = fetch_tmodloader_releases_with_bases(&base, &base, None, None)
+                .await
+                .unwrap_err();
+            server.abort();
+            assert!(matches!(err, LauncherError::Network(_)));
+            assert!(err
+                .to_string()
+                .contains("dự phòng trang GitHub Releases cũng thất bại"));
+        });
+    }
+
+    #[test]
+    fn parse_tmodloader_releases_html_handles_entities_dedup_cap_and_tag_validation() {
+        assert!(is_valid_release_tag("v2026.09.3.1"));
+        assert!(is_valid_release_tag("v1.4.4-stable+2026_1"));
+        assert!(!is_valid_release_tag(""));
+        assert!(!is_valid_release_tag("."));
+        assert!(!is_valid_release_tag(".."));
+        assert!(!is_valid_release_tag("v2026/evil"));
+        assert!(!is_valid_release_tag("v2026 tag"));
+
+        assert_eq!(
+            extract_release_tag_from_location(
+                "https://github.com/tModLoader/tModLoader/releases/download/v2026.09.3.1/tModLoader.zip?x=1#top"
+            )
+            .as_deref(),
+            Some("v2026.09.3.1")
+        );
+        assert_eq!(
+            extract_release_tag_from_location("/tModLoader/tModLoader/releases/tag/v2026.09.3.1/")
+                .as_deref(),
+            Some("v2026.09.3.1")
+        );
+        assert_eq!(
+            extract_release_tag_from_location("/tModLoader/tModLoader/releases/tag/.."),
+            None
+        );
+
+        let html = concat!(
+            "<a href=\"/tModLoader/tModLoader/releases.atom\">Atom</a>",
+            "<a href=\"/tModLoader/tModLoader/releases/tag/..\">Traversal</a>",
+            "<a href=\"/tModLoader/tModLoader/releases/tag/bad/tag\">Slash</a>",
+            "<div>",
+            "<a href=\"https://github.com/tModLoader/tModLoader/releases/tag/v2026.10.2.3\">",
+            "<span>tModLoader &amp; &lt;Beta&gt; &quot;2026&quot; &#39;Test&#39;</span>",
+            "</a>",
+            "<a href=\"/tModLoader/tModLoader/releases/tag/v2026.10.2.3\">dup</a>",
+            "<span>Pre-release</span>",
+            "<relative-time datetime=\"2026-10-15T00:00:00Z\"></relative-time>",
+            "</div>",
+            "<div>",
+            "<a href=\"/tModLoader/tModLoader/releases/tag/v2026.09.3.1\"></a>",
+            "<span class=\"Label\">Pre-release</span>",
+            "</div>",
+        );
+
+        let parsed =
+            parse_tmodloader_releases_html(html, "https://github.com/", Some("v2026.09.3.1"));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].tag_name, "v2026.10.2.3");
+        assert_eq!(parsed[0].name, "tModLoader & <Beta> \"2026\" 'Test'");
+        assert!(parsed[0].prerelease);
+        assert_eq!(parsed[0].published_at, "2026-10-15T00:00:00Z");
+        assert_eq!(
+            parsed[0].download_url,
+            "https://github.com/tModLoader/tModLoader/releases/download/v2026.10.2.3/tModLoader.zip"
+        );
+
+        assert_eq!(parsed[1].tag_name, "v2026.09.3.1");
+        assert_eq!(parsed[1].name, "v2026.09.3.1");
+        assert!(!parsed[1].prerelease);
+
+        let mut many_cards = String::new();
+        for idx in 1..=12 {
+            many_cards.push_str(&format!(
+                "<div><a href=\"/tModLoader/tModLoader/releases/tag/v2026.01.{idx}.0\">Rel {idx}</a></div>"
+            ));
+        }
+        let capped = parse_tmodloader_releases_html(&many_cards, "https://github.com", None);
+        assert_eq!(capped.len(), 10);
+        assert_eq!(capped[0].tag_name, "v2026.01.1.0");
+        assert_eq!(capped[9].tag_name, "v2026.01.10.0");
+
+        let with_inserted_latest =
+            parse_tmodloader_releases_html(&many_cards, "https://github.com", Some("v2025.12.9.9"));
+        assert_eq!(with_inserted_latest.len(), 10);
+        assert_eq!(with_inserted_latest[0].tag_name, "v2025.12.9.9");
+        assert!(!with_inserted_latest[0].prerelease);
+
+        assert!(should_retry_without_system_proxy(&LauncherError::Network(
+            "Lỗi kết nối khi tải tModLoader: timed out".to_string()
+        )));
+        assert!(should_retry_without_system_proxy(&LauncherError::Network(
+            "Lỗi đọc dữ liệu khi tải tModLoader: reset".to_string()
+        )));
+        for code in ["403", "407", "429", "502", "503", "504"] {
+            assert!(should_retry_without_system_proxy(&LauncherError::Network(
+                format!("Máy chủ github.com trả về HTTP {code} khi tải tModLoader")
+            )));
+        }
+        assert!(!should_retry_without_system_proxy(&LauncherError::Network(
+            "Máy chủ github.com trả về HTTP 404 Not Found khi tải tModLoader".to_string()
+        )));
+        assert!(!should_retry_without_system_proxy(
+            &LauncherError::InvalidInput("bad".to_string())
+        ));
+    }
+
+    #[test]
+    fn parse_dotnet_runtime_version_handles_leading_utf8_bom() {
+        let bom_single = "\u{feff}{\"runtimeOptions\":{\"framework\":{\"name\":\"Microsoft.NETCore.App\",\"version\":\"8.0.14\"}}}";
+        assert_eq!(parse_dotnet_runtime_version(bom_single).unwrap(), "8.0.14");
+
+        let bom_multi = "\u{feff}{\"runtimeOptions\":{\"frameworks\":[{\"name\":\"Microsoft.NETCore.App\",\"version\":\"8.0.23\"}]}}";
+        assert_eq!(parse_dotnet_runtime_version(bom_multi).unwrap(), "8.0.23");
+    }
+
+    #[test]
+    fn installed_terraria_receipt_validates_install_dir_and_legacy_fallback() {
+        let guard = TempDirGuard::new("tl_gi_receipt_dir");
+        let mut paths = guard.paths();
+        fs::create_dir_all(&paths.terraria_dir).unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::write(paths.terraria_exe(), b"MZ-TEST").unwrap();
+
+        let seed = InstalledTerrariaReceipt {
+            version: "1.4.5.8".to_string(),
+            sha256: "abc123".to_string(),
+            source: "owner/repo#terraria-game".to_string(),
+            install_dir: String::new(),
+        };
+        save_installed_terraria_receipt(&paths, &seed).unwrap();
+        let saved = load_installed_terraria_receipt(&paths).unwrap();
+        assert_eq!(
+            saved.install_dir,
+            paths.terraria_dir.to_string_lossy().as_ref()
+        );
+
+        let slash_variant = format!(
+            "{}///",
+            paths
+                .terraria_dir
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_uppercase()
+        );
+        let variant_json = serde_json::json!({
+            "version": "1.4.5.8",
+            "sha256": "abc123",
+            "source": "owner/repo#terraria-game",
+            "install_dir": slash_variant,
+        });
+        fs::write(
+            installed_terraria_receipt_path(&paths),
+            serde_json::to_string_pretty(&variant_json).unwrap(),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        assert!(load_installed_terraria_receipt(&paths).is_some());
+
+        let legacy_json = r#"{"version":"1.4.5.8","sha256":"abc123","source":"legacy"}"#;
+        fs::write(installed_terraria_receipt_path(&paths), legacy_json).unwrap();
+        assert!(load_installed_terraria_receipt(&paths).is_some());
+
+        let custom_dir = guard.0.join("CustomTerraria");
+        fs::create_dir_all(&custom_dir).unwrap();
+        fs::write(custom_dir.join("Terraria.exe"), b"MZ-CUSTOM").unwrap();
+        paths.terraria_dir = custom_dir.clone();
+        assert_eq!(load_installed_terraria_receipt(&paths), None);
+
+        save_installed_terraria_receipt(&paths, &seed).unwrap();
+        let custom_saved = load_installed_terraria_receipt(&paths).unwrap();
+        assert_eq!(
+            custom_saved.install_dir,
+            custom_dir.to_string_lossy().as_ref()
+        );
+
+        let mismatched_json = serde_json::json!({
+            "version": "1.4.5.8",
+            "sha256": "abc123",
+            "source": "owner/repo#terraria-game",
+            "install_dir": guard.0.join("OtherTerraria").to_string_lossy(),
+        });
+        fs::write(
+            installed_terraria_receipt_path(&paths),
+            serde_json::to_string_pretty(&mismatched_json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_installed_terraria_receipt(&paths), None);
+    }
+
+    #[test]
+    fn corrupt_bundled_dotnet_requires_install_even_when_dir_exists() {
+        let guard = TempDirGuard::new("tl_gi_corrupt_dotnet");
+        let paths = guard.paths();
+        let dotnet_dir = paths.tmodloader_dir.join("dotnet");
+        fs::create_dir_all(dotnet_dir.join("host").join("fxr")).unwrap();
+        fs::create_dir_all(
+            dotnet_dir
+                .join("shared")
+                .join("Microsoft.NETCore.App")
+                .join("8.0.23"),
+        )
+        .unwrap();
+        fs::write(dotnet_dir.join("dotnet.exe"), b"not-a-valid-pe-binary").unwrap();
+        fs::write(
+            paths.tmodloader_dir.join("tModLoader.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"8.0.23"}}}"#,
+        )
+        .unwrap();
+
+        assert!(detect_exact_bundled_dotnet_runtime(&paths, "8.0.23"));
+        assert_eq!(tl_core::query_local_dotnet8_runtime(&paths), None);
+        assert!(tmodloader_needs_dotnet8_install_with(
+            &paths,
+            |p, req| {
+                detect_exact_bundled_dotnet_runtime(p, req)
+                    && tl_core::query_local_dotnet8_runtime(p)
+                        .is_some_and(|v| tl_core::version_at_least_patch(&v, req))
+            },
+            tl_core::query_local_dotnet8_runtime,
+            || None,
+            |_| false,
+        ));
     }
 }

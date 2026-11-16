@@ -283,6 +283,16 @@ fn launch_tmodloader(
     )
 }
 
+pub(crate) fn has_terraria_content(paths: &LauncherPaths) -> bool {
+    let terraria_content = paths.terraria_dir.join("Content");
+    let sibling_content = paths
+        .tmodloader_dir
+        .parent()
+        .map(|p| p.join("Terraria").join("Content").is_dir())
+        .unwrap_or(false);
+    terraria_content.is_dir() || sibling_content
+}
+
 fn build_tmodloader_command(
     paths: &LauncherPaths,
     opts: &GameLaunchOptions,
@@ -295,13 +305,8 @@ fn build_tmodloader_command(
         )));
     }
 
-    let terraria_content = paths.terraria_dir.join("Content");
-    let sibling_content = paths
-        .tmodloader_dir
-        .parent()
-        .map(|p| p.join("Terraria").join("Content").is_dir())
-        .unwrap_or(false);
-    if !terraria_content.is_dir() && !sibling_content {
+    if !has_terraria_content(paths) {
+        let terraria_content = paths.terraria_dir.join("Content");
         return Err(LauncherError::NotFound(format!(
             "Không tìm thấy thư mục tài nguyên Terraria (Content) tại {}. Hãy cài đặt Terraria hoặc chọn đúng thư mục Terraria trong Cài đặt.",
             terraria_content.display()
@@ -655,17 +660,21 @@ fn extract_exe_stem(raw: &str) -> String {
 }
 
 fn is_rejected_client_stem(stem: &str) -> bool {
-    matches!(
+    if matches!(
         stem,
-        "cmd"
-            | "powershell"
-            | "pwsh"
-            | "conhost"
-            | "wt"
-            | "terrarialauncher"
-            | "terrariallauncher"
-            | "terrariaserver"
-    )
+        "cmd" | "powershell" | "pwsh" | "conhost" | "wt" | "terrariaserver"
+    ) {
+        return true;
+    }
+    let compact: String = stem
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    compact.starts_with("trihienkunterrarialauncher")
+        || compact.starts_with("trihienkunterrarialaucher")
+        || compact.starts_with("terrarialauncher")
+        || compact.starts_with("terrariallauncher")
 }
 
 fn parse_game_client_cmdline(
@@ -741,10 +750,75 @@ fn process_references_launcher_paths(
         .any(|arg| known_dirs.iter().any(|dir| text_references_dir(arg, dir)))
 }
 
-pub fn detect_existing_game_process(
+fn build_known_game_dirs(paths: &LauncherPaths) -> Vec<String> {
+    [
+        &paths.terraria_dir,
+        &paths.tmodloader_dir,
+        &paths.vanilla_saves_dir,
+        &paths.tml_saves_dir,
+    ]
+    .into_iter()
+    .map(|p| normalize_path_for_match(&p.to_string_lossy()))
+    .filter(|s| !s.is_empty())
+    .collect()
+}
+
+struct GameProcessCandidate {
+    pid: u32,
+    proc_name: String,
+    exe_path: Option<PathBuf>,
+    args: Vec<String>,
+    memory_bytes: u64,
+    cpu_usage: f32,
+}
+
+fn collect_detected_game_processes<I>(
+    self_pid: u32,
+    known_dirs: &[String],
+    processes: I,
+) -> Vec<RunningGameSnapshot>
+where
+    I: IntoIterator<Item = GameProcessCandidate>,
+{
+    let mut detected: Vec<((bool, u32), RunningGameSnapshot)> = Vec::new();
+
+    for candidate in processes {
+        if candidate.pid == self_pid {
+            continue;
+        }
+        let Some(edition) = parse_game_client_cmdline(
+            &candidate.proc_name,
+            candidate.exe_path.as_deref(),
+            &candidate.args,
+        ) else {
+            continue;
+        };
+
+        let preferred = process_references_launcher_paths(
+            candidate.exe_path.as_deref(),
+            &candidate.args,
+            known_dirs,
+        );
+        let rank = (!preferred, candidate.pid);
+        detected.push((
+            rank,
+            RunningGameSnapshot {
+                pid: candidate.pid,
+                edition,
+                memory_mb: candidate.memory_bytes / (1024 * 1024),
+                cpu_percent: candidate.cpu_usage,
+            },
+        ));
+    }
+
+    detected.sort_by_key(|(rank, _)| *rank);
+    detected.into_iter().map(|(_, snapshot)| snapshot).collect()
+}
+
+pub fn detect_all_existing_game_processes(
     sys: &mut System,
     paths: &LauncherPaths,
-) -> Option<RunningGameSnapshot> {
+) -> Vec<RunningGameSnapshot> {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -756,56 +830,34 @@ pub fn detect_existing_game_process(
     );
 
     let self_pid = std::process::id();
-    let known_dirs: Vec<String> = [
-        &paths.terraria_dir,
-        &paths.tmodloader_dir,
-        &paths.vanilla_saves_dir,
-        &paths.tml_saves_dir,
-    ]
-    .into_iter()
-    .map(|p| normalize_path_for_match(&p.to_string_lossy()))
-    .filter(|s| !s.is_empty())
-    .collect();
+    let known_dirs = build_known_game_dirs(paths);
+    let owned_entries: Vec<GameProcessCandidate> = sys
+        .processes()
+        .iter()
+        .map(|(pid, process)| GameProcessCandidate {
+            pid: pid.as_u32(),
+            proc_name: process.name().to_string_lossy().into_owned(),
+            exe_path: process.exe().map(Path::to_path_buf),
+            args: process
+                .cmd()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            memory_bytes: process.memory(),
+            cpu_usage: process.cpu_usage(),
+        })
+        .collect();
 
-    let mut best: Option<((bool, u32), RunningGameSnapshot)> = None;
+    collect_detected_game_processes(self_pid, &known_dirs, owned_entries)
+}
 
-    for (pid, process) in sys.processes() {
-        let pid_u32 = pid.as_u32();
-        if pid_u32 == self_pid {
-            continue;
-        }
-        let proc_name = process.name().to_string_lossy();
-        let exe_path = process.exe();
-        let args: Vec<String> = process
-            .cmd()
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-
-        let Some(edition) = parse_game_client_cmdline(&proc_name, exe_path, &args) else {
-            continue;
-        };
-
-        let preferred = process_references_launcher_paths(exe_path, &args, &known_dirs);
-        let rank = (!preferred, pid_u32);
-        let should_replace = match &best {
-            None => true,
-            Some((best_rank, _)) => rank < *best_rank,
-        };
-        if should_replace {
-            best = Some((
-                rank,
-                RunningGameSnapshot {
-                    pid: pid_u32,
-                    edition,
-                    memory_mb: process.memory() / (1024 * 1024),
-                    cpu_percent: process.cpu_usage(),
-                },
-            ));
-        }
-    }
-
-    best.map(|(_, snapshot)| snapshot)
+pub fn detect_existing_game_process(
+    sys: &mut System,
+    paths: &LauncherPaths,
+) -> Option<RunningGameSnapshot> {
+    detect_all_existing_game_processes(sys, paths)
+        .into_iter()
+        .next()
 }
 
 pub fn terminate_game_process_by_pid(sys: &mut System, pid: u32) -> bool {
@@ -1272,6 +1324,28 @@ mod tests {
             ),
             None
         );
+        for (exe_name, exe_path) in [
+            (
+                "TriHienKun Terraria Launcher.exe",
+                r"C:\TerrariaLauncher\TriHienKun Terraria Launcher.exe",
+            ),
+            (
+                "TriHienKun_Terraria_Launcher.exe",
+                r"C:\TerrariaLauncher\TriHienKun_Terraria_Launcher.exe",
+            ),
+        ] {
+            assert_eq!(
+                parse_game_client_cmdline(
+                    exe_name,
+                    Some(Path::new(exe_path)),
+                    &[
+                        r"C:\TerrariaLauncher\Terraria\Terraria.exe".to_string(),
+                        r"C:\TerrariaLauncher\tModLoader\tModLoader.dll".to_string(),
+                    ],
+                ),
+                None
+            );
+        }
         assert_eq!(
             parse_game_client_cmdline(
                 "powershell.exe",
@@ -1683,5 +1757,88 @@ mod tests {
         assert!(is_elevated_exit_success(3010));
         assert!(!is_elevated_exit_success(1603));
         assert!(!is_elevated_exit_success(1));
+    }
+
+    #[test]
+    fn detect_all_existing_game_processes_sorts_preferred_then_pid_and_ignores_self() {
+        let (_guard, paths) = make_temp_paths("tl_game_detect_multi");
+
+        let known_dirs = build_known_game_dirs(&paths);
+        let preferred_vanilla_exe = paths.terraria_dir.join("Terraria.exe");
+        let preferred_tml_dll = paths.tmodloader_dir.join("tModLoader.dll");
+        let external_vanilla_exe = paths.base_dir.join("OtherInstall").join("Terraria.exe");
+
+        let ext_args = vec![external_vanilla_exe.to_string_lossy().into_owned()];
+        let pref_vanilla_args = vec![preferred_vanilla_exe.to_string_lossy().into_owned()];
+        let pref_tml_args = vec![
+            "dotnet".to_string(),
+            preferred_tml_dll.to_string_lossy().into_owned(),
+        ];
+        let server_args = vec![
+            "dotnet".to_string(),
+            preferred_tml_dll.to_string_lossy().into_owned(),
+            "-server".to_string(),
+        ];
+
+        let self_pid = 4000u32;
+        let candidates = vec![
+            GameProcessCandidate {
+                pid: 100,
+                proc_name: "Terraria.exe".to_string(),
+                exe_path: Some(external_vanilla_exe),
+                args: ext_args,
+                memory_bytes: 512 * 1024 * 1024,
+                cpu_usage: 4.5,
+            },
+            GameProcessCandidate {
+                pid: self_pid,
+                proc_name: "Terraria.exe".to_string(),
+                exe_path: Some(preferred_vanilla_exe.clone()),
+                args: pref_vanilla_args.clone(),
+                memory_bytes: 256 * 1024 * 1024,
+                cpu_usage: 1.0,
+            },
+            GameProcessCandidate {
+                pid: 250,
+                proc_name: "Terraria.exe".to_string(),
+                exe_path: Some(preferred_vanilla_exe),
+                args: pref_vanilla_args,
+                memory_bytes: 700 * 1024 * 1024,
+                cpu_usage: 8.0,
+            },
+            GameProcessCandidate {
+                pid: 180,
+                proc_name: "dotnet.exe".to_string(),
+                exe_path: None,
+                args: pref_tml_args,
+                memory_bytes: 900 * 1024 * 1024,
+                cpu_usage: 12.5,
+            },
+            GameProcessCandidate {
+                pid: 120,
+                proc_name: "dotnet.exe".to_string(),
+                exe_path: None,
+                args: server_args,
+                memory_bytes: 300 * 1024 * 1024,
+                cpu_usage: 2.0,
+            },
+        ];
+
+        let snapshots = collect_detected_game_processes(self_pid, &known_dirs, candidates);
+        let pids_and_editions: Vec<(u32, GameEdition)> =
+            snapshots.iter().map(|s| (s.pid, s.edition)).collect();
+        assert_eq!(
+            pids_and_editions,
+            vec![
+                (180, GameEdition::TModLoader),
+                (250, GameEdition::Vanilla),
+                (100, GameEdition::Vanilla),
+            ]
+        );
+        assert_eq!(snapshots[0].memory_mb, 900);
+
+        let mut sys = System::new().expect("create sysinfo System");
+        let live = detect_all_existing_game_processes(&mut sys, &paths);
+        assert!(live.iter().all(|s| s.pid != std::process::id()));
     }
 }

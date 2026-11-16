@@ -24,11 +24,9 @@ fn main() {
                 println!("cargo:rerun-if-changed={}", icon_path.display());
                 let mut res = winresource::WindowsResource::new();
                 res.set_icon(&icon_path.to_string_lossy());
-                res.set("ProductName", "Terraria Launcher");
-                res.set(
-                    "FileDescription",
-                    "Terraria & tModLoader Server, Mod and Host Launcher",
-                );
+                res.set("ProductName", "TriHienKun Terraria Launcher");
+                res.set("FileDescription", "TriHienKun Terraria Launcher");
+                res.set("OriginalFilename", "TriHienKun Terraria Launcher.exe");
                 if let Err(err) = res.compile() {
                     println!("cargo:warning=Failed to compile Windows resource: {err}");
                 }

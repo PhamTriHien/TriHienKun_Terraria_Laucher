@@ -33,6 +33,14 @@ pub enum SharedModSource {
     ManualOnly,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedModEntry {
     #[serde(rename = "n")]
@@ -43,6 +51,8 @@ pub struct SharedModEntry {
     pub version: String,
     #[serde(rename = "s")]
     pub source: SharedModSource,
+    #[serde(rename = "e", default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -443,4 +453,77 @@ fn base64url_decode(input: &str) -> LauncherResult<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_mod_entry_enabled_flag_omits_true_and_preserves_false() {
+        let mixed_payload = ModPackShareKeyPayload {
+            v: 1,
+            name: "MixedPack".to_string(),
+            mods: vec![
+                SharedModEntry {
+                    internal_name: "EnabledMod".to_string(),
+                    display_name: "Enabled Mod".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: SharedModSource::Workshop {
+                        id: "123456".to_string(),
+                    },
+                    enabled: true,
+                },
+                SharedModEntry {
+                    internal_name: "DisabledMod".to_string(),
+                    display_name: String::new(),
+                    version: "2.0.0".to_string(),
+                    source: SharedModSource::ManualOnly,
+                    enabled: false,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&mixed_payload).unwrap();
+        assert!(!json.contains(r#""e":true"#));
+        assert!(json.contains(r#""e":false"#));
+
+        let legacy_json =
+            r#"{"v":1,"name":"LegacyPack","mods":[{"n":"LegacyMod","s":{"k":"m"}}]}"#;
+        let legacy_parsed: ModPackShareKeyPayload = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy_parsed.mods[0].enabled);
+
+        let mixed_key = encode_modpack_share_key(&mixed_payload).unwrap();
+        let decoded_mixed = decode_modpack_share_key(&mixed_key).unwrap();
+        assert_eq!(decoded_mixed, mixed_payload);
+        assert!(decoded_mixed.mods[0].enabled);
+        assert!(!decoded_mixed.mods[1].enabled);
+
+        let all_disabled = ModPackShareKeyPayload {
+            v: 1,
+            name: "AllDisabled".to_string(),
+            mods: vec![
+                SharedModEntry {
+                    internal_name: "ModOne".to_string(),
+                    display_name: String::new(),
+                    version: String::new(),
+                    source: SharedModSource::ManualOnly,
+                    enabled: false,
+                },
+                SharedModEntry {
+                    internal_name: "ModTwo".to_string(),
+                    display_name: String::new(),
+                    version: "1.2.3".to_string(),
+                    source: SharedModSource::Url {
+                        url: "https://example.com/ModTwo.tmod".to_string(),
+                    },
+                    enabled: false,
+                },
+            ],
+        };
+        let disabled_key = encode_modpack_share_key(&all_disabled).unwrap();
+        let decoded_disabled = decode_modpack_share_key(&disabled_key).unwrap();
+        assert_eq!(decoded_disabled, all_disabled);
+        assert!(decoded_disabled.mods.iter().all(|m| !m.enabled));
+    }
 }

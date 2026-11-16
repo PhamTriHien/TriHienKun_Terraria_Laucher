@@ -4,7 +4,9 @@ use std::time::Duration;
 use tl_core::{LauncherError, LauncherResult};
 
 static RUSTLS_INIT: Once = Once::new();
-pub const LAUNCHER_USER_AGENT: &str = "TerrariaLauncher/1.0";
+pub const LAUNCHER_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TriHienKun-TerrariaLauncher/1.2.0";
+pub const GITHUB_API_VERSION: &str = "2022-11-28";
 
 pub fn ensure_rustls_provider() {
     RUSTLS_INIT.call_once(|| {
@@ -24,7 +26,11 @@ pub fn normalize_proxy_url(raw: &str) -> Option<String> {
     }
 }
 
-pub fn build_http_client(proxy_url: Option<&str>) -> LauncherResult<Client> {
+pub fn build_http_client_with_options(
+    proxy_url: Option<&str>,
+    bypass_system_proxy: bool,
+    follow_redirects: bool,
+) -> LauncherResult<Client> {
     ensure_rustls_provider();
 
     let mut builder = Client::builder()
@@ -32,15 +38,25 @@ pub fn build_http_client(proxy_url: Option<&str>) -> LauncherResult<Client> {
         .connect_timeout(Duration::from_secs(12))
         .timeout(Duration::from_secs(60));
 
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+
     if let Some(proxy_str) = proxy_url.and_then(normalize_proxy_url) {
         let proxy = reqwest::Proxy::all(&proxy_str)
             .map_err(|e| LauncherError::InvalidInput(format!("Proxy không hợp lệ: {e}")))?;
         builder = builder.proxy(proxy);
+    } else if bypass_system_proxy {
+        builder = builder.no_proxy();
     }
 
     builder
         .build()
         .map_err(|e| LauncherError::Network(format!("Không thể khởi tạo HTTP client: {e}")))
+}
+
+pub fn build_http_client(proxy_url: Option<&str>) -> LauncherResult<Client> {
+    build_http_client_with_options(proxy_url, false, true)
 }
 
 #[cfg(test)]
@@ -77,6 +93,17 @@ mod tests {
         assert!(build_http_client(Some("socks5://127.0.0.1:10808")).is_ok());
         assert!(matches!(
             build_http_client(Some("://invalid-proxy")),
+            Err(LauncherError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn build_http_client_with_options_supports_bypass_redirect_and_invalid_proxy() {
+        assert!(build_http_client_with_options(None, false, true).is_ok());
+        assert!(build_http_client_with_options(None, true, true).is_ok());
+        assert!(build_http_client_with_options(None, true, false).is_ok());
+        assert!(matches!(
+            build_http_client_with_options(Some("://invalid-proxy"), true, false),
             Err(LauncherError::InvalidInput(_))
         ));
     }

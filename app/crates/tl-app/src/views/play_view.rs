@@ -13,8 +13,34 @@ fn is_edition_ready(state: &AppState, edition: GameEdition) -> bool {
     match edition {
         GameEdition::Vanilla => state.env.terraria_installed && state.env.xna_installed,
         GameEdition::TModLoader => {
-            state.env.tmodloader_installed && state.env.dotnet8_version.is_some()
+            state.env.terraria_content_available
+                && state.env.tmodloader_installed
+                && state.env.dotnet8_ready
         }
+    }
+}
+
+fn edition_launch_block_hint(
+    state: &AppState,
+    edition: GameEdition,
+    check_client_running: bool,
+    running_hint: &'static str,
+    missing_prereq_hint: &'static str,
+) -> Option<&'static str> {
+    if state.install_busy {
+        Some("Đang cài đặt thành phần...")
+    } else if check_client_running
+        && (state.active_game.is_some() || state.is_edition_client_running(edition))
+    {
+        Some(running_hint)
+    } else if state.has_active_client_ipv6_bridge() {
+        Some("Cầu nối IPv6 của phiên game trước vẫn đang hoạt động. Hãy đóng game đang chạy trước.")
+    } else if edition == GameEdition::TModLoader && state.is_mod_operation_busy() {
+        Some("Đang tải hoặc đồng bộ Mod...")
+    } else if !is_edition_ready(state, edition) {
+        Some(missing_prereq_hint)
+    } else {
+        None
     }
 }
 
@@ -68,8 +94,6 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     );
     ui.add_space(10.0);
 
-    let active_edition_ready = is_edition_ready(state, state.config.active_edition);
-
     rpg_card(ui, assets.as_ref(), p, |ui| {
         rpg_section_heading(
             ui,
@@ -101,9 +125,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     selected,
                 );
                 if resp.clicked() && !selected {
-                    state.config.active_edition = edition;
-                    state.save_config();
-                    state.refresh_worlds_and_backups();
+                    state.set_active_edition(edition);
                 }
             }
         });
@@ -121,7 +143,13 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 };
                 let mut modpack_changed = false;
                 let tml_locked = state.is_tml_mods_locked();
-                ui.add_enabled_ui(!tml_locked, |ui| {
+                let mod_busy = state.is_mod_operation_busy();
+                let modpack_disabled_hint = if mod_busy {
+                    "Đang tải hoặc đồng bộ Mod..."
+                } else {
+                    "Không thể đổi ModPack khi tModLoader hoặc tModLoader Server đang chạy."
+                };
+                ui.add_enabled_ui(!tml_locked && !mod_busy, |ui| {
                     egui::ComboBox::from_id_salt("play_modpack_combo")
                         .selected_text(selected_label)
                         .width(260.0)
@@ -152,23 +180,18 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 })
                 .inner
                 .response
-                .on_disabled_hover_text(
-                    "Không thể đổi ModPack khi tModLoader hoặc tModLoader Server đang chạy.",
-                );
+                .on_disabled_hover_text(modpack_disabled_hint);
                 if modpack_changed {
                     let trimmed = selected_modpack.trim();
-                    let pack_to_activate = (!trimmed.is_empty()
-                        && state
-                            .paths
-                            .tml_modpacks_dir()
-                            .join(trimmed)
-                            .join("Mods")
-                            .is_dir())
-                    .then(|| state.modpacks.iter().find(|pack| pack.name == trimmed).cloned())
-                    .flatten();
-                    if let Some(pack) = pack_to_activate {
+                    if trimmed.is_empty() {
+                        state.deactivate_modpack();
+                    } else if let Some(pack) = state
+                        .modpacks
+                        .iter()
+                        .find(|pack| pack.name.eq_ignore_ascii_case(trimmed))
+                        .cloned()
+                    {
                         state.activate_selected_modpack(&pack);
-                        state.save_config();
                     } else {
                         state.config.active_modpack = selected_modpack;
                         state.save_config();
@@ -187,10 +210,16 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
         render_missing_prereq_bar(state, ui, p);
 
         ui.horizontal_wrapped(|ui| {
-            if let Some(running) = state.current_running_game().cloned() {
+            let active_ed = state.config.active_edition;
+            let running_for_bar = state
+                .active_game
+                .as_ref()
+                .map(|g| g.edition)
+                .or_else(|| state.external_game_for_edition(active_ed).map(|g| g.edition));
+            if let Some(run_ed) = running_for_bar {
                 status_pill(
                     ui,
-                    &format!("Đang chạy {}", running.edition.label()),
+                    &format!("Đang chạy {}", run_ed.label()),
                     p.accent_emerald,
                 );
                 if rpg_button(
@@ -206,24 +235,26 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     state.kill_running_game();
                 }
             } else {
-                let launch_disabled_hint = if state.install_busy {
-                    "Đang cài đặt thành phần..."
-                } else {
-                    "Cài đặt thành phần còn thiếu ở thanh phía trên trước khi chơi"
-                };
+                let launch_block = edition_launch_block_hint(
+                    state,
+                    active_ed,
+                    false,
+                    "",
+                    "Cài đặt thành phần còn thiếu ở thanh phía trên trước khi chơi",
+                );
                 if ui
-                    .add_enabled_ui(!state.install_busy && active_edition_ready, |ui| {
+                    .add_enabled_ui(launch_block.is_none(), |ui| {
                         rpg_button(
                             ui,
                             assets.as_ref(),
                             p,
                             ButtonSkin::Emerald,
                             UiIcon::Play,
-                            &format!("Chơi {}", state.config.active_edition.label()),
+                            &format!("Chơi {}", active_ed.label()),
                         )
                     })
                     .inner
-                    .on_disabled_hover_text(launch_disabled_hint)
+                    .on_disabled_hover_text(launch_block.unwrap_or(""))
                     .clicked()
                 {
                     state.launch_selected_game(Some((String::new(), 0, String::new())));
@@ -304,19 +335,15 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             }
 
             let host_non_empty = !state.config.quick_join_host.trim().is_empty();
-            let can_join_now = !state.install_busy
-                && active_edition_ready
-                && !state.is_game_running()
-                && host_non_empty;
-            let join_disabled_hint = if state.install_busy {
-                "Đang cài đặt thành phần..."
-            } else if state.is_game_running() {
-                "Đóng cửa sổ game đang mở trước khi tham gia server"
-            } else if !active_edition_ready {
-                "Cần cài đặt đầy đủ phiên bản game trước"
-            } else {
-                "Nhập địa chỉ Host / IP trước"
-            };
+            let join_block = edition_launch_block_hint(
+                state,
+                state.config.active_edition,
+                true,
+                "Đóng cửa sổ game đang mở trước khi tham gia server",
+                "Cần cài đặt đầy đủ phiên bản game trước",
+            );
+            let can_join_now = join_block.is_none() && host_non_empty;
+            let join_disabled_hint = join_block.unwrap_or("Nhập địa chỉ Host / IP trước");
             if ui
                 .add_enabled_ui(can_join_now, |ui| {
                     rpg_button(
@@ -346,13 +373,21 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             ) || ext_ready;
             if srv_running {
                 let port = state.active_server_port();
-                let local_disabled_hint = if state.install_busy {
-                    "Đang cài đặt thành phần..."
-                } else {
-                    "Đóng cửa sổ game đang mở trước"
-                };
+                let local_srv_ed = state
+                    .active_server_snapshot()
+                    .map(|s| s.edition)
+                    .or_else(|| state.active_external_server().map(|e| e.edition))
+                    .or_else(|| state.config.active_server().map(|s| s.edition))
+                    .unwrap_or(state.config.active_edition);
+                let local_block = edition_launch_block_hint(
+                    state,
+                    local_srv_ed,
+                    true,
+                    "Đóng cửa sổ game đang mở trước",
+                    "Phiên bản của server này chưa cài đủ thành phần",
+                );
                 if ui
-                    .add_enabled_ui(!state.install_busy && !state.is_game_running(), |ui| {
+                    .add_enabled_ui(local_block.is_none(), |ui| {
                         rpg_compact_button(
                             ui,
                             assets.as_ref(),
@@ -363,7 +398,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         )
                     })
                     .inner
-                    .on_disabled_hover_text(local_disabled_hint)
+                    .on_disabled_hover_text(local_block.unwrap_or(""))
                     .clicked()
                 {
                     state.join_own_hosted_server();
@@ -375,7 +410,13 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                     .desired_width(135.0)
                     .hint_text("Tên lưu (tùy chọn)"),
             );
+            let editing_saved = state.editing_saved_server_idx();
             let can_save_fav = !state.config.quick_join_host.trim().is_empty();
+            let save_label = if editing_saved.is_some() {
+                "Lưu cập nhật"
+            } else {
+                "+ Lưu danh sách"
+            };
             if ui
                 .add_enabled_ui(can_save_fav, |ui| {
                     rpg_compact_button(
@@ -384,7 +425,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         p,
                         ButtonSkin::Cyan,
                         Some(UiIcon::Pack),
-                        "+ Lưu danh sách",
+                        save_label,
                     )
                 })
                 .inner
@@ -393,24 +434,38 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             {
                 state.save_quick_join_server();
             }
+            if editing_saved.is_some()
+                && rpg_compact_button(
+                    ui,
+                    assets.as_ref(),
+                    p,
+                    ButtonSkin::Slate,
+                    None,
+                    "Hủy sửa",
+                )
+                .clicked()
+            {
+                state.cancel_editing_saved_server();
+            }
         });
 
         if !state.config.saved_join_servers.is_empty() {
             ui.add_space(8.0);
+            let editing_saved = state.editing_saved_server_idx();
+            let mod_op_busy = state.is_mod_operation_busy();
             let mut join_idx = None;
             let mut edit_idx = None;
             let mut remove_idx = None;
             for (idx, srv) in state.config.saved_join_servers.iter().enumerate() {
-                let srv_ready = is_edition_ready(state, srv.edition);
-                let can_join_saved =
-                    !state.install_busy && !state.is_game_running() && srv_ready;
-                let saved_disabled_hint = if state.install_busy {
-                    "Đang cài đặt thành phần..."
-                } else if state.is_game_running() {
-                    "Đóng cửa sổ game đang mở trước"
-                } else {
-                    "Phiên bản của server này chưa cài đủ thành phần"
-                };
+                let saved_block = edition_launch_block_hint(
+                    state,
+                    srv.edition,
+                    true,
+                    "Đóng cửa sổ game đang mở trước",
+                    "Phiên bản của server này chưa cài đủ thành phần",
+                );
+                let can_join_saved = saved_block.is_none();
+                let saved_disabled_hint = saved_block.unwrap_or("");
                 rpg_subcard(ui, assets.as_ref(), p, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&srv.name).strong());
@@ -423,6 +478,9 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                         status_pill(ui, srv.edition.label(), p.accent_cyan);
                         if !srv.modpack.trim().is_empty() {
                             status_pill(ui, srv.modpack.trim(), p.accent_amber);
+                        }
+                        if editing_saved == Some(idx) {
+                            status_pill(ui, "Đang sửa", p.accent_emerald);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if rpg_compact_button(
@@ -437,15 +495,20 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                             {
                                 remove_idx = Some(idx);
                             }
-                            if rpg_compact_button(
-                                ui,
-                                assets.as_ref(),
-                                p,
-                                ButtonSkin::Slate,
-                                Some(UiIcon::Key),
-                                "Sửa",
-                            )
-                            .clicked()
+                            if ui
+                                .add_enabled_ui(!mod_op_busy, |ui| {
+                                    rpg_compact_button(
+                                        ui,
+                                        assets.as_ref(),
+                                        p,
+                                        ButtonSkin::Slate,
+                                        Some(UiIcon::Key),
+                                        "Sửa",
+                                    )
+                                })
+                                .inner
+                                .on_disabled_hover_text("Đang tải hoặc đồng bộ Mod...")
+                                .clicked()
                             {
                                 edit_idx = Some(idx);
                             }
@@ -472,8 +535,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
             }
             if let Some(idx) = remove_idx {
-                state.config.saved_join_servers.remove(idx);
-                state.save_config();
+                state.remove_saved_join_server(idx);
             } else if let Some(idx) = edit_idx {
                 state.load_saved_join_server_to_form(idx);
             } else if let Some(idx) = join_idx {
@@ -674,10 +736,10 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePa
         match state.config.active_edition {
             GameEdition::Vanilla => (!state.env.terraria_installed, !state.env.xna_installed, false, false),
             GameEdition::TModLoader => (
-                false,
+                !state.env.terraria_content_available,
                 false,
                 !state.env.tmodloader_installed,
-                state.env.dotnet8_version.is_none(),
+                !state.env.dotnet8_ready,
             ),
         };
 
@@ -814,7 +876,7 @@ fn render_missing_prereq_bar(state: &mut AppState, ui: &mut egui::Ui, p: ThemePa
                 state.install_terraria_url();
             }
             if open_settings {
-                state.active_tab = NavTab::Settings;
+                state.switch_nav_tab(NavTab::Settings);
             }
         }
 

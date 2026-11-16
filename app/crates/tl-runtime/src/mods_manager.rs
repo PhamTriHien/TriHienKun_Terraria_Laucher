@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tl_core::config::write_atomic;
 use tl_core::{
     load_enabled_mods, parse_tmod_file, save_enabled_mods, scan_tmod_directory, LauncherError,
@@ -18,6 +18,7 @@ use tl_core::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Notify;
 use zip::ZipArchive;
 
 #[cfg(windows)]
@@ -83,6 +84,8 @@ pub struct RemoteTmodAsset {
     pub asset_name: String,
     pub size_bytes: u64,
     pub download_url: String,
+    #[serde(default)]
+    pub api_asset_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -163,6 +166,24 @@ pub struct StagedWorkshopMod {
     pub author: Option<String>,
     pub preview_url: Option<String>,
     pub time_updated: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModDownloadProgress {
+    pub item_index: usize,
+    pub item_total: usize,
+    pub label: String,
+    pub workshop_id: Option<String>,
+    pub stage: String,
+    pub current_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
+impl ModDownloadProgress {
+    pub fn fraction(&self) -> Option<f32> {
+        let total = self.total_bytes.filter(|&t| t > 0)?;
+        Some((self.current_bytes as f32 / total as f32).clamp(0.0, 1.0))
+    }
 }
 
 pub fn scan_installed_mods(paths: &LauncherPaths) -> LauncherResult<Vec<InstalledModEntry>> {
@@ -355,6 +376,7 @@ pub fn delete_installed_mod(
     }
     set_mod_enabled(paths, internal_name, false)?;
     remove_workshop_manifest_entry(paths, internal_name)?;
+    let _ = crate::modpack_sync::remove_mod_source(paths, internal_name);
     Ok(())
 }
 
@@ -546,7 +568,8 @@ pub async fn fetch_github_latest_tmod(
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let mut req = client
         .get(&api_url)
-        .header("Accept", "application/vnd.github+json");
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
     if let Some(tok) = github_token.map(str::trim).filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
@@ -585,12 +608,14 @@ pub async fn fetch_github_latest_tmod(
             }
             let url = a["browser_download_url"].as_str()?;
             let size_bytes = a["size"].as_u64().unwrap_or(0);
+            let api_asset_url = a["url"].as_str().map(ToString::to_string);
             Some(RemoteTmodAsset {
                 repo: repo.to_string(),
                 tag_name: tag_name.clone(),
                 asset_name: name.to_string(),
                 size_bytes,
                 download_url: url.to_string(),
+                api_asset_url,
             })
         })
         .collect();
@@ -623,6 +648,58 @@ pub async fn download_and_install_tmod_url_with_source(
     proxy_url: Option<&str>,
     auto_enable: bool,
 ) -> LauncherResult<TmodMetadata> {
+    download_and_install_tmod_url_with_source_and_progress(
+        url,
+        suggested_name,
+        github_repo_hint,
+        None,
+        paths,
+        proxy_url,
+        auto_enable,
+        |_| {},
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn download_and_install_tmod_url_with_source_and_progress(
+    url: &str,
+    suggested_name: Option<&str>,
+    github_repo_hint: Option<&str>,
+    known_size: Option<u64>,
+    paths: &LauncherPaths,
+    proxy_url: Option<&str>,
+    auto_enable: bool,
+    on_progress: impl Fn(ModDownloadProgress) + Send + Sync + 'static,
+) -> LauncherResult<TmodMetadata> {
+    download_and_install_tmod_url_with_auth_and_progress(
+        url,
+        None,
+        None,
+        suggested_name,
+        github_repo_hint,
+        known_size,
+        paths,
+        proxy_url,
+        auto_enable,
+        on_progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn download_and_install_tmod_url_with_auth_and_progress(
+    url: &str,
+    api_asset_url: Option<&str>,
+    github_token: Option<&str>,
+    suggested_name: Option<&str>,
+    github_repo_hint: Option<&str>,
+    known_size: Option<u64>,
+    paths: &LauncherPaths,
+    proxy_url: Option<&str>,
+    auto_enable: bool,
+    on_progress: impl Fn(ModDownloadProgress) + Send + Sync + 'static,
+) -> LauncherResult<TmodMetadata> {
     let trimmed = url.trim();
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err(LauncherError::InvalidInput(
@@ -630,15 +707,81 @@ pub async fn download_and_install_tmod_url_with_source(
         ));
     }
 
+    let label = suggested_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            trimmed
+                .split(['?', '#'])
+                .next()
+                .and_then(|s| s.rsplit('/').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "Tải mod".to_string());
+    let initial_total = known_size.filter(|&s| s > 0);
+    let emit = |stage: &str, current_bytes: u64, total_bytes: Option<u64>| {
+        on_progress(ModDownloadProgress {
+            item_index: 1,
+            item_total: 1,
+            label: label.clone(),
+            workshop_id: None,
+            stage: stage.to_string(),
+            current_bytes,
+            total_bytes,
+        });
+    };
+
+    emit("Đang kết nối máy chủ tải mod...", 0, initial_total);
+
     let mods_dir = paths.tml_mods_dir();
     fs::create_dir_all(&mods_dir)?;
 
     let client = build_http_client(proxy_url)?;
-    let resp = client
-        .get(trimmed)
-        .send()
-        .await
-        .map_err(|e| LauncherError::Network(format!("Lỗi tải mod: {e}")))?;
+    let token = github_token.map(str::trim).filter(|s| !s.is_empty());
+    let target_api = api_asset_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            trimmed
+                .starts_with("https://api.github.com/")
+                .then_some(trimmed)
+        });
+
+    let resp = if let (Some(tok), Some(api_url)) = (token, target_api) {
+        let api_resp = client
+            .get(api_url)
+            .bearer_auth(tok)
+            .header("Accept", "application/octet-stream")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| LauncherError::Network(format!("Lỗi tải mod: {e}")))?;
+        if matches!(api_resp.status().as_u16(), 401 | 403)
+            && !trimmed.eq_ignore_ascii_case(api_url)
+            && !trimmed.starts_with("https://api.github.com/")
+        {
+            client
+                .get(trimmed)
+                .send()
+                .await
+                .map_err(|e| LauncherError::Network(format!("Lỗi tải mod: {e}")))?
+        } else {
+            api_resp
+        }
+    } else {
+        let mut req = client.get(trimmed);
+        if trimmed.starts_with("https://api.github.com/") {
+            req = req
+                .header("Accept", "application/octet-stream")
+                .header("X-GitHub-Api-Version", "2022-11-28");
+        }
+        req.send()
+            .await
+            .map_err(|e| LauncherError::Network(format!("Lỗi tải mod: {e}")))?
+    };
 
     if !resp.status().is_success() {
         return Err(LauncherError::Network(format!(
@@ -646,6 +789,9 @@ pub async fn download_and_install_tmod_url_with_source(
             resp.status()
         )));
     }
+
+    let total_bytes = resp.content_length().filter(|&n| n > 0).or(initial_total);
+    emit("Đang tải tệp .tmod...", 0, total_bytes);
 
     let raw_name = suggested_name
         .map(ToString::to_string)
@@ -667,16 +813,29 @@ pub async fn download_and_install_tmod_url_with_source(
 
     let part_path = mods_dir.join(format!(".tl_dl_{}.tmod.part", uuid::Uuid::new_v4()));
     let mut part_guard = TempFileCleanupGuard(Some(part_path.clone()));
+    let mut downloaded: u64 = 0;
     {
         let mut file = File::create(&part_path)?;
         let mut stream = resp.bytes_stream();
+        let mut last_emit = Instant::now();
         while let Some(chunk_res) = stream.next().await {
             let chunk = chunk_res
                 .map_err(|e| LauncherError::Network(format!("Lỗi đọc stream tải mod: {e}")))?;
             file.write_all(&chunk)?;
+            downloaded += chunk.len() as u64;
+            if last_emit.elapsed() >= Duration::from_millis(80) {
+                last_emit = Instant::now();
+                emit("Đang tải tệp .tmod...", downloaded, total_bytes);
+            }
         }
         file.flush()?;
     }
+
+    emit(
+        "Đang kiểm tra & cài đặt .tmod...",
+        downloaded,
+        total_bytes.or_else(|| (downloaded > 0).then_some(downloaded)),
+    );
 
     let parsed = match parse_tmod_file(&part_path) {
         Ok(m) => m,
@@ -739,6 +898,7 @@ pub async fn download_and_install_tmod_url_with_source(
             &meta.sha1_hex,
             source,
         )?;
+        let _ = remove_workshop_manifest_entry(paths, &meta.internal_name);
     }
 
     Ok(meta)
@@ -1407,9 +1567,28 @@ pub fn load_workshop_manifest(paths: &LauncherPaths) -> Vec<WorkshopManifestReco
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+pub(crate) fn file_mtime_unix(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .filter(|&t| t > 0)
+}
+
 pub fn record_workshop_install(
     paths: &LauncherPaths,
     details: Option<&WorkshopItemDetails>,
+    workshop_id: &str,
+    installed_mods: &[TmodMetadata],
+) -> LauncherResult<()> {
+    record_workshop_install_with_timestamp(paths, details, None, workshop_id, installed_mods)
+}
+
+pub fn record_workshop_install_with_timestamp(
+    paths: &LauncherPaths,
+    details: Option<&WorkshopItemDetails>,
+    fallback_time_updated: Option<u64>,
     workshop_id: &str,
     installed_mods: &[TmodMetadata],
 ) -> LauncherResult<()> {
@@ -1419,36 +1598,64 @@ pub fn record_workshop_install(
     let installed_at = Utc::now().timestamp().max(0) as u64;
 
     for meta in installed_mods {
-        let existing_idx = records.iter().position(|r| {
-            r.published_file_id == workshop_id && r.internal_name == meta.internal_name
-        });
-        let previous = existing_idx.map(|idx| &records[idx]);
+        let name_trimmed = meta.internal_name.trim();
+        let previous = records
+            .iter()
+            .find(|r| {
+                r.published_file_id == workshop_id
+                    && if name_trimmed.is_empty() {
+                        r.internal_name.trim().is_empty()
+                    } else {
+                        r.internal_name.eq_ignore_ascii_case(name_trimmed)
+                    }
+            })
+            .cloned();
 
         let workshop_title = details
             .map(|d| d.title.trim())
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
-            .or_else(|| previous.map(|p| p.workshop_title.clone()).filter(|s| !s.is_empty()))
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|p| p.workshop_title.clone())
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_else(|| meta.display_name.clone());
 
         let author = details
             .map(|d| d.author.trim())
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
-            .or_else(|| previous.map(|p| p.author.clone()).filter(|s| !s.is_empty()))
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|p| p.author.clone())
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_else(|| meta.author.clone());
 
         let preview_url = details
             .map(|d| d.preview_url.trim())
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
-            .or_else(|| previous.map(|p| p.preview_url.clone()))
+            .or_else(|| previous.as_ref().map(|p| p.preview_url.clone()))
             .unwrap_or_default();
 
         let time_updated = details
             .map(|d| d.time_updated)
             .filter(|&t| t > 0)
+            .or_else(|| fallback_time_updated.filter(|&t| t > 0))
+            .or_else(|| file_mtime_unix(&meta.file_path))
             .unwrap_or_else(|| Utc::now().timestamp().max(1) as u64);
+
+        if name_trimmed.is_empty() {
+            records.retain(|r| {
+                !(r.published_file_id == workshop_id && r.internal_name.trim().is_empty())
+            });
+        } else {
+            records.retain(|r| !r.internal_name.eq_ignore_ascii_case(name_trimmed));
+        }
 
         let record = WorkshopManifestRecord {
             published_file_id: workshop_id.to_string(),
@@ -1463,11 +1670,7 @@ pub fn record_workshop_install(
             installed_at,
         };
 
-        if let Some(idx) = existing_idx {
-            records[idx] = record;
-        } else {
-            records.push(record);
-        }
+        records.push(record);
     }
 
     let json = serde_json::to_string_pretty(&records)?;
@@ -1498,8 +1701,7 @@ pub fn scan_staged_workshop_mods(paths: &LauncherPaths) -> LauncherResult<Vec<St
     }
 
     let mods_dir = paths.tml_mods_dir();
-    let mut installed_internal_names = HashSet::new();
-    let mut installed_file_names = HashSet::new();
+    let mut installed_by_name: HashMap<String, Vec<TmodMetadata>> = HashMap::new();
     if let Ok(entries) = fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
@@ -1508,21 +1710,22 @@ pub fn scan_staged_workshop_mods(paths: &LauncherPaths) -> LauncherResult<Vec<St
                 .map(|s| s.eq_ignore_ascii_case("tmod"))
                 .unwrap_or(false)
             {
-                if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
-                    installed_file_names.insert(fname.to_string());
-                }
                 if let Ok(meta) = parse_tmod_file(&p) {
                     if !meta.internal_name.is_empty() {
-                        installed_internal_names.insert(meta.internal_name);
+                        installed_by_name
+                            .entry(meta.internal_name.to_ascii_lowercase())
+                            .or_default()
+                            .push(meta);
                     }
                 }
             }
         }
     }
 
-    let enabled_set: HashSet<String> = load_enabled_mods(&paths.tml_enabled_json())
+    let enabled_lower: HashSet<String> = load_enabled_mods(&paths.tml_enabled_json())
         .unwrap_or_default()
         .into_iter()
+        .map(|s| s.to_ascii_lowercase())
         .collect();
     let manifest = load_workshop_manifest(paths);
 
@@ -1550,14 +1753,28 @@ pub fn scan_staged_workshop_mods(paths: &LauncherPaths) -> LauncherResult<Vec<St
                 continue;
             };
 
-            let installed = (!meta.internal_name.is_empty()
-                && installed_internal_names.contains(&meta.internal_name))
-                || installed_file_names.contains(&meta.file_name);
-            let enabled = installed && enabled_set.contains(&meta.internal_name);
+            let name_lower = meta.internal_name.to_ascii_lowercase();
+            let has_manifest_match = !meta.internal_name.is_empty()
+                && manifest.iter().any(|r| {
+                    r.internal_name.eq_ignore_ascii_case(&meta.internal_name)
+                        && r.published_file_id == workshop_id
+                });
+            let installed = !meta.internal_name.is_empty()
+                && installed_by_name.get(&name_lower).is_some_and(|matches| {
+                    matches.iter().any(|m| {
+                        (!meta.sha1_hex.is_empty() && m.sha1_hex == meta.sha1_hex)
+                            || has_manifest_match
+                    })
+                });
+            let enabled =
+                installed && !name_lower.is_empty() && enabled_lower.contains(&name_lower);
 
             let manifest_rec = manifest
                 .iter()
-                .find(|r| r.published_file_id == workshop_id && r.internal_name == meta.internal_name)
+                .find(|r| {
+                    r.published_file_id == workshop_id
+                        && r.internal_name.eq_ignore_ascii_case(&meta.internal_name)
+                })
                 .or_else(|| manifest.iter().find(|r| r.published_file_id == workshop_id));
 
             let workshop_title = manifest_rec
@@ -1869,6 +2086,416 @@ pub async fn install_steamcmd_via_winget(proxy_url: Option<&str>) -> LauncherRes
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteamWorkshopPhase {
+    Connecting,
+    Reconfiguring,
+    Preallocating,
+    Downloading,
+    Committing,
+    Finished,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SteamContentTelemetryTracker {
+    phase: SteamWorkshopPhase,
+    stage: String,
+    current_bytes: u64,
+    total_bytes: Option<u64>,
+    write_baseline: Option<u64>,
+    rate_mbps: Option<f64>,
+    last_emitted: Option<(Option<String>, String, u64, Option<u64>)>,
+}
+
+impl SteamContentTelemetryTracker {
+    pub(crate) fn new(initial_stage: impl Into<String>, known_size: Option<u64>) -> Self {
+        Self {
+            phase: SteamWorkshopPhase::Connecting,
+            stage: initial_stage.into(),
+            current_bytes: 0,
+            total_bytes: known_size.filter(|&s| s > 0),
+            write_baseline: None,
+            rate_mbps: None,
+            last_emitted: None,
+        }
+    }
+
+    pub(crate) fn phase(&self) -> SteamWorkshopPhase {
+        self.phase
+    }
+
+    pub(crate) fn current_bytes(&self) -> u64 {
+        self.current_bytes
+    }
+
+    pub(crate) fn total_bytes(&self) -> Option<u64> {
+        self.total_bytes
+    }
+
+    pub(crate) fn mark_emitted(
+        &mut self,
+        key: Option<&str>,
+        stage: &str,
+        current_bytes: u64,
+        total_bytes: Option<u64>,
+    ) {
+        self.last_emitted = Some((
+            key.map(ToString::to_string),
+            stage.to_string(),
+            current_bytes,
+            total_bytes,
+        ));
+    }
+
+    fn reset_state(&mut self, phase: SteamWorkshopPhase, stage: &str) {
+        self.phase = phase;
+        self.stage = stage.to_string();
+        self.current_bytes = 0;
+        self.total_bytes = None;
+        self.write_baseline = None;
+        self.rate_mbps = None;
+    }
+
+    pub(crate) fn reset_for_new_item(&mut self, stage: &str) {
+        self.reset_state(SteamWorkshopPhase::Reconfiguring, stage);
+    }
+
+    pub(crate) fn reset_idle(&mut self, stage: &str) {
+        self.reset_state(SteamWorkshopPhase::Connecting, stage);
+    }
+
+    fn format_downloading_stage(rate_mbps: Option<f64>) -> String {
+        match rate_mbps {
+            Some(mbps) if mbps.is_finite() && mbps >= 0.8 => {
+                format!("Đang tải dữ liệu Workshop ({:.1} MB/s)...", mbps / 8.0)
+            }
+            _ => "Đang tải dữ liệu Workshop...".to_string(),
+        }
+    }
+
+    pub(crate) fn apply_stdout_line(&mut self, line: &str) -> bool {
+        if !matches!(
+            self.phase,
+            SteamWorkshopPhase::Connecting | SteamWorkshopPhase::Reconfiguring
+        ) {
+            return false;
+        }
+        let Some(next_stage) = parse_steamcmd_stdout_stage(line) else {
+            return false;
+        };
+        if self.stage == next_stage {
+            return false;
+        }
+        self.stage = next_stage.to_string();
+        true
+    }
+
+    pub(crate) fn apply_telemetry(&mut self, lines: &[String], current_written: Option<u64>) {
+        for line in lines {
+            if let Some((dl_total, stage_total)) = parse_steam_content_log_update_started(line) {
+                let best_total = if stage_total > 0 { stage_total } else { dl_total };
+                if best_total > 0 {
+                    self.total_bytes = Some(best_total);
+                }
+                self.current_bytes = 0;
+                self.write_baseline = None;
+                self.rate_mbps = None;
+                if matches!(
+                    self.phase,
+                    SteamWorkshopPhase::Finished | SteamWorkshopPhase::Committing
+                ) {
+                    self.phase = SteamWorkshopPhase::Reconfiguring;
+                }
+            }
+
+            if let Some(new_phase) = parse_steam_content_log_phase(line) {
+                match new_phase {
+                    SteamWorkshopPhase::Connecting => {}
+                    SteamWorkshopPhase::Reconfiguring => {
+                        if matches!(
+                            self.phase,
+                            SteamWorkshopPhase::Connecting
+                                | SteamWorkshopPhase::Reconfiguring
+                                | SteamWorkshopPhase::Finished
+                        ) {
+                            if self.phase == SteamWorkshopPhase::Finished {
+                                self.write_baseline = None;
+                                self.rate_mbps = None;
+                            }
+                            self.phase = SteamWorkshopPhase::Reconfiguring;
+                            self.stage = "Đang chuẩn bị tải Workshop...".to_string();
+                        }
+                    }
+                    SteamWorkshopPhase::Preallocating => {
+                        if !matches!(
+                            self.phase,
+                            SteamWorkshopPhase::Downloading | SteamWorkshopPhase::Committing
+                        ) {
+                            self.phase = SteamWorkshopPhase::Preallocating;
+                            self.stage = "Đang cấp phát dung lượng Workshop...".to_string();
+                        }
+                    }
+                    SteamWorkshopPhase::Downloading => {
+                        if self.phase != SteamWorkshopPhase::Committing {
+                            if self.phase != SteamWorkshopPhase::Downloading {
+                                self.write_baseline = current_written;
+                            }
+                            self.phase = SteamWorkshopPhase::Downloading;
+                            self.stage = Self::format_downloading_stage(self.rate_mbps);
+                        }
+                    }
+                    SteamWorkshopPhase::Committing => {
+                        self.phase = SteamWorkshopPhase::Committing;
+                        self.stage = "Đang hoàn tất gói Workshop...".to_string();
+                    }
+                    SteamWorkshopPhase::Finished => {
+                        self.phase = SteamWorkshopPhase::Finished;
+                        if let Some(total) = self.total_bytes.filter(|&t| t > 0) {
+                            self.current_bytes = total;
+                        }
+                        self.stage = "Đang kiểm tra tệp .tmod...".to_string();
+                    }
+                }
+            }
+
+            if let Some(rate) = parse_steam_content_log_rate_mbps(line) {
+                self.rate_mbps = Some(rate);
+                if self.phase == SteamWorkshopPhase::Downloading {
+                    self.stage = Self::format_downloading_stage(self.rate_mbps);
+                }
+            }
+        }
+
+        if self.phase == SteamWorkshopPhase::Downloading {
+            if let Some(written) = current_written {
+                let baseline = *self.write_baseline.get_or_insert(written);
+                let delta = written.saturating_sub(baseline);
+                self.current_bytes = match self.total_bytes {
+                    Some(t) if t > 1 => delta.min(t - 1),
+                    Some(t) => delta.min(t),
+                    None => delta,
+                };
+            }
+            self.stage = Self::format_downloading_stage(self.rate_mbps);
+        }
+    }
+
+    pub(crate) fn take_changed_for_key(
+        &mut self,
+        key: Option<&str>,
+    ) -> Option<(String, u64, Option<u64>)> {
+        let changed = match &self.last_emitted {
+            Some((prev_key, prev_stage, prev_cur, prev_tot)) => {
+                prev_key.as_deref() != key
+                    || prev_stage != &self.stage
+                    || *prev_cur != self.current_bytes
+                    || *prev_tot != self.total_bytes
+            }
+            None => true,
+        };
+        if !changed {
+            return None;
+        }
+        self.last_emitted = Some((
+            key.map(ToString::to_string),
+            self.stage.clone(),
+            self.current_bytes,
+            self.total_bytes,
+        ));
+        Some((self.stage.clone(), self.current_bytes, self.total_bytes))
+    }
+}
+
+fn extract_slash_pair_total(text: &str, key: &str) -> Option<u64> {
+    let idx = find_ascii_ci(text, key)?;
+    let after = text[idx + key.len()..].trim_start();
+    let done_len = after.bytes().take_while(u8::is_ascii_digit).count();
+    if done_len == 0 {
+        return None;
+    }
+    let total_str = after[done_len..].strip_prefix('/')?;
+    let total_len = total_str.bytes().take_while(u8::is_ascii_digit).count();
+    if total_len == 0 {
+        return None;
+    }
+    total_str[..total_len].parse::<u64>().ok()
+}
+
+pub(crate) fn parse_steam_content_log_update_started(line: &str) -> Option<(u64, u64)> {
+    let marker = "appid 1281930 update started";
+    let idx = find_ascii_ci(line, marker)?;
+    let tail = &line[idx + marker.len()..];
+    let dl_total = extract_slash_pair_total(tail, "download ")?;
+    let stage_total = extract_slash_pair_total(tail, "stage ")?;
+    Some((dl_total, stage_total))
+}
+
+pub(crate) fn parse_steam_content_log_phase(line: &str) -> Option<SteamWorkshopPhase> {
+    let marker = "appid 1281930 workshop update changed :";
+    let idx = find_ascii_ci(line, marker)?;
+    let portion = line[idx + marker.len()..].trim();
+    if portion.eq_ignore_ascii_case("none") {
+        return Some(SteamWorkshopPhase::Finished);
+    }
+    let lower = portion.to_ascii_lowercase();
+    if lower.contains("committing") {
+        Some(SteamWorkshopPhase::Committing)
+    } else if lower.contains("downloading") || lower.contains("staging") {
+        Some(SteamWorkshopPhase::Downloading)
+    } else if lower.contains("preallocating") {
+        Some(SteamWorkshopPhase::Preallocating)
+    } else if lower.contains("reconfiguring") || lower.contains("running update") {
+        Some(SteamWorkshopPhase::Reconfiguring)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn parse_steam_content_log_rate_mbps(line: &str) -> Option<f64> {
+    let marker = "increasing target number of download connections";
+    let idx = find_ascii_ci(line, marker)?;
+    let tail = &line[idx + marker.len()..];
+    let now_idx = find_ascii_ci(tail, "now ")?;
+    let after_now = tail[now_idx + 4..].trim_start();
+    let token = after_now
+        .split(|c: char| c == ')' || c.is_whitespace())
+        .next()?;
+    let val: f64 = token.parse().ok()?;
+    (val.is_finite() && val > 0.0).then_some(val)
+}
+
+pub(crate) fn parse_steamcmd_stdout_stage(line: &str) -> Option<&'static str> {
+    if find_ascii_ci(line, "connecting anonymously").is_some() {
+        Some("Đang đăng nhập SteamCMD...")
+    } else if find_ascii_ci(line, "waiting for client config").is_some()
+        || find_ascii_ci(line, "waiting for user info").is_some()
+    {
+        Some("Đang xác thực phiên Steam...")
+    } else if find_ascii_ci(line, "downloading item ").is_some() {
+        Some("Đang kiểm tra gói Workshop...")
+    } else if find_ascii_ci(line, "downloaded item ").is_some()
+        || find_ascii_ci(line, "success. downloaded item").is_some()
+    {
+        Some("Đang cài đặt tệp .tmod...")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn extract_steamcmd_downloading_item_id(line: &str) -> Option<String> {
+    let needle = "downloading item ";
+    let idx = find_ascii_ci(line, needle)?;
+    let after = &line[idx + needle.len()..];
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+pub(crate) fn steamcmd_content_log_path(steamcmd_exe: &Path) -> Option<PathBuf> {
+    steamcmd_exe
+        .parent()
+        .map(|dir| dir.join("logs").join("content_log.txt"))
+}
+
+pub(crate) fn current_file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+pub(crate) fn read_process_written_bytes(sys: &mut sysinfo::System, pid: u32) -> Option<u64> {
+    let spid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[spid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_disk_usage(),
+    );
+    sys.process(spid)
+        .map(|p| p.disk_usage().total_written_bytes)
+}
+
+pub(crate) fn read_new_complete_lines(path: &Path, offset: &mut u64) -> Vec<String> {
+    const MAX_READ_BYTES: usize = 256 * 1024;
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < *offset {
+        *offset = 0;
+    }
+    if file.seek(SeekFrom::Start(*offset)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    while buf.len() < MAX_READ_BYTES {
+        let limit = (MAX_READ_BYTES - buf.len()).min(chunk.len());
+        match file.read(&mut chunk[..limit]) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    if buf.is_empty() {
+        return Vec::new();
+    }
+    let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
+        return Vec::new();
+    };
+    *offset += (last_nl + 1) as u64;
+    String::from_utf8_lossy(&buf[..=last_nl])
+        .lines()
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_workshop_pipe_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    stream: R,
+    wid: String,
+    label: String,
+    item_index: usize,
+    item_total: usize,
+    marker: Arc<AtomicBool>,
+    log_cb: Arc<impl Fn(String) + Send + Sync + 'static>,
+    progress_cb: Arc<impl Fn(ModDownloadProgress) + Send + Sync + 'static>,
+    tracker: Arc<Mutex<SteamContentTelemetryTracker>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line_indicates_workshop_downloaded(&line, &wid) {
+                marker.store(true, Ordering::Release);
+            }
+            let changed = tracker
+                .lock()
+                .ok()
+                .and_then(|mut trk| {
+                    trk.apply_stdout_line(&line)
+                        .then(|| trk.take_changed_for_key(Some(&wid)))
+                        .flatten()
+                });
+            if let Some((stage, current_bytes, total_bytes)) = changed {
+                progress_cb(ModDownloadProgress {
+                    item_index,
+                    item_total,
+                    label: label.clone(),
+                    workshop_id: Some(wid.clone()),
+                    stage,
+                    current_bytes,
+                    total_bytes,
+                });
+            }
+            log_cb(line);
+        }
+    })
+}
+
 pub async fn download_workshop_mod_via_steamcmd(
     steamcmd_exe: &Path,
     paths: &LauncherPaths,
@@ -1876,6 +2503,36 @@ pub async fn download_workshop_mod_via_steamcmd(
     proxy_url: Option<&str>,
     auto_enable: bool,
     on_log: impl Fn(String) + Send + Sync + 'static,
+) -> LauncherResult<Vec<TmodMetadata>> {
+    download_workshop_mod_via_steamcmd_with_progress(
+        steamcmd_exe,
+        paths,
+        workshop_id,
+        proxy_url,
+        auto_enable,
+        None,
+        "",
+        1,
+        1,
+        on_log,
+        |_| {},
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn download_workshop_mod_via_steamcmd_with_progress(
+    steamcmd_exe: &Path,
+    paths: &LauncherPaths,
+    workshop_id: &str,
+    proxy_url: Option<&str>,
+    auto_enable: bool,
+    known_size: Option<u64>,
+    display_label: &str,
+    item_index: usize,
+    item_total: usize,
+    on_log: impl Fn(String) + Send + Sync + 'static,
+    on_progress: impl Fn(ModDownloadProgress) + Send + Sync + 'static,
 ) -> LauncherResult<Vec<TmodMetadata>> {
     if !steamcmd_exe.is_file() {
         return Err(LauncherError::NotFound(format!(
@@ -1890,6 +2547,30 @@ pub async fn download_workshop_mod_via_steamcmd(
 
     let workshop_item_dir = workshop_staging_content_dir(paths).join(workshop_id);
     let before_snapshot = snapshot_tmod_files(&workshop_item_dir);
+
+    let label = if display_label.trim().is_empty() {
+        format!("Workshop ID {workshop_id}")
+    } else {
+        display_label.trim().to_string()
+    };
+    let content_log_path = steamcmd_content_log_path(steamcmd_exe);
+    let initial_log_offset = content_log_path
+        .as_deref()
+        .map(current_file_len)
+        .unwrap_or(0);
+    let initial_total = known_size.filter(|&s| s > 0);
+    let initial_stage = "Đang khởi động SteamCMD...".to_string();
+
+    let progress_cb = Arc::new(on_progress);
+    progress_cb(ModDownloadProgress {
+        item_index,
+        item_total,
+        label: label.clone(),
+        workshop_id: Some(workshop_id.to_string()),
+        stage: initial_stage.clone(),
+        current_bytes: 0,
+        total_bytes: initial_total,
+    });
 
     let mut cmd = Command::new(steamcmd_exe);
     cmd.arg("+force_install_dir")
@@ -1907,52 +2588,109 @@ pub async fn download_workshop_mod_via_steamcmd(
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| LauncherError::Process(format!("Không thể chạy steamcmd.exe: {e}")))?;
 
+    let child_pid = child.id();
     let log_cb = Arc::new(on_log);
     let saw_downloaded_marker = Arc::new(AtomicBool::new(false));
+    let tracker = Arc::new(Mutex::new({
+        let mut trk = SteamContentTelemetryTracker::new(&initial_stage, initial_total);
+        trk.mark_emitted(Some(workshop_id), &initial_stage, 0, initial_total);
+        trk
+    }));
+
     let stdout_task = child.stdout.take().map(|stdout| {
-        let cb = Arc::clone(&log_cb);
-        let marker = Arc::clone(&saw_downloaded_marker);
-        let wid = workshop_id.to_string();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
-                    if line_indicates_workshop_downloaded(&line, &wid) {
-                        marker.store(true, Ordering::Release);
-                    }
-                    cb(line);
-                }
-            }
-        })
+        spawn_workshop_pipe_reader(
+            stdout,
+            workshop_id.to_string(),
+            label.clone(),
+            item_index,
+            item_total,
+            Arc::clone(&saw_downloaded_marker),
+            Arc::clone(&log_cb),
+            Arc::clone(&progress_cb),
+            Arc::clone(&tracker),
+        )
     });
     let stderr_task = child.stderr.take().map(|stderr| {
-        let cb = Arc::clone(&log_cb);
-        let marker = Arc::clone(&saw_downloaded_marker);
+        spawn_workshop_pipe_reader(
+            stderr,
+            workshop_id.to_string(),
+            label.clone(),
+            item_index,
+            item_total,
+            Arc::clone(&saw_downloaded_marker),
+            Arc::clone(&log_cb),
+            Arc::clone(&progress_cb),
+            Arc::clone(&tracker),
+        )
+    });
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_notify = Arc::new(Notify::new());
+    let monitor_task = {
+        let stop_flag = Arc::clone(&stop_flag);
+        let stop_notify = Arc::clone(&stop_notify);
+        let tracker = Arc::clone(&tracker);
+        let progress_cb = Arc::clone(&progress_cb);
+        let label = label.clone();
         let wid = workshop_id.to_string();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
-                    if line_indicates_workshop_downloaded(&line, &wid) {
-                        marker.store(true, Ordering::Release);
+            let mut sys = sysinfo::System::new().ok();
+            let mut log_offset = initial_log_offset;
+            let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if stop_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let lines = content_log_path
+                            .as_deref()
+                            .map(|p| read_new_complete_lines(p, &mut log_offset))
+                            .unwrap_or_default();
+                        let written = sys
+                            .as_mut()
+                            .zip(child_pid)
+                            .and_then(|(s, pid)| read_process_written_bytes(s, pid));
+                        let changed = tracker.lock().ok().and_then(|mut trk| {
+                            trk.apply_telemetry(&lines, written);
+                            trk.take_changed_for_key(Some(&wid))
+                        });
+                        if let Some((stage, current_bytes, total_bytes)) = changed {
+                            progress_cb(ModDownloadProgress {
+                                item_index,
+                                item_total,
+                                label: label.clone(),
+                                workshop_id: Some(wid.clone()),
+                                stage,
+                                current_bytes,
+                                total_bytes,
+                            });
+                        }
                     }
-                    cb(line);
+                    _ = stop_notify.notified() => {
+                        break;
+                    }
                 }
             }
         })
-    });
+    };
 
     let status = child
         .wait()
         .await
         .map_err(|e| LauncherError::Process(format!("Lỗi chờ steamcmd.exe: {e}")))?;
 
+    stop_flag.store(true, Ordering::Release);
+    stop_notify.notify_waiters();
+    let _ = monitor_task.await;
     if let Some(h) = stdout_task {
         let _ = h.await;
     }
@@ -1981,6 +2719,28 @@ pub async fn download_workshop_mod_via_steamcmd(
             workshop_item_dir.display()
         )));
     }
+
+    let (tracked_bytes, tracked_total) = tracker
+        .lock()
+        .map(|trk| (trk.current_bytes(), trk.total_bytes()))
+        .unwrap_or((0, initial_total));
+    let total_bytes = tracked_total.or_else(|| {
+        let sum: u64 = best_tmods
+            .iter()
+            .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
+            .sum();
+        (sum > 0).then_some(sum)
+    });
+    let final_bytes = total_bytes.unwrap_or(tracked_bytes);
+    progress_cb(ModDownloadProgress {
+        item_index,
+        item_total,
+        label,
+        workshop_id: Some(workshop_id.to_string()),
+        stage: "Đang cài đặt tệp .tmod...".to_string(),
+        current_bytes: final_bytes,
+        total_bytes,
+    });
 
     import_local_mod_files(&best_tmods, paths, auto_enable)
 }
@@ -3106,6 +3866,24 @@ mod tests {
         version: &str,
         mod_references: &[&str],
     ) {
+        write_minimal_tmod_full(
+            path,
+            internal_name,
+            display_name,
+            version,
+            mod_references,
+            [0x11u8; 20],
+        );
+    }
+
+    fn write_minimal_tmod_full(
+        path: &Path,
+        internal_name: &str,
+        display_name: &str,
+        version: &str,
+        mod_references: &[&str],
+        sha1_bytes: [u8; 20],
+    ) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -3126,7 +3904,7 @@ mod tests {
         let mut tmod = Vec::new();
         tmod.extend_from_slice(b"TMOD");
         write_dotnet_str(&mut tmod, "2026.9.3.1");
-        tmod.extend_from_slice(&[0x11u8; 20]);
+        tmod.extend_from_slice(&sha1_bytes);
         tmod.extend_from_slice(&[0u8; 256]);
         tmod.extend_from_slice(&128i32.to_le_bytes());
         write_dotnet_str(&mut tmod, internal_name);
@@ -3927,11 +4705,13 @@ mod tests {
         let meta = parse_tmod_file(&mod_path).unwrap();
         set_mod_enabled(&paths, "alphamod", true).unwrap();
         record_workshop_install(&paths, None, "777777777", &[meta]).unwrap();
+        assert_eq!(crate::modpack_sync::load_mod_sources(&paths).len(), 1);
 
         delete_installed_mod(&paths, &mod_path, "ALPHAMOD").unwrap();
         assert!(!mod_path.exists());
         assert!(load_enabled_mods(&paths.tml_enabled_json()).unwrap().is_empty());
         assert!(load_workshop_manifest(&paths).is_empty());
+        assert!(crate::modpack_sync::load_mod_sources(&paths).is_empty());
 
         let _ = fs::remove_dir_all(&paths.base_dir);
     }
@@ -4076,6 +4856,567 @@ mod tests {
 
         write_minimal_tmod(&stale_file, "StaleMod", "Stale Mod", "1.0.1-longer");
         assert!(has_any_tmod_changed_or_new(&item_dir, &before));
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn mod_download_progress_fraction_handles_bounds_and_zero() {
+        let mut p = ModDownloadProgress {
+            item_index: 1,
+            item_total: 1,
+            label: "Calamity".to_string(),
+            workshop_id: None,
+            stage: "Đang tải...".to_string(),
+            current_bytes: 50,
+            total_bytes: None,
+        };
+        assert_eq!(p.fraction(), None);
+
+        p.total_bytes = Some(0);
+        assert_eq!(p.fraction(), None);
+
+        p.total_bytes = Some(100);
+        assert_eq!(p.fraction(), Some(0.5));
+
+        p.current_bytes = 200;
+        assert_eq!(p.fraction(), Some(1.0));
+    }
+
+    #[test]
+    fn steam_content_log_and_stdout_parsers_match_real_lines() {
+        let started = "[2026-11-15 23:47:12] AppID 1281930 update started : download 0/328600272, store 0/0, reuse 0/0, delta 0/0, stage 0/404391973";
+        assert_eq!(
+            parse_steam_content_log_update_started(started),
+            Some((328_600_272, 404_391_973))
+        );
+        assert_eq!(parse_steam_content_log_update_started("unrelated line"), None);
+
+        assert_eq!(
+            parse_steam_content_log_phase(
+                "[2026-11-15 23:47:10] AppID 1281930 Workshop update changed : Running Update,Reconfiguring,"
+            ),
+            Some(SteamWorkshopPhase::Reconfiguring)
+        );
+        assert_eq!(
+            parse_steam_content_log_phase(
+                "[2026-11-15 23:47:12] AppID 1281930 Workshop update changed : Running Update,Preallocating,"
+            ),
+            Some(SteamWorkshopPhase::Preallocating)
+        );
+        assert_eq!(
+            parse_steam_content_log_phase(
+                "[2026-11-15 23:47:12] AppID 1281930 Workshop update changed : Running Update,Downloading,Staging,"
+            ),
+            Some(SteamWorkshopPhase::Downloading)
+        );
+        assert_eq!(
+            parse_steam_content_log_phase(
+                "[2026-11-15 23:47:47] AppID 1281930 Workshop update changed : Running Update,Committing,"
+            ),
+            Some(SteamWorkshopPhase::Committing)
+        );
+        assert_eq!(
+            parse_steam_content_log_phase(
+                "[2026-11-15 23:47:47] AppID 1281930 Workshop update changed : None"
+            ),
+            Some(SteamWorkshopPhase::Finished)
+        );
+        assert_eq!(
+            parse_steam_content_log_phase("AppID 1281930 Workshop update changed : UnknownPhase"),
+            None
+        );
+
+        let rate_line = "[2026-11-15 23:47:42] Increasing target number of download connections to 10 (rate was 67.763, now 81.647)";
+        let parsed_rate = parse_steam_content_log_rate_mbps(rate_line).unwrap();
+        assert!((parsed_rate - 81.647).abs() < 1e-6);
+        assert_eq!(
+            parse_steam_content_log_rate_mbps(
+                "Increasing target number of download connections to 1 (rate was 0.000, now 0.000)"
+            ),
+            None
+        );
+
+        assert_eq!(
+            extract_steamcmd_downloading_item_id("Downloading item 2824688072..."),
+            Some("2824688072".to_string())
+        );
+        assert_eq!(extract_steamcmd_downloading_item_id("Downloading item "), None);
+
+        assert_eq!(
+            parse_steamcmd_stdout_stage("Connecting anonymously to Steam Public...OK"),
+            Some("Đang đăng nhập SteamCMD...")
+        );
+        assert_eq!(
+            parse_steamcmd_stdout_stage("Waiting for client config...OK"),
+            Some("Đang xác thực phiên Steam...")
+        );
+        assert_eq!(
+            parse_steamcmd_stdout_stage("Waiting for user info...OK"),
+            Some("Đang xác thực phiên Steam...")
+        );
+        assert_eq!(
+            parse_steamcmd_stdout_stage("Downloading item 2824688072..."),
+            Some("Đang kiểm tra gói Workshop...")
+        );
+        assert_eq!(
+            parse_steamcmd_stdout_stage("Success. Downloaded item 2824688072 to C:\\staging"),
+            Some("Đang cài đặt tệp .tmod...")
+        );
+        assert_eq!(parse_steamcmd_stdout_stage("Random SteamCMD line"), None);
+    }
+
+    #[test]
+    fn read_new_complete_lines_handles_partial_completed_and_truncated_files() {
+        let paths = make_temp_paths("read_log_lines");
+        paths.ensure_dirs().unwrap();
+        let log_path = paths.base_dir.join("content_log.txt");
+
+        fs::write(&log_path, b"first line\nsecond line\npartial").unwrap();
+        let mut offset = 0u64;
+        let first = read_new_complete_lines(&log_path, &mut offset);
+        assert_eq!(first, vec!["first line".to_string(), "second line".to_string()]);
+        assert_eq!(offset, b"first line\nsecond line\n".len() as u64);
+
+        let still_partial = read_new_complete_lines(&log_path, &mut offset);
+        assert!(still_partial.is_empty());
+
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+            f.write_all(b" completed\n").unwrap();
+        }
+        let completed = read_new_complete_lines(&log_path, &mut offset);
+        assert_eq!(completed, vec!["partial completed".to_string()]);
+        assert_eq!(offset, fs::metadata(&log_path).unwrap().len());
+
+        fs::write(&log_path, b"reset\n").unwrap();
+        let after_truncate = read_new_complete_lines(&log_path, &mut offset);
+        assert_eq!(after_truncate, vec!["reset".to_string()]);
+        assert_eq!(offset, b"reset\n".len() as u64);
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn steam_telemetry_tracker_caps_bytes_formats_speed_and_resets_cleanly() {
+        let mut trk = SteamContentTelemetryTracker::new("Đang khởi động SteamCMD...", None);
+        assert!(trk.apply_stdout_line("Connecting anonymously to Steam Public...OK"));
+        assert!(trk.take_changed_for_key(Some("123")).is_some());
+
+        trk.apply_telemetry(
+            &[
+                "AppID 1281930 Workshop update changed : Running Update,Preallocating,".to_string(),
+                "AppID 1281930 Workshop update changed : Running Update,".to_string(),
+                "AppID 1281930 update started : download 0/800, store 0/0, reuse 0/0, delta 0/0, stage 0/1000".to_string(),
+                "AppID 1281930 Workshop update changed : Running Update,Downloading,Staging,".to_string(),
+            ],
+            Some(5_000),
+        );
+        let (_, cur, tot) = trk.take_changed_for_key(Some("123")).unwrap();
+        assert_eq!(cur, 0);
+        assert_eq!(tot, Some(1000));
+
+        trk.apply_telemetry(
+            &[
+                "Increasing target number of download connections to 10 (rate was 0.000, now 81.647)"
+                    .to_string(),
+            ],
+            Some(6_500),
+        );
+        let (stage, cur, tot) = trk.take_changed_for_key(Some("123")).unwrap();
+        assert!(stage.contains("10.2 MB/s"), "unexpected stage: {stage}");
+        assert_eq!(cur, 999);
+        assert_eq!(tot, Some(1000));
+
+        assert!(!trk.apply_stdout_line("Connecting anonymously to Steam Public...OK"));
+
+        trk.apply_telemetry(
+            &["AppID 1281930 Workshop update changed : None".to_string()],
+            Some(6_500),
+        );
+        let (_, cur, tot) = trk.take_changed_for_key(Some("123")).unwrap();
+        assert_eq!(cur, 1000);
+        assert_eq!(tot, Some(1000));
+
+        trk.reset_for_new_item("Đang kiểm tra gói Workshop...");
+        assert_eq!(trk.current_bytes(), 0);
+        assert_eq!(trk.total_bytes(), None);
+    }
+
+    #[test]
+    fn download_and_install_tmod_url_with_source_and_progress_reports_bytes() {
+        let paths = make_temp_paths("dl_url_progress");
+        paths.ensure_dirs().unwrap();
+
+        let src_tmod = paths.base_dir.join("src").join("ProgressMod.tmod");
+        write_minimal_tmod(&src_tmod, "ProgressMod", "Progress Mod", "1.0.0");
+        let body = fs::read(&src_tmod).unwrap();
+        let expected_len = body.len() as u64;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+
+        let events = Arc::new(Mutex::new(Vec::<ModDownloadProgress>::new()));
+        let events_clone = Arc::clone(&events);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let meta = download_and_install_tmod_url_with_source_and_progress(
+                &format!("http://{addr}/ProgressMod.tmod"),
+                Some("Progress Mod"),
+                None,
+                None,
+                &paths,
+                None,
+                false,
+                move |prog| events_clone.lock().unwrap().push(prog),
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta.internal_name, "ProgressMod");
+        });
+        server.join().unwrap();
+
+        let captured = events.lock().unwrap();
+        assert!(captured.len() >= 3);
+        assert_eq!(captured[0].label, "Progress Mod");
+        assert_eq!(captured[0].current_bytes, 0);
+        let last = captured.last().unwrap();
+        assert_eq!(last.current_bytes, expected_len);
+        assert_eq!(last.total_bytes, Some(expected_len));
+        assert_eq!(last.fraction(), Some(1.0));
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn scan_staged_workshop_mods_rejects_unrelated_local_custom_tmod() {
+        let paths = make_temp_paths("staged_sha1_guard");
+        paths.ensure_dirs().unwrap();
+
+        let staged_custom = paths
+            .steamcmd_dir
+            .join("staging/steamapps/workshop/content/1281930/111111111/2026.9/CustomMod.tmod");
+        write_minimal_tmod_full(&staged_custom, "CustomMod", "Custom Mod", "1.0.0", &[], [0xAA; 20]);
+
+        let local_custom = paths.tml_mods_dir().join("CustomMod.tmod");
+        write_minimal_tmod_full(&local_custom, "custommod", "Custom Mod Local", "1.0.0", &[], [0xBB; 20]);
+        set_mod_enabled(&paths, "custommod", true).unwrap();
+
+        let staged_mismatch = scan_staged_workshop_mods(&paths).unwrap();
+        assert_eq!(staged_mismatch.len(), 1);
+        assert!(!staged_mismatch[0].installed);
+        assert!(!staged_mismatch[0].enabled);
+
+        let staged_same_sha = paths
+            .steamcmd_dir
+            .join("staging/steamapps/workshop/content/1281930/222222222/2026.9/MatchShaMod.tmod");
+        write_minimal_tmod_full(&staged_same_sha, "MatchShaMod", "Match SHA", "1.0.0", &[], [0xCC; 20]);
+        let installed_same_sha = paths.tml_mods_dir().join("MatchShaMod.tmod");
+        write_minimal_tmod_full(&installed_same_sha, "matchshamod", "Match SHA", "1.0.0", &[], [0xCC; 20]);
+        set_mod_enabled(&paths, "MATCHSHAMOD", true).unwrap();
+
+        let staged_manifest_diff_sha = paths
+            .steamcmd_dir
+            .join("staging/steamapps/workshop/content/1281930/333333333/2026.9/UpdatedWsMod.tmod");
+        write_minimal_tmod_full(
+            &staged_manifest_diff_sha,
+            "UpdatedWsMod",
+            "Updated WS",
+            "1.0.0",
+            &[],
+            [0xDD; 20],
+        );
+        let installed_updated_ws = paths.tml_mods_dir().join("UpdatedWsMod.tmod");
+        write_minimal_tmod_full(
+            &installed_updated_ws,
+            "updatedwsmod",
+            "Updated WS",
+            "1.1.0",
+            &[],
+            [0xEE; 20],
+        );
+        let ws_meta = parse_tmod_file(&installed_updated_ws).unwrap();
+        record_workshop_install(&paths, None, "333333333", &[ws_meta]).unwrap();
+
+        let staged = scan_staged_workshop_mods(&paths).unwrap();
+        let by_id: HashMap<String, StagedWorkshopMod> = staged
+            .into_iter()
+            .map(|s| (s.workshop_id.clone(), s))
+            .collect();
+        assert!(!by_id["111111111"].installed);
+        assert!(by_id["222222222"].installed);
+        assert!(by_id["222222222"].enabled);
+        assert!(by_id["333333333"].installed);
+        assert!(!by_id["333333333"].enabled);
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn url_mod_install_clears_stale_workshop_manifest_entry() {
+        let paths = make_temp_paths("url_clears_ws_manifest");
+        paths.ensure_dirs().unwrap();
+
+        let old_ws = paths.tml_mods_dir().join("OverwrittenMod.tmod");
+        write_minimal_tmod(&old_ws, "OverwrittenMod", "Overwritten Mod", "1.0.0");
+        let old_meta = parse_tmod_file(&old_ws).unwrap();
+        record_workshop_install(&paths, None, "444444444", &[old_meta]).unwrap();
+        assert_eq!(load_workshop_manifest(&paths).len(), 1);
+
+        let src_new = paths.base_dir.join("src").join("OverwrittenMod.tmod");
+        write_minimal_tmod_full(&src_new, "overwrittenmod", "Overwritten Mod", "2.0.0", &[], [0x55; 20]);
+        let body = fs::read(&src_new).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            download_and_install_tmod_url_with_source_and_progress(
+                &format!("http://{addr}/OverwrittenMod.tmod"),
+                Some("OverwrittenMod"),
+                Some("Owner/OverwrittenMod"),
+                None,
+                &paths,
+                None,
+                false,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        });
+        server.join().unwrap();
+
+        assert!(load_workshop_manifest(&paths).is_empty());
+        let sources = crate::modpack_sync::load_mod_sources(&paths);
+        assert_eq!(sources.len(), 1);
+        assert!(matches!(
+            sources[0].source,
+            tl_core::SharedModSource::Github { .. }
+        ));
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn download_and_install_tmod_url_with_auth_and_progress_verifies_headers_and_401_fallback() {
+        let paths = make_temp_paths("dl_gh_auth");
+        paths.ensure_dirs().unwrap();
+
+        let src_tmod = paths.base_dir.join("src").join("AuthMod.tmod");
+        write_minimal_tmod(&src_tmod, "AuthMod", "Auth Mod", "1.2.3");
+        let body = fs::read(&src_tmod).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen_requests = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+            let seen_clone = Arc::clone(&seen_requests);
+            let body_srv = body.clone();
+
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let seen = Arc::clone(&seen_clone);
+                    let body = body_srv.clone();
+                    tokio::spawn(async move {
+                        let mut raw = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let Ok(n) = socket.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            raw.extend_from_slice(&buf[..n]);
+                            if raw.windows(4).any(|w| w == b"\r\n\r\n") || raw.len() >= 16384 {
+                                break;
+                            }
+                        }
+                        let req_text = String::from_utf8_lossy(&raw).into_owned();
+                        let target = req_text
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        seen.lock().unwrap().push((target.clone(), req_text.clone()));
+
+                        let lower = req_text.to_ascii_lowercase();
+                        let (status, resp_body): (&str, Vec<u8>) =
+                            if target == "/repos/owner/repo/releases/assets/42" {
+                                let has_bearer = lower.contains("authorization: bearer good-token");
+                                let has_accept = lower.contains("accept: application/octet-stream");
+                                let has_ver = lower.contains("x-github-api-version: 2022-11-28");
+                                if has_bearer && has_accept && has_ver {
+                                    ("200 OK", body)
+                                } else {
+                                    ("401 Unauthorized", b"unauthorized".to_vec())
+                                }
+                            } else if target == "/owner/repo/releases/download/v1.0/AuthMod.tmod" {
+                                if lower.contains("authorization:") {
+                                    ("400 Bad Request", b"unexpected auth".to_vec())
+                                } else {
+                                    ("200 OK", body)
+                                }
+                            } else {
+                                ("404 Not Found", b"not found".to_vec())
+                            };
+
+                        let hdr = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            resp_body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(&resp_body).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+
+            let browser_url = format!(
+                "http://{addr}/owner/repo/releases/download/v1.0/AuthMod.tmod"
+            );
+            let api_url = format!("http://{addr}/repos/owner/repo/releases/assets/42");
+
+            let meta_ok = download_and_install_tmod_url_with_auth_and_progress(
+                &browser_url,
+                Some(&api_url),
+                Some("good-token"),
+                Some("AuthMod.tmod"),
+                Some("owner/repo"),
+                None,
+                &paths,
+                None,
+                false,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta_ok.internal_name, "AuthMod");
+            {
+                let reqs = seen_requests.lock().unwrap();
+                assert_eq!(reqs.len(), 1);
+                assert_eq!(reqs[0].0, "/repos/owner/repo/releases/assets/42");
+                let lower = reqs[0].1.to_ascii_lowercase();
+                assert!(lower.contains("authorization: bearer good-token"));
+                assert!(lower.contains("accept: application/octet-stream"));
+                assert!(lower.contains("x-github-api-version: 2022-11-28"));
+            }
+
+            let meta_fallback = download_and_install_tmod_url_with_auth_and_progress(
+                &browser_url,
+                Some(&api_url),
+                Some("expired-token"),
+                Some("AuthMod.tmod"),
+                Some("owner/repo"),
+                None,
+                &paths,
+                None,
+                false,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta_fallback.internal_name, "AuthMod");
+            {
+                let reqs = seen_requests.lock().unwrap();
+                assert_eq!(reqs.len(), 3);
+                assert_eq!(reqs[1].0, "/repos/owner/repo/releases/assets/42");
+                assert_eq!(reqs[2].0, "/owner/repo/releases/download/v1.0/AuthMod.tmod");
+                assert!(!reqs[2].1.to_ascii_lowercase().contains("authorization:"));
+            }
+
+            let sources = crate::modpack_sync::load_mod_sources(&paths);
+            assert_eq!(sources.len(), 1);
+            assert_eq!(
+                sources[0].source,
+                tl_core::SharedModSource::Github {
+                    repo: "owner/repo".to_string(),
+                    url: browser_url,
+                }
+            );
+
+            server.abort();
+        });
+
+        let _ = fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn record_workshop_install_evicts_cross_id_case_insensitively_and_uses_fallback_ts() {
+        let paths = make_temp_paths("ws_cross_id_evict");
+        paths.ensure_dirs().unwrap();
+
+        let mod_path_v1 = paths.tml_mods_dir().join("ReuploadMod.tmod");
+        write_minimal_tmod(&mod_path_v1, "ReuploadMod", "Reupload Mod", "1.0.0");
+        let meta_v1 = parse_tmod_file(&mod_path_v1).unwrap();
+
+        let old_details = WorkshopItemDetails {
+            published_file_id: "111111111".to_string(),
+            title: "Reupload Mod Old".to_string(),
+            time_updated: 1_700_000_000,
+            ..Default::default()
+        };
+        record_workshop_install(&paths, Some(&old_details), "111111111", &[meta_v1]).unwrap();
+
+        let mut meta_v2 = parse_tmod_file(&mod_path_v1).unwrap();
+        meta_v2.internal_name = "reuploadmod".to_string();
+        meta_v2.version = "1.1.0".to_string();
+        record_workshop_install_with_timestamp(
+            &paths,
+            None,
+            Some(1_750_000_000),
+            "222222222",
+            &[meta_v2],
+        )
+        .unwrap();
+
+        let loaded = load_workshop_manifest(&paths);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].published_file_id, "222222222");
+        assert_eq!(loaded[0].internal_name, "reuploadmod");
+        assert_eq!(loaded[0].mod_version, "1.1.0");
+        assert_eq!(loaded[0].time_updated, 1_750_000_000);
 
         let _ = fs::remove_dir_all(&paths.base_dir);
     }
