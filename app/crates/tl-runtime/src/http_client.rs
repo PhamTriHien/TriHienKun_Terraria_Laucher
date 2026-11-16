@@ -4,8 +4,10 @@ use std::time::Duration;
 use tl_core::{LauncherError, LauncherResult};
 
 static RUSTLS_INIT: Once = Once::new();
-pub const LAUNCHER_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TriHienKun-TerrariaLauncher/1.2.0";
+pub const LAUNCHER_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TriHienKun-TerrariaLauncher/",
+    env!("CARGO_PKG_VERSION")
+);
 pub const GITHUB_API_VERSION: &str = "2022-11-28";
 
 pub fn ensure_rustls_provider() {
