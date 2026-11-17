@@ -4,6 +4,7 @@ pub mod http_client;
 pub mod modpack_sync;
 pub mod mods_manager;
 pub mod network_host;
+pub mod p2p_tunnel;
 pub mod server_manager;
 
 pub use game_installer::{
@@ -48,21 +49,29 @@ pub use mods_manager::{
     CURATED_GITHUB_MODS,
 };
 pub use network_host::{
-    check_firewall_rule_exists, close_upnp_port, detect_primary_global_ipv6, ensure_firewall_rule,
-    is_global_unicast_ipv6, is_local_probe_host, open_upnp_port, probe_local_endpoint_listening,
-    probe_local_tcp_listening, probe_network_snapshot, probe_network_snapshot_ports,
-    probe_tcp_endpoint, remove_firewall_rule, resolve_ipv6_bridge_target, split_endpoint_host_port,
-    start_direct_port_host, start_ipv4_to_ipv6_client_bridge, DirectHostActiveInfo,
-    DirectHostConfig, DirectHostStatus, DirectPortHostHandle, LocalClientBridgeHandle,
-    LocalInterfaceInfo, NetworkSnapshot, UpnpLeaseInfo, UpnpPortStatus,
+    check_firewall_rule_exists, clean_launcher_error_msg, close_ipv6_pinhole, close_upnp_port,
+    detect_primary_global_ipv6, ensure_firewall_rule, is_global_unicast_ipv6, is_local_probe_host,
+    open_upnp_port, probe_external_ipv4_reachability, probe_external_ipv6_reachability,
+    probe_local_endpoint_listening, probe_local_tcp_listening, probe_network_snapshot,
+    probe_network_snapshot_ports, probe_tcp_endpoint, remove_firewall_rule,
+    resolve_ipv6_bridge_target, split_endpoint_host_port, start_direct_port_host,
+    start_ipv4_to_ipv6_client_bridge, DirectHostActiveInfo, DirectHostConfig, DirectHostStatus,
+    DirectPortHostHandle, ExternalReachability, Ipv6PinholeLeaseInfo, Ipv6PinholeStatus,
+    LocalClientBridgeHandle, LocalInterfaceInfo, NetworkSnapshot, UpnpLeaseInfo, UpnpPortStatus,
+};
+pub use p2p_tunnel::{
+    encode_p2p_ticket, format_p2p_ticket_short, is_p2p_ticket, parse_p2p_ticket,
+    probe_p2p_ticket_reachability, start_p2p_client_bridge, BridgedPeerTarget, P2pHostStatus,
+    P2P_BAN_PREFIX, P2P_TICKET_PREFIX,
 };
 pub use server_manager::{
     acquire_single_instance_guard, detect_existing_server_processes,
-    egui_repaint::RepaintHandle, extract_ban_ip_key, focus_existing_launcher_window,
-    is_loopback_ban_target, load_banlist, normalize_ip_addr, read_server_log_summary,
-    read_server_log_summary_if_fresh, rebase_portable_data_path, resolve_effective_join_metadata,
-    resolve_server_banlist_path, resolve_tmodloader_server_modpack_config, save_banlist,
-    start_server, summarize_server_log_lines, terminate_process_by_pid, BanEntry, ConnectedPlayer,
+    egui_repaint::RepaintHandle, extract_ban_ip_key, extract_ban_p2p_key,
+    focus_existing_launcher_window, is_loopback_ban_target, load_banlist, normalize_ip_addr,
+    read_server_log_summary, read_server_log_summary_if_fresh, rebase_portable_data_path,
+    resolve_effective_join_metadata, resolve_server_banlist_path,
+    resolve_tmodloader_server_modpack_config, save_banlist, start_server,
+    summarize_server_log_lines, terminate_process_by_pid, BanEntry, ConnectedPlayer,
     ConsoleLogLine, DetectedExternalServer, ExternalServerLogSummary, ServerLifecycleState,
     ServerRuntimeSnapshot, ServerSupervisor, SingleInstanceGuard,
 };

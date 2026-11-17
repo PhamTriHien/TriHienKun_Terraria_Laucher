@@ -2,7 +2,7 @@ use crate::assets::LauncherAssets;
 use crate::theme::{format_bytes, palette, ThemePalette};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,34 +20,38 @@ use tl_core::{
 };
 use tl_runtime::{
     browse_workshop_mods, build_modpack_share_preview, build_modpack_share_preview_with_states,
-    check_firewall_rule_exists, delete_installed_mod, detect_all_existing_game_processes,
+    check_firewall_rule_exists, clean_launcher_error_msg, delete_installed_mod,
+    detect_all_existing_game_processes,
     detect_existing_server_processes, download_and_install_tmod_url_with_auth_and_progress,
     download_and_install_xna, download_workshop_mod_via_steamcmd_with_progress,
-    enable_mod_and_installed_deps, ensure_firewall_rule, extract_ban_ip_key,
+    enable_mod_and_installed_deps, ensure_firewall_rule, extract_ban_ip_key, extract_ban_p2p_key,
     fetch_github_latest_tmod, fetch_terraria_branch_manifest, fetch_tmodloader_releases,
-    fetch_workshop_details, fetch_workshop_image_bytes, import_local_mod_files,
-    inspect_share_key_against_local, install_dotnet8_portable, install_steamcmd_with_progress,
-    install_terraria_from_local_zip, install_terraria_from_source, install_tmodloader_release,
-    install_xna_framework_elevated, is_local_probe_host, is_loopback_ban_target, launch_game,
-    load_banlist, load_installed_terraria_receipt, load_mod_sources, load_workshop_manifest,
-    normalize_ip_addr, parse_mod_source_input, parse_workshop_id, probe_local_endpoint_listening,
-    probe_local_tcp_listening, probe_network_snapshot_ports, probe_tcp_endpoint,
+    fetch_workshop_details, fetch_workshop_image_bytes, format_p2p_ticket_short,
+    import_local_mod_files, inspect_share_key_against_local, install_dotnet8_portable,
+    install_steamcmd_with_progress, install_terraria_from_local_zip, install_terraria_from_source,
+    install_tmodloader_release, install_xna_framework_elevated, is_local_probe_host,
+    is_loopback_ban_target, is_p2p_ticket, launch_game, load_banlist,
+    load_installed_terraria_receipt, load_mod_sources, load_workshop_manifest, normalize_ip_addr,
+    parse_mod_source_input, parse_p2p_ticket, parse_workshop_id, probe_external_ipv4_reachability,
+    probe_external_ipv6_reachability, probe_local_endpoint_listening, probe_local_tcp_listening,
+    probe_network_snapshot_ports, probe_p2p_ticket_reachability, probe_tcp_endpoint,
     read_server_log_summary_if_fresh, rebase_portable_data_path, record_workshop_install,
     record_workshop_install_with_timestamp, remove_firewall_rule, remove_mod_source,
     remove_workshop_manifest_entry, resolve_effective_join_metadata, resolve_ipv6_bridge_target,
     resolve_server_banlist_path, save_banlist, scan_installed_mods, scan_staged_workshop_mods,
     search_workshop_candidates_for_mod, set_mod_enabled, split_endpoint_host_port,
-    start_direct_port_host, start_ipv4_to_ipv6_client_bridge, start_server,
-    sync_modpack_from_share_key, terminate_game_process_by_pid, terminate_process_by_pid,
-    upsert_mod_source, ActiveGameProcess, BanEntry, DetectedExternalServer, DirectHostConfig,
-    DirectHostStatus, DirectPortHostHandle, ExternalServerLogSummary, GameLaunchOptions,
-    InstallProgress, InstallTarget, InstalledModEntry, InstalledTerrariaReceipt,
+    start_direct_port_host, start_ipv4_to_ipv6_client_bridge, start_p2p_client_bridge,
+    start_server, sync_modpack_from_share_key, terminate_game_process_by_pid,
+    terminate_process_by_pid, upsert_mod_source, ActiveGameProcess, BanEntry, BridgedPeerTarget,
+    DetectedExternalServer, DirectHostConfig, DirectHostStatus, DirectPortHostHandle,
+    ExternalReachability, ExternalServerLogSummary, GameLaunchOptions, InstallProgress,
+    InstallTarget, InstalledModEntry, InstalledTerrariaReceipt, Ipv6PinholeStatus,
     LocalClientBridgeHandle, ModDownloadProgress, ModPackImportPreview, ModPackSharePreview,
-    ModPackSyncProgress, ModPackSyncReport, ModSourceRecord, NetworkSnapshot, ProgressCallback,
-    RemoteTmodAsset, RepaintHandle, RunningGameSnapshot, RuntimeTuning, ServerLifecycleState,
-    ServerRuntimeSnapshot, ServerSupervisor, StagedWorkshopMod, TerrariaBranchManifest,
-    TmodLoaderReleaseInfo, UpnpPortStatus, WorkshopItemDetails, WorkshopManifestRecord,
-    WorkshopQueryResult, WorkshopSort,
+    ModPackSyncProgress, ModPackSyncReport, ModSourceRecord, NetworkSnapshot, P2pHostStatus,
+    ProgressCallback, RemoteTmodAsset, RepaintHandle, RunningGameSnapshot, RuntimeTuning,
+    ServerLifecycleState, ServerRuntimeSnapshot, ServerSupervisor, StagedWorkshopMod,
+    TerrariaBranchManifest, TmodLoaderReleaseInfo, UpnpPortStatus, WorkshopItemDetails,
+    WorkshopManifestRecord, WorkshopQueryResult, WorkshopSort, P2P_BAN_PREFIX,
 };
 use tokio::sync::mpsc;
 
@@ -140,7 +144,11 @@ pub enum AppEvent {
     },
     PortProbed {
         endpoint: String,
-        result: Result<u128, String>,
+        result: Result<String, String>,
+    },
+    P2pJoinBridgeReady {
+        opts: Box<GameLaunchOptions>,
+        result: Result<LocalClientBridgeHandle, String>,
     },
     GithubFetched {
         repo: String,
@@ -206,6 +214,7 @@ pub struct AppState {
     pub running_game: Option<RunningGameSnapshot>,
     pub external_games: Vec<RunningGameSnapshot>,
     client_ipv6_bridge: Option<LocalClientBridgeHandle>,
+    pub p2p_join_connecting: bool,
     pub confirm_close_bridge_modal: bool,
     close_bridge_allow_exit: bool,
     last_applied_terraria_dir: String,
@@ -229,6 +238,7 @@ pub struct AppState {
     pub direct_host_port_input: String,
     pub direct_bind_ips: HashMap<String, Option<std::net::Ipv4Addr>>,
     pub direct_try_upnp: bool,
+    pub direct_enable_p2p: bool,
     pub firewall_busy: bool,
     pub network_snapshot: NetworkSnapshot,
     pub network_loading: bool,
@@ -348,6 +358,7 @@ impl AppState {
             .filter(|&p| p > 0)
             .unwrap_or(default_port);
         let default_try_upnp = config.active_server().map(|s| s.config.upnp).unwrap_or(true);
+        let default_enable_p2p = config.active_server().map(|s| s.p2p_tunnel).unwrap_or(true);
         let quick_join_port_init = if config.quick_join_port > 0 {
             config.quick_join_port
         } else {
@@ -377,6 +388,7 @@ impl AppState {
             running_game: None,
             external_games: Vec::new(),
             client_ipv6_bridge: None,
+            p2p_join_connecting: false,
             confirm_close_bridge_modal: false,
             close_bridge_allow_exit: false,
             last_applied_terraria_dir,
@@ -398,6 +410,7 @@ impl AppState {
             direct_host_port_input: default_effective_port.to_string(),
             direct_bind_ips: HashMap::new(),
             direct_try_upnp: default_try_upnp,
+            direct_enable_p2p: default_enable_p2p,
             firewall_busy: false,
             network_snapshot: NetworkSnapshot::default(),
             network_loading: false,
@@ -655,6 +668,12 @@ impl AppState {
                     if matches!(
                         info.upnp_status,
                         UpnpPortStatus::Mapped { .. } | UpnpPortStatus::Mapping
+                    ) || matches!(
+                        info.ipv6_pinhole_status,
+                        Ipv6PinholeStatus::Opened { .. } | Ipv6PinholeStatus::Opening
+                    ) || matches!(
+                        info.p2p_status,
+                        P2pHostStatus::Running { .. } | P2pHostStatus::Starting
                     ) {
                         has_upnp = true;
                     }
@@ -673,6 +692,7 @@ impl AppState {
             || self.is_steamcmd_busy()
             || self.is_game_running()
             || self.any_server_active()
+            || self.p2p_join_connecting
             || has_hosted_server
             || has_direct_host
             || has_upnp
@@ -769,6 +789,11 @@ impl AppState {
                 .config
                 .active_server()
                 .map(|s| s.config.upnp)
+                .unwrap_or(true);
+            self.direct_enable_p2p = self
+                .config
+                .active_server()
+                .map(|s| s.p2p_tunnel)
                 .unwrap_or(true);
         }
         let cfg_port = self
@@ -995,8 +1020,13 @@ impl AppState {
                     self.network_loading = false;
                     let auto_host_and_port = self
                         .active_online_endpoint()
-                        .as_deref()
-                        .and_then(split_endpoint_host_port)
+                        .and_then(|ep| {
+                            if is_p2p_ticket(&ep) {
+                                Some((ep, self.active_server_port()))
+                            } else {
+                                split_endpoint_host_port(&ep)
+                            }
+                        })
                         .or_else(|| {
                             snap.public_ip
                                 .map(|pub_ip| (pub_ip.to_string(), self.active_server_port()))
@@ -1037,21 +1067,28 @@ impl AppState {
                 AppEvent::PortProbed { endpoint, result } => {
                     self.port_probe_busy = false;
                     self.port_probe_status = Some(match result {
-                        Ok(ms) => {
-                            let is_local = split_endpoint_host_port(&endpoint).is_some_and(
-                                |(h, _)| is_local_probe_host(&h, &self.network_snapshot),
-                            );
-                            let msg = if is_local {
-                                format!(
-                                    "{endpoint} đang mở nội bộ ({ms} ms — thử tự kiểm tra trên máy này, chưa xác nhận qua Modem)"
-                                )
-                            } else {
-                                format!("{endpoint} phản hồi ({ms} ms)")
-                            };
-                            (true, msg)
-                        }
+                        Ok(msg) => (true, msg),
                         Err(e) => (false, format!("{endpoint}: {e}")),
                     });
+                }
+                AppEvent::P2pJoinBridgeReady { mut opts, result } => {
+                    self.p2p_join_connecting = false;
+                    match result {
+                        Ok(bridge) => {
+                            if self.active_game.is_some()
+                                || self.external_game_for_edition(opts.edition).is_some()
+                            {
+                                bridge.stop();
+                                continue;
+                            }
+                            self.stop_client_ipv6_bridge();
+                            opts.join_host = "127.0.0.1".to_string();
+                            opts.join_port = bridge.local_port();
+                            self.client_ipv6_bridge = Some(bridge);
+                            self.finish_launching_game(*opts);
+                        }
+                        Err(e) => self.notify_err(e),
+                    }
                 }
                 AppEvent::GithubFetched { repo, result } => {
                     self.github_busy = false;
@@ -1343,8 +1380,8 @@ impl AppState {
                 AppEvent::DelayedBanRefresh { profile_id } => {
                     if self.config.active_server_id == profile_id {
                         self.refresh_banlist();
-                    } else if let Some(handle) = self.direct_host_handles.get(&profile_id) {
-                        handle.set_banned_ips(self.collect_banlist_ips_for_profile_id(&profile_id));
+                    } else {
+                        self.sync_banlist_to_direct_host_for_profile(&profile_id);
                     }
                 }
             }
@@ -1520,11 +1557,7 @@ impl AppState {
                     self.refresh_banlist();
                     for profile_id in dirty_ban_profiles {
                         if profile_id != self.config.active_server_id {
-                            if let Some(handle) = self.direct_host_handles.get(&profile_id) {
-                                handle.set_banned_ips(
-                                    self.collect_banlist_ips_for_profile_id(&profile_id),
-                                );
-                            }
+                            self.sync_banlist_to_direct_host_for_profile(&profile_id);
                         }
                     }
                 }
@@ -1566,17 +1599,23 @@ impl AppState {
                     } else {
                         local_port
                     };
-                    let try_upnp = if target_id == self.config.active_server_id {
-                        self.direct_try_upnp
+                    let (try_upnp, enable_p2p) = if target_id == self.config.active_server_id {
+                        (self.direct_try_upnp, self.direct_enable_p2p)
                     } else {
                         self.config
                             .servers
                             .iter()
                             .find(|p| p.id == target_id)
-                            .map(|p| p.config.upnp)
-                            .unwrap_or(true)
+                            .map(|p| (p.config.upnp, p.p2p_tunnel))
+                            .unwrap_or((true, true))
                     };
-                    self.start_direct_host_for_profile(target_id, local_port, host_port, try_upnp);
+                    self.start_direct_host_for_profile(
+                        target_id,
+                        local_port,
+                        host_port,
+                        try_upnp,
+                        enable_p2p,
+                    );
                 }
                 Some(ServerLifecycleState::Stopped | ServerLifecycleState::Crashed(_)) | None => {
                     self.pending_auto_direct_host_ports.remove(&target_id);
@@ -1604,6 +1643,7 @@ impl AppState {
             || self.network_loading
             || self.tml_releases_busy
             || self.terraria_check_busy
+            || self.p2p_join_connecting
             || self
                 .direct_host_handles
                 .values()
@@ -2093,6 +2133,7 @@ impl AppState {
             || self.workshop_busy
             || self.github_busy
             || self.modpack_sync_busy
+            || self.p2p_join_connecting
     }
 
     fn has_active_close_resources(&self) -> bool {
@@ -2189,6 +2230,10 @@ impl AppState {
             self.notify_err("Đang có tiến trình cài đặt chạy, không thể mở Game lúc này.");
             return;
         }
+        if self.p2p_join_connecting {
+            self.notify_err("Đang kết nối Cổng Ảo P2P tới Server, vui lòng chờ...");
+            return;
+        }
         if self.active_game.is_some() {
             self.notify_err("Game đang chạy. Hãy đóng phiên hiện tại trước khi mở mới.");
             return;
@@ -2270,6 +2315,43 @@ impl AppState {
         };
         self.save_config();
 
+        let mut opts = GameLaunchOptions {
+            edition: self.config.active_edition,
+            modpack: self.config.active_modpack.clone(),
+            join_host: "127.0.0.1".to_string(),
+            join_port: 7777,
+            join_password,
+            extra_args: String::new(),
+            graphics_backend: self.config.tml_graphics_backend,
+            dotnet_tiered_pgo: self.config.dotnet_tiered_pgo,
+            dotnet_server_gc: self.config.dotnet_server_gc,
+            process_priority: self.config.game_process_priority,
+        };
+
+        if is_p2p_ticket(&join_host) {
+            if let Err(e) = parse_p2p_ticket(&join_host) {
+                self.notify_err(clean_launcher_error_msg(e));
+                return;
+            }
+            self.p2p_join_connecting = true;
+            self.notify_ok("Đang kết nối Cổng Ảo P2P tới Server...");
+            let client_key_path = self.paths.data_dir.join("client_p2p_identity.key");
+            let ticket = join_host.clone();
+            let tx = self.event_tx.clone();
+            let wake = self.repaint.clone();
+            self.rt.spawn(async move {
+                let result = start_p2p_client_bridge(&ticket, Some(&client_key_path))
+                    .await
+                    .map_err(clean_launcher_error_msg);
+                let _ = tx.send(AppEvent::P2pJoinBridgeReady {
+                    opts: Box::new(opts),
+                    result,
+                });
+                wake.wake();
+            });
+            return;
+        }
+
         // Terraria client connects via IPv4; bridge IPv6 targets over a local 127.0.0.1 forwarder.
         let target_port = if join_port > 0 { join_port } else { 7777 };
         let resolved_v6 = if !join_host.trim().is_empty() {
@@ -2286,7 +2368,7 @@ impl AppState {
                     ("127.0.0.1".to_string(), local_port)
                 }
                 Err(err) => {
-                    self.notify_err(err.to_string());
+                    self.notify_err(clean_launcher_error_msg(err));
                     return;
                 }
             }
@@ -2294,25 +2376,18 @@ impl AppState {
             (join_host, join_port)
         };
 
-        let opts = GameLaunchOptions {
-            edition: self.config.active_edition,
-            modpack: self.config.active_modpack.clone(),
-            join_host: effective_join_host,
-            join_port: effective_join_port,
-            join_password,
-            extra_args: String::new(),
-            graphics_backend: self.config.tml_graphics_backend,
-            dotnet_tiered_pgo: self.config.dotnet_tiered_pgo,
-            dotnet_server_gc: self.config.dotnet_server_gc,
-            process_priority: self.config.game_process_priority,
-        };
+        opts.join_host = effective_join_host;
+        opts.join_port = effective_join_port;
+        self.finish_launching_game(opts);
+    }
 
+    fn finish_launching_game(&mut self, opts: GameLaunchOptions) {
         match launch_game(&self.paths, &opts) {
             Ok(mut proc_handle) => {
                 self.running_game = Some(proc_handle.snapshot());
                 self.active_game = Some(proc_handle);
                 self.external_games.retain(|g| g.edition != opts.edition);
-                self.notify_ok(format!("Đã khởi chạy {}.", self.config.active_edition.label()));
+                self.notify_ok(format!("Đã khởi chạy {}.", opts.edition.label()));
             }
             Err(e) => {
                 self.stop_client_ipv6_bridge();
@@ -3452,6 +3527,34 @@ impl AppState {
         });
     }
 
+    fn persist_and_kick_bridged_ban(
+        &mut self,
+        safe_name: &str,
+        entry_ip: String,
+        is_already_banned: impl FnOnce(&[BanEntry]) -> bool,
+        ok_msg: String,
+    ) {
+        let Some(profile) = self.config.active_server().cloned() else {
+            return;
+        };
+        let ban_path = self.resolve_profile_banlist_path(&profile);
+        let mut entries = load_banlist(&ban_path);
+        if !is_already_banned(&entries) {
+            entries.push(BanEntry {
+                label: format!("Player: {safe_name}"),
+                ip: entry_ip,
+            });
+            if let Err(e) = save_banlist(&ban_path, &entries) {
+                self.notify_err(format!("Không lưu được banlist: {e}"));
+                return;
+            }
+        }
+        self.banlist_entries = entries;
+        self.sync_banlist_to_direct_host();
+        self.send_server_command(&format!("kick {safe_name}"));
+        self.notify_ok(ok_msg);
+    }
+
     pub fn ban_player(&mut self, name: &str) {
         let target_name = name.trim();
         let safe_name = sanitize_server_console_arg(target_name);
@@ -3476,7 +3579,7 @@ impl AppState {
 
         let resolution = resolve_player_ban_target(player_ip_raw.as_deref(), |port| {
             self.active_direct_host_handle()
-                .and_then(|h| h.resolve_bridged_peer(port))
+                .and_then(|h| h.resolve_bridged_peer_target(port))
         });
 
         match resolution {
@@ -3486,28 +3589,30 @@ impl AppState {
                 );
             }
             PlayerBanResolution::BridgedRealIp(real_ip) => {
-                let Some(profile) = self.config.active_server().cloned() else {
-                    return;
-                };
-                let ban_path = self.resolve_profile_banlist_path(&profile);
-                let mut entries = load_banlist(&ban_path);
-                let already_banned = entries
-                    .iter()
-                    .any(|e| extract_ban_ip_key(&e.ip).map(normalize_ip_addr) == Some(real_ip));
-                if !already_banned {
-                    entries.push(BanEntry {
-                        label: format!("Player: {safe_name}"),
-                        ip: real_ip.to_string(),
-                    });
-                    if let Err(e) = save_banlist(&ban_path, &entries) {
-                        self.notify_err(format!("Không lưu được banlist: {e}"));
-                        return;
-                    }
-                }
-                self.banlist_entries = entries;
-                self.sync_banlist_to_direct_host();
-                self.send_server_command(&format!("kick {safe_name}"));
-                self.notify_ok(format!("Đã cấm {safe_name} ({real_ip})."));
+                self.persist_and_kick_bridged_ban(
+                    &safe_name,
+                    real_ip.to_string(),
+                    |entries| {
+                        entries
+                            .iter()
+                            .any(|e| extract_ban_ip_key(&e.ip).map(normalize_ip_addr) == Some(real_ip))
+                    },
+                    format!("Đã cấm {safe_name} ({real_ip})."),
+                );
+            }
+            PlayerBanResolution::BridgedP2pPeer(peer_id) => {
+                let peer_key = peer_id.trim().to_ascii_lowercase();
+                let short = short_p2p_peer_id(&peer_key);
+                self.persist_and_kick_bridged_ban(
+                    &safe_name,
+                    format!("{P2P_BAN_PREFIX}{peer_key}"),
+                    |entries| {
+                        entries
+                            .iter()
+                            .any(|e| extract_ban_p2p_key(&e.ip).as_deref() == Some(peer_key.as_str()))
+                    },
+                    format!("Đã cấm {safe_name} (P2P:{short})."),
+                );
             }
             PlayerBanResolution::DirectIp(direct_ip) => {
                 self.send_server_command(&format!("ban {safe_name}"));
@@ -3559,8 +3664,8 @@ impl AppState {
     }
 
     pub fn add_manual_ban(&mut self) {
-        let norm_ip = match validate_and_normalize_manual_ban_ip(&self.manual_ban_ip) {
-            Ok(ip) => ip,
+        let target = match validate_and_normalize_manual_ban_target(&self.manual_ban_ip) {
+            Ok(target) => target,
             Err(msg) => {
                 self.notify_err(msg);
                 return;
@@ -3576,7 +3681,7 @@ impl AppState {
         };
         let path = self.resolve_profile_banlist_path(&profile);
         let mut next_entries = load_banlist(&path);
-        let added = merge_manual_ban_entry(&mut next_entries, label, norm_ip);
+        let added = merge_manual_ban_target_entry(&mut next_entries, label, &target);
         if added {
             if let Err(e) = save_banlist(&path, &next_entries) {
                 self.notify_err(format!("Không lưu được banlist: {e}"));
@@ -3600,14 +3705,20 @@ impl AppState {
                         .filter_map(|p| {
                             let resolved = resolve_player_ban_target(p.ip.as_deref(), |port| {
                                 self.active_direct_host_handle()
-                                    .and_then(|h| h.resolve_bridged_peer(port))
+                                    .and_then(|h| h.resolve_bridged_peer_target(port))
                             });
-                            let matches = matches!(
-                                resolved,
-                                PlayerBanResolution::DirectIp(ip)
-                                    | PlayerBanResolution::BridgedRealIp(ip)
-                                    if ip == norm_ip
-                            );
+                            let matches = match (&target, &resolved) {
+                                (
+                                    ManualBanTarget::Ip(norm_ip),
+                                    PlayerBanResolution::DirectIp(ip)
+                                    | PlayerBanResolution::BridgedRealIp(ip),
+                                ) => ip == norm_ip,
+                                (
+                                    ManualBanTarget::P2p(peer_id),
+                                    PlayerBanResolution::BridgedP2pPeer(active_peer),
+                                ) => active_peer.eq_ignore_ascii_case(peer_id),
+                                _ => false,
+                            };
                             if matches {
                                 let safe = sanitize_server_console_arg(&p.name);
                                 (!safe.is_empty()).then_some(safe)
@@ -3623,10 +3734,14 @@ impl AppState {
             }
         }
 
+        let target_label = match &target {
+            ManualBanTarget::Ip(ip) => ip.to_string(),
+            ManualBanTarget::P2p(peer_id) => format!("{P2P_BAN_PREFIX}{peer_id}"),
+        };
         if added {
-            self.notify_ok(format!("Đã thêm {norm_ip} vào banlist.txt."));
+            self.notify_ok(format!("Đã thêm {target_label} vào banlist.txt."));
         } else {
-            self.notify_ok(format!("IP {norm_ip} đã có sẵn trong danh sách cấm."));
+            self.notify_ok(format!("{target_label} đã có sẵn trong danh sách cấm."));
         }
     }
 
@@ -3646,6 +3761,13 @@ impl AppState {
             let _ = tx.send(AppEvent::NetworkProbed(snap));
             wake.wake();
         });
+    }
+
+    pub fn refresh_network_and_recheck_online(&mut self) {
+        self.spawn_network_probe();
+        if let Some(handle) = self.active_direct_host_handle().cloned() {
+            handle.recheck_reachability(self.rt.handle(), self.repaint.clone());
+        }
     }
 
     pub fn ensure_firewall(&mut self, port: u16) {
@@ -3717,13 +3839,18 @@ impl AppState {
     pub fn format_player_ip_for_active(&self, raw: &str) -> String {
         format_player_ip_with_resolver(raw, |port| {
             self.active_direct_host_handle()
-                .and_then(|h| h.resolve_bridged_peer(port))
+                .and_then(|h| h.resolve_bridged_peer_target(port))
         })
     }
 
     pub fn collect_banlist_ips_for_profile(&self, profile: &ServerProfile) -> Vec<IpAddr> {
         let entries = load_banlist(&self.resolve_profile_banlist_path(profile));
         collect_banlist_ips_from_entries(&entries)
+    }
+
+    pub fn collect_banlist_p2p_for_profile(&self, profile: &ServerProfile) -> Vec<String> {
+        let entries = load_banlist(&self.resolve_profile_banlist_path(profile));
+        collect_banlist_p2p_from_entries(&entries)
     }
 
     fn collect_banlist_ips_for_profile_id(&self, profile_id: &str) -> Vec<IpAddr> {
@@ -3735,6 +3862,15 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    fn collect_banlist_p2p_for_profile_id(&self, profile_id: &str) -> Vec<String> {
+        self.config
+            .servers
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map(|p| self.collect_banlist_p2p_for_profile(p))
+            .unwrap_or_default()
+    }
+
     fn collect_banlist_ips_for_active(&self) -> Vec<IpAddr> {
         self.config
             .active_server()
@@ -3742,9 +3878,37 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    fn collect_banlist_p2p_for_active(&self) -> Vec<String> {
+        self.config
+            .active_server()
+            .map(|p| self.collect_banlist_p2p_for_profile(p))
+            .unwrap_or_default()
+    }
+
+    fn sync_banlist_to_direct_host_for_profile(&self, profile_id: &str) {
+        if let Some(handle) = self.direct_host_handles.get(profile_id) {
+            let (ips, p2p_peers) = self
+                .config
+                .servers
+                .iter()
+                .find(|p| p.id == profile_id)
+                .map(|p| {
+                    let entries = load_banlist(&self.resolve_profile_banlist_path(p));
+                    (
+                        collect_banlist_ips_from_entries(&entries),
+                        collect_banlist_p2p_from_entries(&entries),
+                    )
+                })
+                .unwrap_or_default();
+            handle.set_banned_ips(ips);
+            handle.set_banned_p2p_peers(p2p_peers);
+        }
+    }
+
     pub fn sync_banlist_to_direct_host(&self) {
         if let Some(handle) = self.direct_host_handles.get(&self.config.active_server_id) {
             handle.set_banned_ips(self.collect_banlist_ips_for_active());
+            handle.set_banned_p2p_peers(self.collect_banlist_p2p_for_active());
         }
     }
 
@@ -3778,6 +3942,7 @@ impl AppState {
         local_target_port: u16,
         host_port: u16,
         try_upnp: bool,
+        enable_p2p: bool,
     ) {
         if self.direct_host_handles.get(&profile_id).is_some_and(|h| {
             matches!(
@@ -3797,6 +3962,7 @@ impl AppState {
         }
         self.stop_direct_host_for_profile(&profile_id);
         let initial_banned_ips = self.collect_banlist_ips_for_profile_id(&profile_id);
+        let initial_banned_p2p_peers = self.collect_banlist_p2p_for_profile_id(&profile_id);
         let bind_ipv4 = self.direct_bind_ips.get(&profile_id).copied().flatten();
         let cleanup_local_upnp_on_start = self
             .config
@@ -3804,6 +3970,12 @@ impl AppState {
             .iter()
             .find(|p| p.id == profile_id)
             .is_some_and(|p| p.config.upnp);
+        let p2p_secret_key_path = Some(
+            self.paths
+                .servers_dir
+                .join(&profile_id)
+                .join("p2p_secret.key"),
+        );
         let handle = start_direct_port_host(
             self.rt.handle(),
             DirectHostConfig {
@@ -3813,6 +3985,10 @@ impl AppState {
                 try_upnp,
                 cleanup_local_upnp_on_start,
                 initial_banned_ips,
+                verify_wan_reachability: true,
+                enable_p2p,
+                p2p_secret_key_path,
+                initial_banned_p2p_peers,
             },
             self.repaint.clone(),
         );
@@ -3834,7 +4010,14 @@ impl AppState {
             .filter(|&p| p > 0)
             .unwrap_or(local_target_port);
         let try_upnp = self.direct_try_upnp;
-        self.start_direct_host_for_profile(active_id, local_target_port, host_port, try_upnp);
+        let enable_p2p = self.direct_enable_p2p;
+        self.start_direct_host_for_profile(
+            active_id,
+            local_target_port,
+            host_port,
+            try_upnp,
+            enable_p2p,
+        );
     }
 
     pub fn toggle_direct_host(&mut self) {
@@ -3940,6 +4123,10 @@ impl AppState {
     pub fn join_own_hosted_server(&mut self) {
         if self.install_busy {
             self.notify_err("Đang có tiến trình cài đặt chạy, không thể mở Game lúc này.");
+            return;
+        }
+        if self.p2p_join_connecting {
+            self.notify_err("Đang kết nối Cổng Ảo P2P tới Server, vui lòng chờ...");
             return;
         }
         if self.active_game.is_some() {
@@ -4079,6 +4266,10 @@ impl AppState {
     pub fn join_saved_server(&mut self, idx: usize) {
         if self.install_busy {
             self.notify_err("Đang có tiến trình cài đặt chạy, không thể mở Game lúc này.");
+            return;
+        }
+        if self.p2p_join_connecting {
+            self.notify_err("Đang kết nối Cổng Ảo P2P tới Server, vui lòng chờ...");
             return;
         }
         if self.active_game.is_some() {
@@ -4248,6 +4439,31 @@ impl AppState {
         if self.port_probe_busy {
             return;
         }
+        let raw_host_trimmed = self.port_probe_host.trim();
+        if is_p2p_ticket(raw_host_trimmed) {
+            let raw_ticket = raw_host_trimmed.to_string();
+            if let Err(e) = parse_p2p_ticket(&raw_ticket) {
+                self.notify_err(clean_launcher_error_msg(e));
+                return;
+            }
+            self.port_probe_host = raw_ticket.clone();
+            let endpoint = format_p2p_ticket_short(&raw_ticket);
+            let client_key_path = self.paths.data_dir.join("client_p2p_identity.key");
+            self.port_probe_busy = true;
+            self.port_probe_status = None;
+            let tx = self.event_tx.clone();
+            let wake = self.repaint.clone();
+            self.rt.spawn(async move {
+                let result =
+                    match probe_p2p_ticket_reachability(&raw_ticket, Some(&client_key_path)).await {
+                        Ok(ms) => Ok(format!("{endpoint} sẵn sàng kết nối P2P ({ms} ms)")),
+                        Err(e) => Err(e),
+                    };
+                let _ = tx.send(AppEvent::PortProbed { endpoint, result });
+                wake.wake();
+            });
+            return;
+        }
         let fallback_port = self
             .port_probe_port
             .trim()
@@ -4283,6 +4499,8 @@ impl AppState {
         }
         let local_port = self.active_server_port();
         let is_local_target = is_local_probe_host(&clean_host, &self.network_snapshot);
+        let snap_v6 = self.network_snapshot.global_ipv6;
+        let snap_pub_v4 = self.network_snapshot.public_ip;
         let endpoint = if clean_host.contains(':') {
             format!("[{clean_host}]:{port}")
         } else {
@@ -4293,16 +4511,61 @@ impl AppState {
         let tx = self.event_tx.clone();
         let wake = self.repaint.clone();
         self.rt.spawn(async move {
-            let result = if is_local_target {
-                if port == local_port && !probe_local_tcp_listening(local_port).await {
+            let result = if let Some(v6) =
+                snap_v6.filter(|&ip| clean_host.parse::<Ipv6Addr>().ok() == Some(ip))
+            {
+                match probe_local_endpoint_listening(&clean_host, port).await {
+                    Ok(ms) => match probe_external_ipv6_reachability(v6, port).await {
+                        ExternalReachability::Reachable => {
+                            Ok(format!("{endpoint} đã thông từ Internet ({ms} ms)"))
+                        }
+                        ExternalReachability::Blocked => Err(
+                            "Đã mở trên máy nhưng đang bị Tường lửa Modem chặn từ Internet"
+                                .to_string(),
+                        ),
+                        ExternalReachability::CheckUnavailable(reason) => Err(format!(
+                            "Đã mở trên máy, chưa xác nhận được từ Internet ({reason})"
+                        )),
+                        ExternalReachability::NotChecked | ExternalReachability::Checking => {
+                            Err("Đã mở trên máy, chưa xác nhận được từ Internet".to_string())
+                        }
+                    },
+                    Err(e) => Err(e),
+                }
+            } else if let Some(v4) =
+                snap_pub_v4.filter(|&ip| clean_host.parse::<Ipv4Addr>().ok() == Some(ip))
+            {
+                let started = Instant::now();
+                match probe_external_ipv4_reachability(v4, port).await {
+                    ExternalReachability::Reachable => {
+                        let ms = started.elapsed().as_millis();
+                        Ok(format!("{endpoint} đã thông từ Internet ({ms} ms)"))
+                    }
+                    ExternalReachability::Blocked => Err(
+                        "Không kết nối được từ Internet (bị Modem chặn hoặc sau CGNAT nhà mạng)"
+                            .to_string(),
+                    ),
+                    ExternalReachability::CheckUnavailable(reason) => {
+                        Err(format!("Chưa xác nhận được từ Internet ({reason})"))
+                    }
+                    ExternalReachability::NotChecked | ExternalReachability::Checking => {
+                        Err("Chưa xác nhận được từ Internet".to_string())
+                    }
+                }
+            } else if is_local_target {
+                let local_res = if port == local_port && !probe_local_tcp_listening(local_port).await
+                {
                     Err(format!(
                         "Cổng máy bạn ({clean_host}:{port}) chưa lắng nghe — hãy bật Server trước."
                     ))
                 } else {
                     probe_local_endpoint_listening(&clean_host, port).await
-                }
+                };
+                local_res.map(|ms| format!("{endpoint} đang mở nội bộ/VPN ({ms} ms)"))
             } else {
-                probe_tcp_endpoint(&clean_host, port).await
+                probe_tcp_endpoint(&clean_host, port)
+                    .await
+                    .map(|ms| format!("{endpoint} phản hồi ({ms} ms)"))
             };
             let _ = tx.send(AppEvent::PortProbed { endpoint, result });
             wake.wake();
@@ -5900,6 +6163,7 @@ impl AppState {
             name: final_name,
             edition,
             auto_restart: false,
+            p2p_tunnel: true,
             extra_args: String::new(),
             config: ServerConfigData {
                 port,
@@ -5982,7 +6246,9 @@ impl AppState {
         self.config.quick_join_host = host.clone();
         self.config.quick_join_port = final_port;
         self.quick_join_port_input = final_port.to_string();
-        let default_label = if host.contains(':') {
+        let default_label = if is_p2p_ticket(&host) {
+            format_p2p_ticket_short(&host)
+        } else if host.contains(':') {
             format!("[{host}]:{final_port}")
         } else {
             format!("{host}:{final_port}")
@@ -6170,6 +6436,9 @@ fn strip_ipv6_zone_if_valid(s: &str) -> Option<String> {
 
 fn split_host_port_input(raw_host: &str, fallback_port: u16) -> (String, u16) {
     let trimmed = raw_host.trim();
+    if is_p2p_ticket(trimmed) {
+        return (trimmed.to_string(), fallback_port);
+    }
     if let Some(rest) = trimmed.strip_prefix('[') {
         if let Some((v6, port_str)) = rest.split_once("]:") {
             let v6 = v6.trim();
@@ -6449,6 +6718,25 @@ fn is_server_managed_by_direct_host(
         })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualBanTarget {
+    Ip(IpAddr),
+    P2p(String),
+}
+
+fn validate_and_normalize_manual_ban_target(raw: &str) -> Result<ManualBanTarget, &'static str> {
+    let trimmed = raw.trim();
+    if let Some(peer_id) = extract_ban_p2p_key(trimmed) {
+        return Ok(ManualBanTarget::P2p(peer_id));
+    }
+    if trimmed.len() >= P2P_BAN_PREFIX.len()
+        && trimmed[..P2P_BAN_PREFIX.len()].eq_ignore_ascii_case(P2P_BAN_PREFIX)
+    {
+        return Err("Mã P2P không hợp lệ (định dạng p2p:<PeerID tối thiểu 32 ký tự chữ/số>).");
+    }
+    validate_and_normalize_manual_ban_ip(trimmed).map(ManualBanTarget::Ip)
+}
+
 fn validate_and_normalize_manual_ban_ip(raw: &str) -> Result<IpAddr, &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -6489,12 +6777,37 @@ fn merge_manual_ban_entry(entries: &mut Vec<BanEntry>, label: String, norm_ip: I
     true
 }
 
+fn merge_manual_ban_target_entry(
+    entries: &mut Vec<BanEntry>,
+    label: String,
+    target: &ManualBanTarget,
+) -> bool {
+    match target {
+        ManualBanTarget::Ip(norm_ip) => merge_manual_ban_entry(entries, label, *norm_ip),
+        ManualBanTarget::P2p(peer_id) => {
+            if entries
+                .iter()
+                .any(|e| extract_ban_p2p_key(&e.ip).as_deref() == Some(peer_id.as_str()))
+            {
+                return false;
+            }
+            entries.push(BanEntry {
+                label,
+                ip: format!("{P2P_BAN_PREFIX}{peer_id}"),
+            });
+            true
+        }
+    }
+}
+
 fn remove_ban_entry_from_disk_list(disk_entries: &mut Vec<BanEntry>, target: &BanEntry) -> bool {
     let target_norm = extract_ban_ip_key(&target.ip).map(normalize_ip_addr);
+    let target_p2p = extract_ban_p2p_key(&target.ip);
     if let Some(pos) = disk_entries.iter().position(|e| {
         (e.label == target.label && e.ip == target.ip)
             || (target_norm.is_some()
                 && extract_ban_ip_key(&e.ip).map(normalize_ip_addr) == target_norm)
+            || (target_p2p.is_some() && extract_ban_p2p_key(&e.ip) == target_p2p)
     }) {
         disk_entries.remove(pos);
         true
@@ -6569,15 +6882,37 @@ fn collect_banlist_ips_from_entries(entries: &[BanEntry]) -> Vec<IpAddr> {
     ips
 }
 
+fn collect_banlist_p2p_from_entries(entries: &[BanEntry]) -> Vec<String> {
+    let mut peers = Vec::new();
+    for entry in entries {
+        if let Some(peer_id) = extract_ban_p2p_key(&entry.ip) {
+            if !peers.contains(&peer_id) {
+                peers.push(peer_id);
+            }
+        }
+    }
+    peers
+}
+
+fn short_p2p_peer_id(peer_id: &str) -> String {
+    peer_id.chars().take(8).collect()
+}
+
 fn format_player_ip_with_resolver(
     raw: &str,
-    resolve_peer: impl FnOnce(u16) -> Option<IpAddr>,
+    resolve_peer: impl FnOnce(u16) -> Option<BridgedPeerTarget>,
 ) -> String {
     let trimmed = raw.trim();
     if let Ok(sock) = trimmed.parse::<SocketAddr>() {
         if sock.ip().is_loopback() {
-            if let Some(real_ip) = resolve_peer(sock.port()) {
-                return normalize_ip_addr(real_ip).to_string();
+            match resolve_peer(sock.port()) {
+                Some(BridgedPeerTarget::Ip(real_ip)) => {
+                    return normalize_ip_addr(real_ip).to_string();
+                }
+                Some(BridgedPeerTarget::P2p(peer_id)) => {
+                    return format!("P2P:{}", short_p2p_peer_id(&peer_id));
+                }
+                None => {}
             }
         }
         return trimmed.to_string();
@@ -6588,17 +6923,18 @@ fn format_player_ip_with_resolver(
     raw.to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PlayerBanResolution {
     RefuseLoopback,
     BridgedRealIp(IpAddr),
+    BridgedP2pPeer(String),
     DirectIp(IpAddr),
     UnknownIp,
 }
 
 fn resolve_player_ban_target(
     raw: Option<&str>,
-    resolve_peer: impl FnOnce(u16) -> Option<IpAddr>,
+    resolve_peer: impl FnOnce(u16) -> Option<BridgedPeerTarget>,
 ) -> PlayerBanResolution {
     let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return PlayerBanResolution::UnknownIp;
@@ -6606,11 +6942,22 @@ fn resolve_player_ban_target(
     if let Ok(sock) = trimmed.parse::<SocketAddr>() {
         let ip = normalize_ip_addr(sock.ip());
         if ip.is_loopback() || ip.is_unspecified() {
-            return match resolve_peer(sock.port())
-                .map(normalize_ip_addr)
-                .filter(|r| !r.is_loopback() && !r.is_unspecified())
-            {
-                Some(real_ip) => PlayerBanResolution::BridgedRealIp(real_ip),
+            return match resolve_peer(sock.port()) {
+                Some(BridgedPeerTarget::Ip(raw_ip)) => {
+                    let real_ip = normalize_ip_addr(raw_ip);
+                    if !real_ip.is_loopback() && !real_ip.is_unspecified() {
+                        PlayerBanResolution::BridgedRealIp(real_ip)
+                    } else {
+                        PlayerBanResolution::RefuseLoopback
+                    }
+                }
+                Some(BridgedPeerTarget::P2p(peer_id)) => {
+                    if peer_id.trim().is_empty() {
+                        PlayerBanResolution::RefuseLoopback
+                    } else {
+                        PlayerBanResolution::BridgedP2pPeer(peer_id)
+                    }
+                }
                 None => PlayerBanResolution::RefuseLoopback,
             };
         }
@@ -7242,21 +7589,22 @@ mod tests {
     use super::{
         apply_saved_join_server_to_config, check_install_edition_ready_flags,
         check_restore_world_backup_flags, choose_default_share_scope,
-        collect_banlist_ips_from_entries, compute_is_mod_operation_busy,
-        compute_workshop_install_status, configured_profile_port, derive_url_mod_label,
-        find_conflicting_world_profile_name, format_close_confirm_message,
+        collect_banlist_ips_from_entries, collect_banlist_p2p_from_entries,
+        compute_is_mod_operation_busy, compute_workshop_install_status, configured_profile_port,
+        derive_url_mod_label, find_conflicting_world_profile_name, format_close_confirm_message,
         format_close_confirm_message_with_background, format_player_ip_with_resolver,
         generate_unique_profile_world_stem, group_dropped_world_files, is_existing_valid_modpack,
-        is_safe_single_dir_component, merge_manual_ban_entry, next_available_server_port,
-        parse_wld_format_version, remove_ban_entry_from_disk_list,
+        is_safe_single_dir_component, merge_manual_ban_entry, merge_manual_ban_target_entry,
+        next_available_server_port, parse_wld_format_version, remove_ban_entry_from_disk_list,
         remove_saved_join_server_from_list, resolve_active_server_port_value,
         resolve_enabled_share_pack_name_with, resolve_modpack_dir, resolve_player_ban_target,
         resolve_profile_world_path, resolve_unique_world_dest_stem,
         resolve_workshop_install_order, sanitize_server_console_arg,
         save_or_update_saved_join_server, select_mod_names_for_share_scope,
         should_block_close_transition, split_host_port_input,
-        validate_and_normalize_manual_ban_ip, workshop_item_label_and_size, PlayerBanResolution,
-        ShareExportOrigin, ShareExportScope,
+        validate_and_normalize_manual_ban_ip, validate_and_normalize_manual_ban_target,
+        workshop_item_label_and_size, ManualBanTarget, PlayerBanResolution, ShareExportOrigin,
+        ShareExportScope,
     };
     use std::collections::{HashMap, HashSet};
     use std::net::IpAddr;
@@ -7267,9 +7615,9 @@ mod tests {
         TmodMetadata,
     };
     use tl_runtime::{
-        BanEntry, DetectedExternalServer, InstallTarget, InstalledModEntry, ModSourceRecord,
-        ServerLifecycleState, ServerRuntimeSnapshot, StagedWorkshopMod, WorkshopItemDetails,
-        WorkshopManifestRecord,
+        BanEntry, BridgedPeerTarget, DetectedExternalServer, InstallTarget, InstalledModEntry,
+        ModSourceRecord, ServerLifecycleState, ServerRuntimeSnapshot, StagedWorkshopMod,
+        WorkshopItemDetails, WorkshopManifestRecord,
     };
 
     #[test]
@@ -7322,6 +7670,14 @@ mod tests {
             split_host_port_input(":50355", 7777),
             (":50355".to_string(), 7777)
         );
+        assert_eq!(
+            split_host_port_input("  TLPORT:AbCdEf1234567890_xyz-  ", 7777),
+            ("TLPORT:AbCdEf1234567890_xyz-".to_string(), 7777)
+        );
+        assert_eq!(
+            split_host_port_input("tlport:TestTicketBody", 7788),
+            ("tlport:TestTicketBody".to_string(), 7788)
+        );
     }
 
     #[test]
@@ -7367,12 +7723,52 @@ mod tests {
     }
 
     #[test]
+    fn collect_banlist_p2p_normalizes_and_dedups() {
+        let valid_upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let valid_other = "0123456789abcdefghijklmnopqrstuv";
+        let entries = vec![
+            BanEntry {
+                label: "IP".to_string(),
+                ip: "203.0.113.9".to_string(),
+            },
+            BanEntry {
+                label: "Short".to_string(),
+                ip: "p2p:abc".to_string(),
+            },
+            BanEntry {
+                label: "Upper".to_string(),
+                ip: format!("  P2P:{valid_upper}  "),
+            },
+            BanEntry {
+                label: "Dup".to_string(),
+                ip: format!("p2p:{}", valid_upper.to_ascii_lowercase()),
+            },
+            BanEntry {
+                label: "Second".to_string(),
+                ip: format!("p2p:{valid_other}"),
+            },
+        ];
+        assert_eq!(
+            collect_banlist_p2p_from_entries(&entries),
+            vec![valid_upper.to_ascii_lowercase(), valid_other.to_string()]
+        );
+    }
+
+    #[test]
     fn format_player_ip_resolves_bridged_loopback_and_preserves_direct() {
         let bridged = format_player_ip_with_resolver("127.0.0.1:60972", |port| {
             assert_eq!(port, 60972);
-            Some("::ffff:198.51.100.4".parse().unwrap())
+            Some(BridgedPeerTarget::Ip("::ffff:198.51.100.4".parse().unwrap()))
         });
         assert_eq!(bridged, "198.51.100.4");
+
+        let bridged_p2p = format_player_ip_with_resolver("127.0.0.1:60973", |port| {
+            assert_eq!(port, 60973);
+            Some(BridgedPeerTarget::P2p(
+                "abcdef0123456789abcdef0123456789".to_string(),
+            ))
+        });
+        assert_eq!(bridged_p2p, "P2P:abcdef01");
 
         let unbridged = format_player_ip_with_resolver("127.0.0.1:50000", |_| None);
         assert_eq!(unbridged, "127.0.0.1:50000");
@@ -7386,9 +7782,18 @@ mod tests {
         assert_eq!(
             resolve_player_ban_target(Some("127.0.0.1:60972"), |port| {
                 assert_eq!(port, 60972);
-                Some("::ffff:203.0.113.5".parse().unwrap())
+                Some(BridgedPeerTarget::Ip("::ffff:203.0.113.5".parse().unwrap()))
             }),
             PlayerBanResolution::BridgedRealIp("203.0.113.5".parse().unwrap())
+        );
+        assert_eq!(
+            resolve_player_ban_target(Some("127.0.0.1:60973"), |port| {
+                assert_eq!(port, 60973);
+                Some(BridgedPeerTarget::P2p(
+                    "abcdef0123456789abcdef0123456789".to_string(),
+                ))
+            }),
+            PlayerBanResolution::BridgedP2pPeer("abcdef0123456789abcdef0123456789".to_string())
         );
         assert_eq!(
             resolve_player_ban_target(Some("127.0.0.1:60972"), |_| None),
@@ -7396,7 +7801,7 @@ mod tests {
         );
         assert_eq!(
             resolve_player_ban_target(Some("[::1]:54321"), |_| {
-                Some("127.0.0.1".parse().unwrap())
+                Some(BridgedPeerTarget::Ip("127.0.0.1".parse().unwrap()))
             }),
             PlayerBanResolution::RefuseLoopback
         );
@@ -7418,6 +7823,7 @@ mod tests {
             name: "Test".to_string(),
             edition: GameEdition::TModLoader,
             auto_restart: false,
+            p2p_tunnel: true,
             extra_args: String::new(),
             config: ServerConfigData {
                 world: "Custom.wld".to_string(),
@@ -7472,6 +7878,7 @@ mod tests {
             name: name.to_string(),
             edition: GameEdition::TModLoader,
             auto_restart: false,
+            p2p_tunnel: true,
             extra_args: String::new(),
             config: ServerConfigData {
                 world: world.to_string(),
@@ -7991,6 +8398,49 @@ mod tests {
         assert!(remove_ban_entry_from_disk_list(&mut disk, &target));
         assert_eq!(disk.len(), 1);
         assert_eq!(disk[0].label, "ConcurrentBan");
+    }
+
+    #[test]
+    fn manual_ban_target_validates_p2p_and_removes_case_insensitively() {
+        let valid_id = "abcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(
+            validate_and_normalize_manual_ban_target(&format!(
+                "  P2P:{}  ",
+                valid_id.to_ascii_uppercase()
+            )),
+            Ok(ManualBanTarget::P2p(valid_id.to_string()))
+        );
+        assert!(validate_and_normalize_manual_ban_target("p2p:abc").is_err());
+        assert!(validate_and_normalize_manual_ban_target("127.0.0.1").is_err());
+        assert_eq!(
+            validate_and_normalize_manual_ban_target("203.0.113.10"),
+            Ok(ManualBanTarget::Ip("203.0.113.10".parse().unwrap()))
+        );
+
+        let mut disk = vec![
+            BanEntry {
+                label: "Player: Alice".to_string(),
+                ip: format!("p2p:{valid_id}"),
+            },
+            BanEntry {
+                label: "Player: Bob".to_string(),
+                ip: "198.51.100.7".to_string(),
+            },
+        ];
+        assert!(!merge_manual_ban_target_entry(
+            &mut disk,
+            "Duplicate".to_string(),
+            &ManualBanTarget::P2p(valid_id.to_string()),
+        ));
+        assert_eq!(disk.len(), 2);
+
+        let remove_target = BanEntry {
+            label: "OtherLabel".to_string(),
+            ip: format!("P2P:{}", valid_id.to_ascii_uppercase()),
+        };
+        assert!(remove_ban_entry_from_disk_list(&mut disk, &remove_target));
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk[0].label, "Player: Bob");
     }
 
     #[test]

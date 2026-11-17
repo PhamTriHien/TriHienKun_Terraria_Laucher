@@ -455,6 +455,7 @@ pub struct ServerProfile {
     pub name: String,
     pub edition: GameEdition,
     pub auto_restart: bool,
+    pub p2p_tunnel: bool,
     pub extra_args: String,
     pub config: ServerConfigData,
 }
@@ -466,6 +467,7 @@ impl Default for ServerProfile {
             name: "tModLoader Server".to_string(),
             edition: GameEdition::TModLoader,
             auto_restart: false,
+            p2p_tunnel: true,
             extra_args: String::new(),
             config: ServerConfigData::default(),
         }
@@ -517,6 +519,7 @@ impl Default for LauncherConfig {
             name: "tModLoader Server".to_string(),
             edition: GameEdition::TModLoader,
             auto_restart: false,
+            p2p_tunnel: true,
             extra_args: String::new(),
             config: ServerConfigData {
                 world: paths
@@ -540,6 +543,7 @@ impl Default for LauncherConfig {
             name: "Vanilla 1.4.5.8 Server".to_string(),
             edition: GameEdition::Vanilla,
             auto_restart: false,
+            p2p_tunnel: true,
             extra_args: String::new(),
             config: ServerConfigData {
                 world: paths
@@ -785,6 +789,31 @@ mod tests {
         let encoded = serde_json::to_string(&with_pack).unwrap();
         let roundtrip: SavedJoinServer = serde_json::from_str(&encoded).unwrap();
         assert_eq!(roundtrip.modpack, "Calamity");
+    }
+
+    #[test]
+    fn server_profile_defaults_and_roundtrips_p2p_tunnel() {
+        let legacy_json =
+            r#"{"id":"legacy-srv","name":"Legacy Server","edition":"TModLoader","auto_restart":false,"extra_args":""}"#;
+        let parsed: ServerProfile = serde_json::from_str(legacy_json).unwrap();
+        assert!(parsed.p2p_tunnel);
+
+        let default_profile = ServerProfile::default();
+        assert!(default_profile.p2p_tunnel);
+
+        let default_cfg = LauncherConfig::default();
+        assert_eq!(default_cfg.servers.len(), 2);
+        assert!(default_cfg.servers.iter().all(|s| s.p2p_tunnel));
+
+        let explicit_false_json =
+            r#"{"id":"p2p-off","name":"Direct Port","edition":"Vanilla","auto_restart":false,"p2p_tunnel":false,"extra_args":""}"#;
+        let disabled: ServerProfile = serde_json::from_str(explicit_false_json).unwrap();
+        assert!(!disabled.p2p_tunnel);
+
+        let encoded = serde_json::to_string(&disabled).unwrap();
+        assert!(encoded.contains(r#""p2p_tunnel":false"#));
+        let roundtrip: ServerProfile = serde_json::from_str(&encoded).unwrap();
+        assert!(!roundtrip.p2p_tunnel);
     }
 
     #[test]

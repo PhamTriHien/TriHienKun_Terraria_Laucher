@@ -6,7 +6,10 @@ use crate::theme::{
     ThemePalette,
 };
 use egui::RichText;
-use tl_runtime::{DirectHostStatus, ServerLifecycleState, UpnpPortStatus};
+use tl_runtime::{
+    format_p2p_ticket_short, is_p2p_ticket, DirectHostStatus, ExternalReachability,
+    Ipv6PinholeStatus, P2pHostStatus, ServerLifecycleState, UpnpPortStatus,
+};
 
 pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: ThemePalette) {
     let assets = state.assets.clone();
@@ -100,6 +103,49 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                 ui.add_space(4.0);
             }
 
+            match &info.p2p_status {
+                P2pHostStatus::Running { ticket, .. } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Cổng Ảo P2P:").strong());
+                        status_pill(ui, &format_p2p_ticket_short(ticket), p.accent_emerald);
+                        status_pill(ui, "Xuyên mọi mạng", p.accent_emerald);
+                        if rpg_compact_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Emerald,
+                            Some(UiIcon::Copy),
+                            "Sao chép",
+                        )
+                        .clicked()
+                        {
+                            copy_target = Some(ticket.clone());
+                        }
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Bạn bè dán mã này vào 'Tham gia Server nhanh' để vào thẳng không phụ thuộc Modem hay nhà mạng.",
+                        )
+                        .size(11.5)
+                        .color(p.text_muted),
+                    );
+                }
+                P2pHostStatus::Starting => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spinner();
+                        ui.label("Đang khởi tạo Cổng Ảo P2P...");
+                    });
+                }
+                P2pHostStatus::Error(err) => {
+                    ui.label(
+                        RichText::new(format!("Cổng Ảo P2P chưa kết nối được: {err}"))
+                            .size(11.8)
+                            .color(p.accent_amber),
+                    );
+                }
+                P2pHostStatus::Disabled => {}
+            }
+
             for (idx, (nic_name, endpoint)) in info.lan_endpoints.iter().enumerate() {
                 ui.push_id(("direct_lan_ep", idx), |ui| {
                     ui.horizontal_wrapped(|ui| {
@@ -143,29 +189,95 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
             }
 
             if let Some(v6_ep) = &info.ipv6_endpoint {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Online IPv6:").strong());
-                    status_pill(ui, v6_ep, p.accent_emerald);
-                    if rpg_compact_button(
-                        ui,
-                        assets.as_ref(),
-                        p,
-                        ButtonSkin::Emerald,
-                        Some(UiIcon::Copy),
-                        "Sao chép",
-                    )
-                    .clicked()
-                    {
-                        copy_target = Some(v6_ep.clone());
+                match (&info.ipv6_reachability, &info.ipv6_pinhole_status) {
+                    (ExternalReachability::Reachable, _) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Online IPv6:").strong());
+                            status_pill(ui, v6_ep, p.accent_emerald);
+                            status_pill(ui, "Đã thông Internet", p.accent_emerald);
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Emerald,
+                                Some(UiIcon::Copy),
+                                "Sao chép",
+                            )
+                            .clicked()
+                            {
+                                copy_target = Some(v6_ep.clone());
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Bạn bè có mạng IPv6 dán địa chỉ này vào 'Tham gia Server nhanh' trên Launcher.",
+                            )
+                            .size(11.5)
+                            .color(p.text_muted),
+                        );
                     }
-                });
-                ui.label(
-                    RichText::new(
-                        "Bạn bè dán địa chỉ này vào mục 'Tham gia Server nhanh' trên Launcher.",
-                    )
-                    .size(11.5)
-                    .color(p.text_muted),
-                );
+                    (ExternalReachability::Checking, _) | (_, Ipv6PinholeStatus::Opening) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Online IPv6:").strong());
+                            status_pill(ui, v6_ep, p.accent_cyan);
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Đang mở tường lửa Modem & kiểm tra kết nối...")
+                                    .size(11.8)
+                                    .color(p.text_muted),
+                            );
+                        });
+                    }
+                    (ExternalReachability::Blocked, _) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("IPv6 (Bị Modem chặn):").strong());
+                            status_pill(ui, v6_ep, p.accent_amber);
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Slate,
+                                Some(UiIcon::Copy),
+                                "Sao chép",
+                            )
+                            .clicked()
+                            {
+                                copy_target = Some(v6_ep.clone());
+                            }
+                        });
+                        ui.label(
+                            RichText::new(format!(
+                                "Đã mở trên máy nhưng tường lửa IPv6 của Modem đang chặn chiều vào — hãy cho phép TCP {} trong IPv6 Firewall của Modem hoặc dùng Cổng Ảo P2P / VPN.",
+                                info.host_port
+                            ))
+                            .size(11.5)
+                            .color(p.text_muted),
+                        );
+                    }
+                    (
+                        ExternalReachability::CheckUnavailable(_)
+                        | ExternalReachability::NotChecked,
+                        _,
+                    ) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("IPv6:").strong());
+                            status_pill(ui, v6_ep, p.accent_amber);
+                            status_pill(ui, "Chưa xác nhận qua Modem", p.accent_amber);
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Cyan,
+                                Some(UiIcon::Copy),
+                                "Sao chép",
+                            )
+                            .clicked()
+                            {
+                                copy_target = Some(v6_ep.clone());
+                            }
+                        });
+                    }
+                }
             }
 
             match &info.upnp_status {
@@ -175,38 +287,103 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                     ..
                 } => {
                     let v4_ep = format!("{external_ip}:{external_port}");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Online IPv4:").strong());
-                        status_pill(ui, &v4_ep, p.accent_emerald);
-                        if rpg_compact_button(
-                            ui,
-                            assets.as_ref(),
-                            p,
-                            ButtonSkin::Emerald,
-                            Some(UiIcon::Copy),
-                            "Sao chép",
-                        )
-                        .clicked()
-                        {
-                            copy_target = Some(v4_ep);
+                    ui.horizontal_wrapped(|ui| match &info.ipv4_reachability {
+                        ExternalReachability::Reachable => {
+                            ui.label(RichText::new("Online IPv4:").strong());
+                            status_pill(ui, &v4_ep, p.accent_emerald);
+                            status_pill(ui, "Đã thông Internet", p.accent_emerald);
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Emerald,
+                                Some(UiIcon::Copy),
+                                "Sao chép",
+                            )
+                            .clicked()
+                            {
+                                copy_target = Some(v4_ep);
+                            }
+                        }
+                        ExternalReachability::Checking => {
+                            ui.label(RichText::new("Online IPv4:").strong());
+                            status_pill(ui, &v4_ep, p.accent_cyan);
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Đang kiểm tra kết nối...")
+                                    .size(11.8)
+                                    .color(p.text_muted),
+                            );
+                        }
+                        ExternalReachability::Blocked => {
+                            ui.label(RichText::new("IPv4 (Bị Modem chặn):").strong());
+                            status_pill(ui, &v4_ep, p.accent_amber);
+                            status_pill(ui, "Chưa thông Internet", p.accent_amber);
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Slate,
+                                Some(UiIcon::Copy),
+                                "Sao chép",
+                            )
+                            .clicked()
+                            {
+                                copy_target = Some(v4_ep);
+                            }
+                        }
+                        ExternalReachability::CheckUnavailable(_)
+                        | ExternalReachability::NotChecked => {
+                            ui.label(RichText::new("Online IPv4:").strong());
+                            status_pill(ui, &v4_ep, p.accent_amber);
+                            status_pill(ui, "Chưa xác nhận qua Modem", p.accent_amber);
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Cyan,
+                                Some(UiIcon::Copy),
+                                "Sao chép",
+                            )
+                            .clicked()
+                            {
+                                copy_target = Some(v4_ep);
+                            }
                         }
                     });
                 }
                 UpnpPortStatus::Mapping => {
                     ui.horizontal_wrapped(|ui| {
                         ui.spinner();
-                        ui.label("Đang mở cổng tự động trên Modem...");
+                        ui.label("Đang mở cổng IPv4 trên Modem...");
                     });
                 }
-                UpnpPortStatus::CarrierGradeNat { .. } | UpnpPortStatus::Unavailable(_) => {
-                    ui.label(
-                        RichText::new(format!(
-                            "Modem chặn mở cổng IPv4 tự động — hãy gửi địa chỉ IPv6 ở trên, dùng VPN chung mạng hoặc mở Port Forwarding TCP {} trên Modem.",
+                UpnpPortStatus::CarrierGradeNat {
+                    wan_ip, public_ip, ..
+                } => {
+                    let msg = match public_ip {
+                        Some(pub_ip) if pub_ip != wan_ip => format!(
+                            "Nhà mạng đang dùng CGNAT (WAN Modem {wan_ip} ≠ IP thực {pub_ip}) — dùng Cổng Ảo P2P ở trên, IPv6 hoặc VPN."
+                        ),
+                        _ => format!(
+                            "Nhà mạng đang dùng CGNAT ({wan_ip}) — dùng Cổng Ảo P2P ở trên, IPv6 hoặc VPN."
+                        ),
+                    };
+                    ui.label(RichText::new(msg).size(11.8).color(p.text_muted));
+                }
+                UpnpPortStatus::Unavailable(_) => {
+                    let msg = if matches!(info.p2p_status, P2pHostStatus::Running { .. })
+                        || info.ipv6_reachability == ExternalReachability::Reachable
+                    {
+                        "UPnP IPv4 không khả dụng — dùng Cổng Ảo P2P / kênh Online ở trên."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Modem chặn mở cổng IPv4 tự động — hãy bật Cổng Ảo P2P, dùng IPv6 / VPN chung mạng hoặc mở Port Forwarding TCP {} trên Modem.",
                             info.host_port
-                        ))
-                        .size(11.8)
-                        .color(p.text_muted),
-                    );
+                        )
+                    };
+                    ui.label(RichText::new(msg).size(11.8).color(p.text_muted));
                 }
                 UpnpPortStatus::Disabled => {}
             }
@@ -369,6 +546,15 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                         }
                         state.save_config();
                     }
+                    if ui
+                        .checkbox(&mut state.direct_enable_p2p, "Cổng Ảo P2P xuyên mạng")
+                        .changed()
+                    {
+                        if let Some(prof) = state.config.active_server_mut() {
+                            prof.p2p_tunnel = state.direct_enable_p2p;
+                        }
+                        state.save_config();
+                    }
                 });
             });
         }
@@ -482,7 +668,7 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
     });
 
     if ask_refresh_net {
-        state.spawn_network_probe();
+        state.refresh_network_and_recheck_online();
     }
     if ask_start_self_host {
         state.start_self_host_online();
@@ -492,7 +678,12 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
     }
     if let Some(txt) = copy_target {
         ui.ctx().copy_text(txt.clone());
-        state.notify_ok(format!("Đã sao chép {txt}"));
+        let msg = if is_p2p_ticket(&txt) {
+            "Đã sao chép mã Cổng Ảo P2P".to_string()
+        } else {
+            format!("Đã sao chép {txt}")
+        };
+        state.notify_ok(msg);
     }
 
     ui.add_space(12.0);
@@ -559,16 +750,19 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
             let probe_host_resp = ui.add(
                 egui::TextEdit::singleline(&mut state.port_probe_host)
                     .desired_width(170.0)
-                    .hint_text("IP / Domain"),
+                    .hint_text("IP, Domain hoặc TLPORT:..."),
             );
-            let parsed_probe = ((probe_host_resp.changed() && pasted) || probe_host_resp.lost_focus())
+            let probe_is_p2p = is_p2p_ticket(&state.port_probe_host);
+            let parsed_probe = (!probe_is_p2p
+                && ((probe_host_resp.changed() && pasted) || probe_host_resp.lost_focus()))
                 .then(|| parse_pasted_host_port(&state.port_probe_host))
                 .flatten();
             if let Some((host, parsed_port)) = parsed_probe {
                 state.port_probe_host = host;
                 state.port_probe_port = parsed_port.to_string();
             }
-            ui.add(
+            ui.add_enabled(
+                !probe_is_p2p,
                 egui::TextEdit::singleline(&mut state.port_probe_port)
                     .desired_width(64.0)
                     .hint_text("7777"),
@@ -581,7 +775,7 @@ pub(super) fn render_network_panel(state: &mut AppState, ui: &mut egui::Ui, p: T
                 .is_some_and(|pt| pt > 0);
             let probe_ready = !state.port_probe_busy
                 && !state.port_probe_host.trim().is_empty()
-                && probe_port_valid;
+                && (probe_is_p2p || probe_port_valid);
             if ui
                 .add_enabled_ui(probe_ready, |ui| {
                     rpg_compact_button(
@@ -745,7 +939,7 @@ pub(super) fn render_players_and_banlist_card(
             let ip_resp = ui.add(
                 egui::TextEdit::singleline(&mut state.manual_ban_ip)
                     .desired_width(140.0)
-                    .hint_text("Địa chỉ IP"),
+                    .hint_text("IP hoặc p2p:..."),
             );
             let can_ban = !state.manual_ban_ip.trim().is_empty();
             let ban_enabled = banlist_writable && can_ban;

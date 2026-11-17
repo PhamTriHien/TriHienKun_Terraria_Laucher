@@ -37,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 quick-xml = "0.42.0"
 sysinfo = "0.40.1"
 socket2 = "0.6"
+iroh = { version = "1.4.1", default-features = false, features = ["tls-ring", "portmapper"] }
 open = "5.4.5"
 rfd = "0.17.2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico", "webp", "gif"] }

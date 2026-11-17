@@ -2109,6 +2109,21 @@ pub fn extract_ban_ip_key(raw: &str) -> Option<IpAddr> {
     None
 }
 
+pub fn extract_ban_p2p_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() <= crate::p2p_tunnel::P2P_BAN_PREFIX.len() {
+        return None;
+    }
+    let (prefix, body) = trimmed.split_at(crate::p2p_tunnel::P2P_BAN_PREFIX.len());
+    if !prefix.eq_ignore_ascii_case(crate::p2p_tunnel::P2P_BAN_PREFIX) {
+        return None;
+    }
+    if body.len() < 32 || !body.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(body.to_ascii_lowercase())
+}
+
 pub fn is_loopback_ban_target(raw: &str) -> bool {
     raw.trim().eq_ignore_ascii_case("localhost")
         || extract_ban_ip_key(raw).is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
@@ -2546,6 +2561,7 @@ mod tests {
         let (_guard, paths) = make_temp_paths("tl_join_meta_restart");
         let mut tml_profile = ServerProfile {
             edition: GameEdition::TModLoader,
+            p2p_tunnel: true,
             ..Default::default()
         };
         tml_profile.config.password = "secret-pass".to_string();
@@ -2559,6 +2575,7 @@ mod tests {
 
         let mut vanilla_profile = ServerProfile {
             edition: GameEdition::Vanilla,
+            p2p_tunnel: true,
             ..Default::default()
         };
         vanilla_profile.config.password = "vanilla-pass".to_string();
@@ -2703,6 +2720,7 @@ mod tests {
             id: "smoke-stop".to_string(),
             edition: GameEdition::Vanilla,
             auto_restart: false,
+            p2p_tunnel: true,
             ..Default::default()
         };
         profile.config.world = test_world.to_string_lossy().into_owned();
@@ -3027,6 +3045,25 @@ mod tests {
     }
 
     #[test]
+    fn extract_ban_p2p_key_validates_prefix_length_and_alphanumeric_body() {
+        let valid_upper = "0123456789ABCDEF".repeat(4);
+        assert_eq!(
+            extract_ban_p2p_key(&format!("  P2P:{valid_upper}  ")),
+            Some(valid_upper.to_ascii_lowercase())
+        );
+        assert_eq!(
+            extract_ban_p2p_key("p2p:abcdefghijklmnopqrstuvwxyz012345"),
+            Some("abcdefghijklmnopqrstuvwxyz012345".to_string())
+        );
+        assert_eq!(extract_ban_p2p_key("p2p:short"), None);
+        assert_eq!(extract_ban_p2p_key("p2p:abcdefghijklmnopqrstuvwxyz01234"), None);
+        assert_eq!(extract_ban_p2p_key("p2p: abcdefghijklmnopqrstuvwxyz012345"), None);
+        assert_eq!(extract_ban_p2p_key("p2p:abcdefghijklmnopqrstuvwxyz-12345"), None);
+        assert_eq!(extract_ban_p2p_key(&valid_upper), None);
+        assert_eq!(extract_ban_p2p_key("192.168.1.5"), None);
+    }
+
+    #[test]
     fn colon_and_angle_bracket_player_names_and_chat_spoof_rejection_work() {
         assert_eq!(
             parse_playing_player_line(":D (127.0.0.1:60972)"),
@@ -3118,6 +3155,7 @@ mod tests {
         let mut profile = ServerProfile {
             id: "p1".to_string(),
             edition: GameEdition::Vanilla,
+            p2p_tunnel: true,
             ..Default::default()
         };
         profile.config.world = missing_world.to_string_lossy().into_owned();
@@ -3173,6 +3211,7 @@ mod tests {
         let (_guard, paths) = make_temp_paths("tl_join_meta_ban_guard");
         let mut profile = ServerProfile {
             edition: GameEdition::TModLoader,
+            p2p_tunnel: true,
             extra_args: r#"-p 7799 -password="cli pass" -modpack "CLI Pack""#.to_string(),
             ..Default::default()
         };
@@ -3359,6 +3398,7 @@ mod tests {
         let (_guard, paths) = make_temp_paths("tl_live_auto_restart");
         let mut profile = ServerProfile {
             auto_restart: false,
+            p2p_tunnel: true,
             ..Default::default()
         };
         let sup = ServerSupervisor::new(&paths, &profile);
@@ -3382,6 +3422,7 @@ mod tests {
         let (_guard, paths) = make_temp_paths("tl_running_modpack");
         let mut profile = ServerProfile {
             edition: GameEdition::TModLoader,
+            p2p_tunnel: true,
             ..Default::default()
         };
         profile.config.modpack = "MissingPack".to_string();
@@ -3437,6 +3478,7 @@ mod tests {
         let profile = ServerProfile {
             id: "tml-preflight".to_string(),
             edition: GameEdition::TModLoader,
+            p2p_tunnel: true,
             ..Default::default()
         };
 
@@ -3498,6 +3540,7 @@ mod tests {
         let mut profile = ServerProfile {
             id: "cli-pack".to_string(),
             edition: GameEdition::TModLoader,
+            p2p_tunnel: true,
             extra_args: r#"-port 7788 -modpack "CliFolderPack" -secure"#.to_string(),
             ..Default::default()
         };
@@ -3528,6 +3571,7 @@ mod tests {
         let legacy_profile = ServerProfile {
             id: "legacy-cli-pack".to_string(),
             edition: GameEdition::TModLoader,
+            p2p_tunnel: true,
             extra_args: r#"-modpack="LegacyPack" -secure"#.to_string(),
             ..Default::default()
         };
@@ -3568,6 +3612,7 @@ mod tests {
         let mut profile = ServerProfile {
             id: "moved-srv".to_string(),
             edition: GameEdition::Vanilla,
+            p2p_tunnel: true,
             ..Default::default()
         };
         profile.config.worldpath = r"Z:/MissingDrive/DATA/saves/Vanilla/Worlds".to_string();

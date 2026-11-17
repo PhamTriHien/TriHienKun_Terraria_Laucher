@@ -7,7 +7,10 @@ use crate::theme::{
 };
 use egui::RichText;
 use tl_core::{GameEdition, WorldDifficultyOption};
-use tl_runtime::{ConsoleLogLine, DirectHostStatus, ServerLifecycleState};
+use tl_runtime::{
+    format_p2p_ticket_short, is_p2p_ticket, ConsoleLogLine, DirectHostStatus, ExternalReachability,
+    ServerLifecycleState,
+};
 
 pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     let p = state.palette();
@@ -85,17 +88,28 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             state.server_tab = ServerSubTab::Config;
         }
 
-        let net_label = if direct_open {
-            "Mở Port & IP • Đang mở"
+        let direct_status_tab = state.active_direct_host_status();
+        let (net_label, net_skin) = if state.active_online_endpoint().is_some() {
+            ("Mở Port & IP • Đang mở", ButtonSkin::Emerald)
+        } else if matches!(direct_status_tab, DirectHostStatus::Starting { .. })
+            || state.is_active_profile_pending_direct_host()
+            || matches!(
+                direct_status_tab,
+                DirectHostStatus::Running(ref info) if info.is_online_setup_in_progress()
+            )
+        {
+            ("Mở Port & IP • Đang kiểm tra", ButtonSkin::Cyan)
+        } else if direct_open {
+            ("Mở Port & IP • Chỉ LAN", ButtonSkin::Amber)
         } else {
-            ServerSubTab::Network.label()
+            (ServerSubTab::Network.label(), ButtonSkin::Emerald)
         };
         if rpg_selectable_button(
             ui,
             assets.as_ref(),
             p,
             state.server_tab == ServerSubTab::Network,
-            ButtonSkin::Emerald,
+            net_skin,
             UiIcon::Host,
             net_label,
         )
@@ -487,7 +501,17 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
             }
 
             if let Some(ep) = state.active_online_endpoint() {
-                status_pill(ui, &format!("Online: {ep}"), p.accent_emerald);
+                let (pill_text, copy_msg) = if is_p2p_ticket(&ep) {
+                    (
+                        format!("Cổng Ảo: {}", format_p2p_ticket_short(&ep)),
+                        "Đã sao chép mã Cổng Ảo P2P".to_string(),
+                    )
+                } else if ep.starts_with('[') {
+                    (format!("IPv6 Online: {ep}"), format!("Đã sao chép {ep}"))
+                } else {
+                    (format!("Online: {ep}"), format!("Đã sao chép {ep}"))
+                };
+                status_pill(ui, &pill_text, p.accent_emerald);
                 if rpg_compact_button(
                     ui,
                     assets.as_ref(),
@@ -498,29 +522,64 @@ fn render_profile_and_controls_card(state: &mut AppState, ui: &mut egui::Ui, p: 
                 )
                 .clicked()
                 {
-                    ui.ctx().copy_text(ep.clone());
-                    state.notify_ok(format!("Đã sao chép {ep}"));
+                    ui.ctx().copy_text(ep);
+                    state.notify_ok(copy_msg);
                 }
             } else if matches!(direct_status, DirectHostStatus::Starting { .. })
                 || state.is_active_profile_pending_direct_host()
+                || matches!(
+                    &direct_status,
+                    DirectHostStatus::Running(info) if info.is_online_setup_in_progress()
+                )
             {
-                status_pill(ui, "Đang mở cổng Online...", p.accent_cyan);
+                status_pill(ui, "Đang mở & kiểm tra cổng Online...", p.accent_cyan);
                 ui.spinner();
             } else if let DirectHostStatus::Running(info) = &direct_status {
-                if let Some(v6) = &info.ipv6_endpoint {
-                    status_pill(ui, &format!("IPv6: {v6}"), p.accent_emerald);
-                    if rpg_compact_button(
-                        ui,
-                        assets.as_ref(),
-                        p,
-                        ButtonSkin::Cyan,
-                        Some(UiIcon::Copy),
-                        "Sao chép",
-                    )
-                    .clicked()
-                    {
-                        ui.ctx().copy_text(v6.clone());
-                        state.notify_ok(format!("Đã sao chép {v6}"));
+                match info.candidate_wan_endpoint() {
+                    Some((_, ExternalReachability::Blocked)) => {
+                        status_pill(
+                            ui,
+                            "Modem đang chặn Internet • Chỉ vào được LAN",
+                            p.accent_amber,
+                        );
+                    }
+                    Some((ep, ExternalReachability::CheckUnavailable(_))) => {
+                        status_pill(
+                            ui,
+                            &format!("Chưa xác nhận Modem: {ep}"),
+                            p.accent_amber,
+                        );
+                        if rpg_compact_button(
+                            ui,
+                            assets.as_ref(),
+                            p,
+                            ButtonSkin::Cyan,
+                            Some(UiIcon::Copy),
+                            "Sao chép",
+                        )
+                        .clicked()
+                        {
+                            ui.ctx().copy_text(ep.clone());
+                            state.notify_ok(format!("Đã sao chép {ep}"));
+                        }
+                    }
+                    _ => {
+                        if let Some(lan_ep) = info.primary_lan_endpoint() {
+                            status_pill(ui, &format!("LAN: {lan_ep}"), p.accent_cyan);
+                            if rpg_compact_button(
+                                ui,
+                                assets.as_ref(),
+                                p,
+                                ButtonSkin::Cyan,
+                                Some(UiIcon::Copy),
+                                "Sao chép",
+                            )
+                            .clicked()
+                            {
+                                ui.ctx().copy_text(lan_ep.to_string());
+                                state.notify_ok(format!("Đã sao chép {lan_ep}"));
+                            }
+                        }
                     }
                 }
             } else if let DirectHostStatus::Error(err) = &direct_status {

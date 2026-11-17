@@ -42,11 +42,13 @@ C:\TerrariaLauncher\
 
 - **Chơi Game**:
   - Chạy **Terraria 1.4.5.8** hoặc **tModLoader 2026.9**.
-  - Tham gia nhanh server theo `Host:Port` hoặc `[IPv6]:port` (tự động tạo cầu nối cục bộ IPv4 → IPv6 cho client) và lưu danh sách server thường chơi.
+  - **Tham gia nhanh** server bằng cách nhập/dán `Host:Port`, `[IPv6]:port` hoặc mã **Cổng Ảo P2P** (`TLPORT:...`) (Launcher tự động mở cầu nối cục bộ `127.0.0.1:<port>` cho kết nối IPv6 hoặc P2P + Relay) và lưu danh sách server thường chơi.
   - Tự động đọc thông tin file `.wld` (tên thế giới, kích thước, độ khó, special seeds, `.twld`), hỗ trợ sao lưu, khôi phục bằng `.zip` và kéo thả trực tiếp file thế giới (`.wld`, `.twld`) hoặc bản sao lưu thế giới (`.zip`) vào cửa sổ launcher.
 - **Server Game**:
   - **Cấu hình**: quản lý nhiều hồ sơ server độc lập, chỉnh sửa đầy đủ `serverconfig.txt` (bao gồm các tùy chọn `seed_*`, `worldrollbackstokeep`, `slowliquids` của 1.4.5), bật server nền không mở cửa sổ CMD rời, theo dõi RAM/CPU, hỗ trợ **Lưu & Tắt** an toàn (`save` + `exit`) và tự khởi động lại khi crash.
-  - **Mở Port & IP**: tự động nhận diện **Mạng LAN** và **VPN chơi game** (`Radmin VPN`, `Tailscale`, `ZeroTier`), cấp quyền **Windows Firewall**, mở cổng tự động **UPnP** trên Modem/Router (phát hiện **CGNAT** và hướng dẫn **Port Forwarding** thủ công), lắng nghe **Global IPv6** (`[IPv6]:port` để bạn bè tham gia trực tiếp qua **Tham gia nhanh**) và kiểm tra kết nối TCP thực tế theo `host:port`.
+  - **Mở Port & IP**:
+    - **Cổng Ảo P2P + Relay (`TLPORT:...`)**: tích hợp sẵn trong Launcher, tạo đường hầm outbound mã hóa P2P/HTTPS-relay cố định theo từng hồ sơ server, hoạt động qua CGNAT, tường lửa router và mạng IPv4/IPv6 mà không cần tài khoản hay mở port modem; bạn bè chỉ cần dán mã `TLPORT:...` vào **Tham gia nhanh**.
+    - **Mạng LAN, VPN & Mở cổng trực tiếp**: tự động nhận diện **Mạng LAN** và **VPN chơi game** (`Radmin VPN`, `Tailscale`, `ZeroTier`), cấp quyền **Windows Firewall**, mở cổng tự động **UPnP IPv4** (`WANIPConnection`) và **UPnP IPv6 Firewall Pinhole** (`WANIPv6FirewallControl`) trên Modem/Router, phát hiện chính xác **CGNAT** (đối chiếu WAN IP của Modem với Public IP) kèm hướng dẫn **Port Forwarding** thủ công, lắng nghe **Global IPv6** (`[IPv6]:port` cho **Tham gia nhanh**), kiểm tra khả năng kết nối từ Internet bên ngoài và kiểm tra kết nối TCP thực tế theo `host:port`.
   - **Console & Người chơi**: xem console log theo thời gian thực, gửi lệnh trực tiếp (`playing`, `save`, `dawn`, `noon`, `dusk`, `midnight`, `settle`, `kick`, `ban`), **Kick / Ban** người chơi đang online và quản lý `banlist.txt`.
 - **Cài Mod**:
   - **Đã cài**:

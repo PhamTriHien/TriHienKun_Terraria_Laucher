@@ -7,7 +7,7 @@ use crate::theme::{
 };
 use egui::RichText;
 use tl_core::GameEdition;
-use tl_runtime::{InstallProgress, ServerLifecycleState};
+use tl_runtime::{format_p2p_ticket_short, is_p2p_ticket, InstallProgress, ServerLifecycleState};
 
 fn is_edition_ready(state: &AppState, edition: GameEdition) -> bool {
     match edition {
@@ -29,6 +29,8 @@ fn edition_launch_block_hint(
 ) -> Option<&'static str> {
     if state.install_busy {
         Some("Đang cài đặt thành phần...")
+    } else if state.p2p_join_connecting {
+        Some("Đang kết nối Cổng Ảo P2P...")
     } else if check_client_running
         && (state.active_game.is_some() || state.is_edition_client_running(edition))
     {
@@ -281,7 +283,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             let host_resp = ui.add(
                 egui::TextEdit::singleline(&mut state.config.quick_join_host)
                     .desired_width(185.0)
-                    .hint_text("IP, Domain hoặc [IPv6]:port"),
+                    .hint_text("IP, [IPv6]:port hoặc TLPORT:..."),
             );
             if (host_resp.changed() && pasted) || host_resp.lost_focus() {
                 if let Some((host, port)) = parse_pasted_host_port(&state.config.quick_join_host) {
@@ -294,8 +296,10 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 }
             }
 
+            let p2p_mode = is_p2p_ticket(&state.config.quick_join_host);
             ui.label(RichText::new("Cổng:").color(p.text_muted));
-            let port_resp = ui.add(
+            let port_resp = ui.add_enabled(
+                !p2p_mode,
                 egui::TextEdit::singleline(&mut state.quick_join_port_input)
                     .desired_width(62.0)
                     .hint_text("7777"),
@@ -360,6 +364,9 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 .clicked()
             {
                 state.launch_selected_game(None);
+            }
+            if state.p2p_join_connecting {
+                ui.spinner();
             }
         });
 
@@ -469,7 +476,9 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
                 rpg_subcard(ui, assets.as_ref(), p, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&srv.name).strong());
-                        let ep_text = if srv.host.contains(':') {
+                        let ep_text = if is_p2p_ticket(&srv.host) {
+                            format_p2p_ticket_short(&srv.host)
+                        } else if srv.host.contains(':') {
                             format!("[{}]:{}", srv.host, srv.port)
                         } else {
                             format!("{}:{}", srv.host, srv.port)
@@ -920,6 +929,9 @@ pub(crate) fn render_install_progress_bar(ui: &mut egui::Ui, p: &InstallProgress
 
 pub(crate) fn parse_pasted_host_port(raw: &str) -> Option<(String, u16)> {
     let trimmed = raw.trim();
+    if is_p2p_ticket(trimmed) {
+        return None;
+    }
     if let Some(rest) = trimmed.strip_prefix('[') {
         let (ipv6, port_part) = rest.split_once("]:")?;
         let ipv6 = ipv6.split('%').next().unwrap_or(ipv6).trim();
