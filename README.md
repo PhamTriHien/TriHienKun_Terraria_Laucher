@@ -17,6 +17,7 @@ C:\TerrariaLauncher\
 │   │   ├── Vanilla\Worlds\ # Thế giới Terraria 1.4.5.8
 │   │   └── tModLoader\     # Thế giới & mod tModLoader
 │   │       ├── Worlds\     # Thế giới tModLoader (.wld/.twld)
+│   │       ├── ModConfigs\ # Cấu hình mod dùng chung cho game và server
 │   │       └── Mods\       # File .tmod, enabled.json, mod_sources.json, workshop_manifest.json, ModPacks\
 │   ├── Servers\            # serverconfig.txt, server.log và banlist.txt theo từng hồ sơ
 │   ├── Backups\            # Bản sao lưu thế giới (.zip)
@@ -55,6 +56,7 @@ C:\TerrariaLauncher\
     - Hiển thị icon trích xuất từ `.tmod`, phiên bản, tác giả, `ModSide`, cảnh báo thiếu dependency, bật/tắt cập nhật `enabled.json` và kéo thả trực tiếp file `.tmod` / `.zip` vào cửa sổ.
     - Gắn nhãn nguồn/ID từng mod (`Workshop <id>`, `GitHub: <repo>`, `URL .tmod`, `Thủ công`) lưu trong `mod_sources.json`; hỗ trợ gắn/chỉnh nguồn thủ công (`Lưu nguồn`) và tra cứu nhanh trên Workshop (`Tìm Workshop`).
     - **Xuất mã đồng bộ** / **Nhập mã đồng bộ** (`TLPACK1:...`) với phạm vi `Mod đang bật` hoặc `Tất cả đã cài` (giữ nguyên trạng thái bật/tắt của từng mod giữa các máy) và theo dõi tiến trình tải theo byte thực tế.
+  - **Cấu hình**: xem, nhập và chỉnh file JSON trong `ModConfigs` (tối đa 512 KiB/file). Launcher sao lưu file cũ trước khi thay thế và chỉ cho lưu khi tModLoader và server tModLoader đã dừng. Cấu hình này không thay thế menu chọn preset tạo world của Advanced World Generation.
   - **GitHub & URL**: tra cứu nhanh release mới nhất từ repo phổ biến (`RecipeBrowser`, `MagicStorage`, `BossChecklist`, `AlchemistNPCLite`, `OreExcavator`, `WingSlot`), nhập repo `owner/repo` bất kỳ hoặc tải trực tiếp từ link `.tmod` kèm thanh tiến trình tải trực tiếp theo byte.
   - **ModPack**: gom nhóm mod thành ModPack riêng, chuyển đổi nhanh, đồng bộ tiến trình tải/cập nhật và hỗ trợ xuất `install.txt`.
   - **Workshop**:

@@ -1,4 +1,5 @@
 mod host_view;
+pub(crate) mod mod_configs_view;
 pub mod mods_view;
 pub mod play_view;
 pub mod server_view;

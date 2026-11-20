@@ -758,8 +758,29 @@ async fn handle_p2p_connection(ctx: P2pHostContext, incoming: iroh::endpoint::In
     }
 }
 
+fn publish_online_relay_status(
+    endpoint_id: &iroh::PublicKey,
+    stable_ticket: &str,
+    addr: &iroh::EndpointAddr,
+    status: &RwLock<DirectHostStatus>,
+    wake_ui: &RepaintHandle,
+) {
+    if let Some(url_str) = addr.relay_urls().next().map(|u| u.to_string()) {
+        update_p2p_status(
+            status,
+            wake_ui,
+            P2pHostStatus::Running {
+                ticket: stable_ticket.to_string(),
+                endpoint_id: endpoint_id.to_string(),
+                relay_url: Some(url_str),
+            },
+        );
+    }
+}
+
 fn spawn_online_relay_watcher(
     endpoint: &iroh::Endpoint,
+    stable_ticket: String,
     status: Arc<RwLock<DirectHostStatus>>,
     wake_ui: RepaintHandle,
     cancel: CancellationToken,
@@ -767,21 +788,7 @@ fn spawn_online_relay_watcher(
     let endpoint_id = endpoint.id();
     let mut watcher = endpoint.watch_addr();
     tokio::spawn(async move {
-        let publish_relay = |addr: &iroh::EndpointAddr| {
-            if let Some(url_str) = addr.relay_urls().next().map(|u| u.to_string()) {
-                let ticket = encode_p2p_ticket(&endpoint_id, Some(&url_str));
-                update_p2p_status(
-                    &status,
-                    &wake_ui,
-                    P2pHostStatus::Running {
-                        ticket,
-                        endpoint_id: endpoint_id.to_string(),
-                        relay_url: Some(url_str),
-                    },
-                );
-            }
-        };
-        publish_relay(&watcher.get());
+        publish_online_relay_status(&endpoint_id, &stable_ticket, &watcher.get(), &status, &wake_ui);
         loop {
             let addr = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -790,7 +797,7 @@ fn spawn_online_relay_watcher(
                     Err(_) => break,
                 },
             };
-            publish_relay(&addr);
+            publish_online_relay_status(&endpoint_id, &stable_ticket, &addr, &status, &wake_ui);
         }
     });
 }
@@ -888,12 +895,12 @@ pub(crate) fn spawn_p2p_host_worker_inner(
             .next()
             .map(|u| u.to_string())
             .or_else(|| Some(DEFAULT_FALLBACK_RELAY_URL.to_string()));
-        let initial_ticket = encode_p2p_ticket(&endpoint_id, initial_relay.as_deref());
+        let stable_ticket = encode_p2p_ticket(&endpoint_id, None);
         update_p2p_status(
             &status,
             &wake_ui,
             P2pHostStatus::Running {
-                ticket: initial_ticket,
+                ticket: stable_ticket.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 relay_url: initial_relay,
             },
@@ -902,6 +909,7 @@ pub(crate) fn spawn_p2p_host_worker_inner(
         if use_relay_preset {
             spawn_online_relay_watcher(
                 &endpoint,
+                stable_ticket,
                 Arc::clone(&status),
                 wake_ui.clone(),
                 cancel.clone(),
@@ -1531,6 +1539,7 @@ mod tests {
                     } = info.p2p_status
                     {
                         assert!(is_p2p_ticket(ticket));
+                        assert_eq!(ticket, &encode_p2p_ticket(&host_key.public(), None));
                         assert_eq!(endpoint_id, &host_key.public().to_string());
                         assert_eq!(info.preferred_online_endpoint(), Some(ticket.clone()));
                         break;
@@ -1791,6 +1800,7 @@ mod tests {
                     } = info.p2p_status
                     {
                         assert!(is_p2p_ticket(ticket));
+                        assert_eq!(ticket, &encode_p2p_ticket(&host_key.public(), None));
                         assert_eq!(endpoint_id, &host_key.public().to_string());
                         break ticket.clone();
                     }
@@ -1841,6 +1851,141 @@ mod tests {
                 .expect("host join timeout")
                 .expect("host task clean exit");
 
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn stable_host_ticket_persists_across_restarts_and_relay_changes() {
+        let key = iroh::SecretKey::from_bytes(&[0x5Au8; 32]);
+        let endpoint_id = key.public();
+        let expected_ticket = encode_p2p_ticket(&endpoint_id, None);
+        let expected_short = format_p2p_ticket_short(&expected_ticket);
+        assert!(expected_ticket.ends_with("AA"));
+
+        let status = Arc::new(RwLock::new(DirectHostStatus::Running(
+            DirectHostActiveInfo {
+                local_port: 7777,
+                host_port: 7777,
+                lan_endpoints: Vec::new(),
+                vpn_endpoints: Vec::new(),
+                ipv6_endpoint: None,
+                ipv6_pinhole_status: Ipv6PinholeStatus::Disabled,
+                ipv6_reachability: ExternalReachability::NotChecked,
+                upnp_status: UpnpPortStatus::Disabled,
+                ipv4_reachability: ExternalReachability::NotChecked,
+                bridging_tcp: false,
+                active_clients: 0,
+                p2p_status: P2pHostStatus::Starting,
+            },
+        )));
+        let wake_ui = RepaintHandle::default();
+
+        for relay_str in [
+            "https://aps1-1.relay.n0.iroh.link./",
+            "https://usw1-1.relay.n0.iroh.link./",
+            "https://euc1-1.relay.n0.iroh.link./",
+        ] {
+            let relay: iroh::RelayUrl = relay_str.parse().unwrap();
+            let addr = iroh::EndpointAddr::new(endpoint_id).with_relay_url(relay.clone());
+            publish_online_relay_status(&endpoint_id, &expected_ticket, &addr, &status, &wake_ui);
+
+            let guard = status.read().unwrap();
+            let DirectHostStatus::Running(ref info) = *guard else {
+                panic!("expected DirectHostStatus::Running");
+            };
+            let P2pHostStatus::Running {
+                ref ticket,
+                endpoint_id: ref reported_id,
+                ref relay_url,
+            } = info.p2p_status
+            else {
+                panic!("expected P2pHostStatus::Running");
+            };
+            assert_eq!(ticket, &expected_ticket);
+            assert_eq!(format_p2p_ticket_short(ticket), expected_short);
+            assert_eq!(reported_id, &endpoint_id.to_string());
+            assert_eq!(relay_url.as_deref(), Some(relay.as_str()));
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!("tl_p2p_stable_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let key_path = dir.join("p2p_secret.key");
+
+            let mut observed_tickets = Vec::with_capacity(2);
+            let mut expected_from_disk = None;
+            for _ in 0..2 {
+                let loaded_key = load_or_create_p2p_secret_key(Some(&key_path));
+                let expected_disk_ticket = encode_p2p_ticket(&loaded_key.public(), None);
+                if let Some(ref prev) = expected_from_disk {
+                    assert_eq!(prev, &expected_disk_ticket);
+                } else {
+                    expected_from_disk = Some(expected_disk_ticket.clone());
+                }
+
+                let cancel = CancellationToken::new();
+                let run_status = Arc::new(RwLock::new(DirectHostStatus::Running(
+                    DirectHostActiveInfo {
+                        local_port: 7777,
+                        host_port: 7777,
+                        lan_endpoints: Vec::new(),
+                        vpn_endpoints: Vec::new(),
+                        ipv6_endpoint: None,
+                        ipv6_pinhole_status: Ipv6PinholeStatus::Disabled,
+                        ipv6_reachability: ExternalReachability::NotChecked,
+                        upnp_status: UpnpPortStatus::Disabled,
+                        ipv4_reachability: ExternalReachability::NotChecked,
+                        bridging_tcp: false,
+                        active_clients: 0,
+                        p2p_status: P2pHostStatus::Starting,
+                    },
+                )));
+                let host_join = spawn_p2p_host_worker_inner(
+                    7777,
+                    loaded_key,
+                    cancel.clone(),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::clone(&run_status),
+                    RepaintHandle::default(),
+                    Arc::new(RwLock::new(HashSet::new())),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(RwLock::new(HashMap::new())),
+                    false,
+                    None,
+                );
+
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let ticket = loop {
+                    if let DirectHostStatus::Running(ref info) = *run_status.read().unwrap() {
+                        if let P2pHostStatus::Running { ref ticket, .. } = info.p2p_status {
+                            break ticket.clone();
+                        }
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "P2pHostStatus did not become Running"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+
+                assert_eq!(ticket, expected_disk_ticket);
+                observed_tickets.push(ticket);
+
+                cancel.cancel();
+                timeout(Duration::from_secs(5), host_join)
+                    .await
+                    .expect("host join timeout")
+                    .expect("host task clean exit");
+            }
+
+            assert_eq!(observed_tickets[0], observed_tickets[1]);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

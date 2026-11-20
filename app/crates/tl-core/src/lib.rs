@@ -1,6 +1,7 @@
 pub mod binary_parsers;
 pub mod config;
 pub mod error;
+pub mod mod_configs;
 pub mod modpack_share;
 pub mod paths;
 

@@ -13,7 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -23,7 +23,7 @@ use tl_core::{
     read_declared_tml_dotnet_version_opt, GameEdition, LauncherError, LauncherPaths,
     LauncherResult, ServerConfigData, ServerProfile,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Notify};
 #[cfg(windows)]
@@ -35,7 +35,7 @@ use windows::Win32::Foundation::{
 #[cfg(windows)]
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 #[cfg(windows)]
@@ -48,6 +48,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_CONSOLE_LINES: usize = 2000;
+const WORLD_CREATION_MENU_PROMPT: &str = "Please choose the options you want.";
+const WORLD_CREATION_MENU_ERROR: &str = "Advanced World Generation cần nhập tay khi tạo world. Hãy tạo world trong tModLoader với cùng bộ mod, rồi chọn world đó để chạy server.";
 const LOG_TAIL_MAX_BYTES: u64 = 128 * 1024;
 const GRACEFUL_STOP_RUNNING_SECS: u64 = 12;
 const GRACEFUL_STOP_STARTING_SECS: u64 = 2;
@@ -181,15 +183,23 @@ impl KillOnCloseJob {
         Ok(job)
     }
 
-    fn assign_child(&self, child: &Child) {
+    fn assign_child(&self, child: &Child) -> bool {
         let Some(raw) = child.raw_handle() else {
-            return;
+            return false;
         };
         let job_handle = HANDLE(self.0 as *mut _);
         let process_handle = HANDLE(raw);
-        if let Err(e) = unsafe { AssignProcessToJobObject(job_handle, process_handle) } {
-            tracing::warn!("Could not attach server child to kill-on-close job object: {e}");
+        match unsafe { AssignProcessToJobObject(job_handle, process_handle) } {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("Could not attach server child to kill-on-close job object: {e}");
+                false
+            }
         }
+    }
+
+    fn terminate(&self) -> windows::core::Result<()> {
+        unsafe { TerminateJobObject(HANDLE(self.0 as *mut _), 1) }
     }
 }
 
@@ -867,8 +877,13 @@ fn prepare_effective_server_config(
             .to_string_lossy()
             .into_owned();
     }
+    let world = Path::new(&effective_cfg.world);
     if effective_cfg.world.trim().is_empty()
-        || (!Path::new(&effective_cfg.world).is_file() && effective_cfg.autocreate.is_none())
+        || (effective_cfg.autocreate.is_none()
+            && match profile.edition {
+                GameEdition::TModLoader => !paths.tmodloader_dir.join(world).is_file(),
+                GameEdition::Vanilla => !world.is_file(),
+            })
     {
         return Err(LauncherError::InvalidInput(
             "File thế giới chưa tồn tại và tính năng Tự tạo World đang tắt. Hãy chọn thế giới có sẵn hoặc bật Tự tạo World.".to_string(),
@@ -1026,107 +1041,8 @@ async fn run_server_supervisor(
             break;
         }
         match spawn_server_process(&paths, &profile, &config_file, strip_cli_modpack, tuning) {
-            Ok(mut child) => {
-                #[cfg(windows)]
-                if let Some(job) = sup._job_object.as_ref() {
-                    job.assign_child(&child);
-                }
-                if sup.stop_requested.load(Ordering::SeqCst) {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    mark_stopped_by_request(&sup, &repaint);
-                    break;
-                }
-                let pid = child.id();
-                sup.run_generation.fetch_add(1, Ordering::SeqCst);
-                *sup.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = pid;
-                {
-                    let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
-                    guard.snapshot.pid = pid;
-                    guard.snapshot.state = ServerLifecycleState::Starting;
-                    guard.snapshot.players.clear();
-                    guard.playing_batch_names.clear();
-                }
-                repaint.wake();
-
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
-                let stdin = child.stdin.take();
-
-                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
-                *sup.stdin_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(cmd_tx);
-
-                if let Some(stdin) = stdin {
-                    tokio::spawn(stdin_writer_task(stdin, cmd_rx));
-                }
-                let out_handle = stdout.map(|out| {
-                    let s = sup.clone();
-                    let r = repaint.clone();
-                    tokio::spawn(async move {
-                        let mut lines = BufReader::new(out).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            handle_server_output_line(&s, false, &line);
-                            r.wake();
-                        }
-                    })
-                });
-                let err_handle = stderr.map(|err| {
-                    let s = sup.clone();
-                    let r = repaint.clone();
-                    tokio::spawn(async move {
-                        let mut lines = BufReader::new(err).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            handle_server_output_line(&s, true, &line);
-                            r.wake();
-                        }
-                    })
-                });
-
-                let exit_res = child.wait().await;
-                if let Some(h) = out_handle {
-                    let _ = h.await;
-                }
-                if let Some(h) = err_handle {
-                    let _ = h.await;
-                }
-                *sup.stdin_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *sup.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
-
-                let user_stopped = sup.stop_requested.load(Ordering::SeqCst);
-                let clean_shutdown = {
-                    let guard = sup.shared.read().unwrap_or_else(|e| e.into_inner());
-                    is_clean_server_exit(
-                        user_stopped,
-                        &guard.snapshot.state,
-                        exit_res.as_ref().is_ok_and(|st| st.success()),
-                    )
-                };
-                let exit_desc = match &exit_res {
-                    Ok(st) => format!("Mã thoát: {:?}", st.code()),
-                    Err(e) => format!("Lỗi chờ tiến trình: {e}"),
-                };
-                push_log_line(
-                    &sup.shared,
-                    !clean_shutdown,
-                    format!("[Launcher] Tiến trình server đã kết thúc ({exit_desc})."),
-                );
-
-                if clean_shutdown || !sup.auto_restart.load(Ordering::SeqCst) {
-                    {
-                        let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
-                        guard.snapshot.pid = None;
-                        guard.snapshot.players.clear();
-                        guard.playing_batch_names.clear();
-                        if clean_shutdown {
-                            guard.snapshot.state = ServerLifecycleState::Stopped;
-                            guard.snapshot.status_detail = "Đã dừng".to_string();
-                        } else {
-                            guard.snapshot.state = ServerLifecycleState::Crashed(exit_desc.clone());
-                            guard.snapshot.status_detail = format!("Dừng bất thường ({exit_desc})");
-                        }
-                    }
-                    sup.exit_notify.notify_waiters();
-                    repaint.wake();
+            Ok(child) => {
+                if !supervise_server_child(&sup, child, &repaint).await {
                     break;
                 }
 
@@ -1144,6 +1060,163 @@ async fn run_server_supervisor(
             }
         }
     }
+}
+
+async fn supervise_server_child(
+    sup: &ServerSupervisor,
+    mut child: Child,
+    repaint: &egui_repaint::RepaintHandle,
+) -> bool {
+    #[cfg(windows)]
+    let job = sup
+        ._job_object
+        .as_ref()
+        .as_ref()
+        .filter(|job| job.assign_child(&child));
+    if sup.stop_requested.load(Ordering::SeqCst) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        mark_stopped_by_request(sup, repaint);
+        return false;
+    }
+
+    let pid = child.id();
+    sup.run_generation.fetch_add(1, Ordering::SeqCst);
+    *sup.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = pid;
+    {
+        let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
+        guard.snapshot.pid = pid;
+        guard.snapshot.state = ServerLifecycleState::Starting;
+        guard.snapshot.players.clear();
+        guard.playing_batch_names.clear();
+    }
+    repaint.wake();
+
+    if let Some(stdin) = child.stdin.take() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
+        *sup.stdin_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(cmd_tx);
+        tokio::spawn(stdin_writer_task(stdin, cmd_rx));
+    }
+    let (exit_res, interactive_world_creation) = monitor_server_child(
+        sup,
+        &mut child,
+        repaint,
+        #[cfg(windows)]
+        job,
+    )
+    .await;
+    *sup.stdin_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *sup.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+    let user_stopped = sup.stop_requested.load(Ordering::SeqCst);
+    let clean_shutdown = {
+        let guard = sup.shared.read().unwrap_or_else(|e| e.into_inner());
+        is_clean_server_exit(
+            user_stopped,
+            &guard.snapshot.state,
+            exit_res.as_ref().is_ok_and(|st| st.success()),
+        )
+    };
+    let exit_desc = match &exit_res {
+        Ok(st) => format!("Mã thoát: {:?}", st.code()),
+        Err(e) => format!("Lỗi chờ tiến trình: {e}"),
+    };
+    push_log_line(
+        &sup.shared,
+        !clean_shutdown,
+        format!("[Launcher] Tiến trình server đã kết thúc ({exit_desc})."),
+    );
+
+    if clean_shutdown || interactive_world_creation || !sup.auto_restart.load(Ordering::SeqCst) {
+        {
+            let mut guard = sup.shared.write().unwrap_or_else(|e| e.into_inner());
+            guard.snapshot.pid = None;
+            guard.snapshot.players.clear();
+            guard.playing_batch_names.clear();
+            if clean_shutdown {
+                guard.snapshot.state = ServerLifecycleState::Stopped;
+                guard.snapshot.status_detail = "Đã dừng".to_string();
+            } else if interactive_world_creation {
+                guard.snapshot.state =
+                    ServerLifecycleState::Crashed(WORLD_CREATION_MENU_ERROR.to_string());
+                guard.snapshot.status_detail = WORLD_CREATION_MENU_ERROR.to_string();
+            } else {
+                guard.snapshot.state = ServerLifecycleState::Crashed(exit_desc.clone());
+                guard.snapshot.status_detail = format!("Dừng bất thường ({exit_desc})");
+            }
+        }
+        sup.exit_notify.notify_waiters();
+        repaint.wake();
+        return false;
+    }
+    true
+}
+
+async fn monitor_server_child(
+    sup: &ServerSupervisor,
+    child: &mut Child,
+    repaint: &egui_repaint::RepaintHandle,
+    #[cfg(windows)] job: Option<&KillOnCloseJob>,
+) -> (std::io::Result<ExitStatus>, bool) {
+    let mut stdout = child.stdout.take().map(|out| BufReader::new(out).lines());
+    let mut stderr = child.stderr.take().map(|err| BufReader::new(err).lines());
+    let mut exit = None;
+    loop {
+        let (is_error, line) = tokio::select! {
+            line = next_server_output_line(&mut stdout), if stdout.is_some() => (false, line),
+            line = next_server_output_line(&mut stderr), if stderr.is_some() => (true, line),
+            result = child.wait(), if exit.is_none() => {
+                exit = Some(result);
+                continue;
+            }
+            else => break,
+        };
+        let Some(line) = line else {
+            if is_error {
+                stderr = None;
+            } else {
+                stdout = None;
+            }
+            continue;
+        };
+        let needs_interactive_creation = handle_server_output_line(sup, is_error, &line);
+        repaint.wake();
+        if needs_interactive_creation {
+            push_log_line(
+                &sup.shared,
+                true,
+                format!("[Launcher] {WORLD_CREATION_MENU_ERROR}"),
+            );
+            #[cfg(windows)]
+            let job_terminated = job.is_some_and(|job| match job.terminate() {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("Could not terminate server job after world creation prompt: {e}");
+                    false
+                }
+            });
+            #[cfg(not(windows))]
+            let job_terminated = false;
+            if let Some(result) = exit {
+                return (result, true);
+            }
+            if !job_terminated {
+                let _ = child.start_kill().inspect_err(|e| {
+                    tracing::warn!("Could not terminate server child after world creation prompt: {e}");
+                });
+            }
+            // A descendant outside the job can keep the inherited pipes open.
+            drop((stdout, stderr));
+            return (child.wait().await, true);
+        }
+    }
+    (exit.expect("child waited before monitor finished"), false)
+}
+
+async fn next_server_output_line<R: AsyncBufRead + Unpin>(
+    lines: &mut Option<Lines<R>>,
+) -> Option<String> {
+    lines.as_mut()?.next_line().await.ok().flatten()
 }
 
 async fn wait_for_auto_restart_or_stop(
@@ -1385,10 +1458,10 @@ fn parse_players_connected_summary(normalized: &str) -> Option<usize> {
     count_str.parse::<usize>().ok().filter(|&n| n >= 1)
 }
 
-fn handle_server_output_line(sup: &ServerSupervisor, is_error: bool, raw_line: &str) {
+fn handle_server_output_line(sup: &ServerSupervisor, is_error: bool, raw_line: &str) -> bool {
     let clean = raw_line.trim_end_matches(['\r', '\n']);
     if clean.is_empty() {
-        return;
+        return false;
     }
     push_log_line(&sup.shared, is_error, clean.to_string());
 
@@ -1398,6 +1471,13 @@ fn handle_server_output_line(sup: &ServerSupervisor, is_error: bool, raw_line: &
         let state = &mut *guard;
         let is_stopping = sup.stop_requested.load(Ordering::SeqCst)
             || state.snapshot.state == ServerLifecycleState::Stopping;
+        if !is_stopping
+            && state.snapshot.edition == GameEdition::TModLoader
+            && state.snapshot.state == ServerLifecycleState::Starting
+            && clean.trim() == WORLD_CREATION_MENU_PROMPT
+        {
+            return true;
+        }
         let outcome = apply_log_event_to_state(
             clean,
             &now,
@@ -1417,6 +1497,7 @@ fn handle_server_output_line(sup: &ServerSupervisor, is_error: bool, raw_line: &
     if outcome.player_joined && !is_stopping {
         let _ = sup.send_silent_command("playing");
     }
+    false
 }
 
 fn apply_log_event_to_state(
@@ -3204,6 +3285,153 @@ mod tests {
             Path::new(&effective_existing.banlist),
             server_dir.join("banlist.txt").as_path()
         );
+    }
+
+    #[test]
+    fn new_server_world_requires_autocreate_but_not_an_existing_file() {
+        let (_guard, paths) = make_temp_paths("tl_world_preflight");
+        for edition in [GameEdition::TModLoader, GameEdition::Vanilla] {
+            let mut profile = ServerProfile {
+                edition,
+                ..Default::default()
+            };
+            profile.config.worldname = "NewServerWorld".to_string();
+            profile.config.autocreate = Some(3);
+            let worlds_dir = match edition {
+                GameEdition::TModLoader => paths.tml_worlds_dir(),
+                GameEdition::Vanilla => paths.vanilla_worlds_dir(),
+            };
+            let world = worlds_dir.join("NewServerWorld.wld");
+            assert!(!world.exists());
+            let config = prepare_effective_server_config(&paths, &profile, RuntimeTuning::default())
+                .unwrap();
+            assert_eq!(Path::new(&config.world), world);
+            assert!(config
+                .to_config_text(edition)
+                .lines()
+                .any(|line| line == "autocreate=3"));
+            assert!(!world.exists());
+
+            profile.config.autocreate = None;
+            assert!(matches!(
+                prepare_effective_server_config(&paths, &profile, RuntimeTuning::default()),
+                Err(LauncherError::InvalidInput(_))
+            ));
+            fs::create_dir_all(worlds_dir).unwrap();
+            File::create(&world).unwrap();
+            let config = prepare_effective_server_config(&paths, &profile, RuntimeTuning::default())
+                .unwrap();
+            assert_eq!(Path::new(&config.world), world);
+        }
+    }
+
+    #[test]
+    fn relative_tmodloader_world_is_checked_in_server_working_directory() {
+        let (_guard, paths) = make_temp_paths("tl_world_relative");
+        let relative = Path::new("Worlds").join("Relative World.wld");
+        let child_world = paths.tmodloader_dir.join(&relative);
+        fs::create_dir_all(child_world.parent().unwrap()).unwrap();
+        File::create(child_world).unwrap();
+        let mut profile = ServerProfile {
+            edition: GameEdition::TModLoader,
+            ..Default::default()
+        };
+        profile.config.autocreate = None;
+        profile.config.world = relative.to_string_lossy().into_owned();
+        let config = prepare_effective_server_config(&paths, &profile, RuntimeTuning::default())
+            .unwrap();
+        assert_eq!(Path::new(&config.world), relative);
+    }
+
+    #[test]
+    fn world_creation_prompt_is_only_fatal_during_tmodloader_startup() {
+        let (_guard, paths) = make_temp_paths("tl_world_prompt");
+        let profile = ServerProfile {
+            edition: GameEdition::TModLoader,
+            ..Default::default()
+        };
+        let sup = ServerSupervisor::new(&paths, &profile);
+        sup.shared.write().unwrap().snapshot.state = ServerLifecycleState::Starting;
+        for line in [
+            "Choose World:",
+            "Constructing Mods...",
+            "Please choose the options you want",
+            "<Player> Please choose the options you want.",
+        ] {
+            assert!(!handle_server_output_line(&sup, false, line));
+        }
+        assert!(handle_server_output_line(
+            &sup,
+            false,
+            "  Please choose the options you want.  "
+        ));
+        sup.stop_requested.store(true, Ordering::SeqCst);
+        assert!(!handle_server_output_line(&sup, false, WORLD_CREATION_MENU_PROMPT));
+        sup.stop_requested.store(false, Ordering::SeqCst);
+        handle_server_output_line(&sup, false, "Listening on port 7777");
+        assert!(!handle_server_output_line(&sup, false, WORLD_CREATION_MENU_PROMPT));
+
+        let vanilla = ServerSupervisor::new(&paths, &ServerProfile {
+            edition: GameEdition::Vanilla,
+            ..Default::default()
+        });
+        vanilla.shared.write().unwrap().snapshot.state = ServerLifecycleState::Starting;
+        assert!(!handle_server_output_line(&vanilla, false, WORLD_CREATION_MENU_PROMPT));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_world_creation_child_is_reaped_without_restart() {
+        let (_guard, paths) = make_temp_paths("tl_world_prompt_child");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let repaint = egui_repaint::RepaintHandle::default();
+        rt.block_on(async {
+            for (input, redirect) in [("set /p choice=", ""), ("exit /b 0", "1>&2 ")] {
+                let profile = ServerProfile {
+                    edition: GameEdition::TModLoader,
+                    auto_restart: true,
+                    ..Default::default()
+                };
+                let sup = ServerSupervisor::new(&paths, &profile);
+                fs::write(
+                    paths.base_dir.join("world-menu.cmd"),
+                    format!("@echo off\r\n{redirect}echo {WORLD_CREATION_MENU_PROMPT}\r\n{input}\r\n"),
+                )
+                .unwrap();
+                let child = Command::new("cmd.exe")
+                    .args(["/D", "/C", "world-menu.cmd"])
+                    .current_dir(&paths.base_dir)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .kill_on_drop(true)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let retry = tokio::time::timeout(
+                    Duration::from_secs(GRACEFUL_STOP_RUNNING_SECS),
+                    supervise_server_child(&sup, child, &repaint),
+                )
+                .await
+                .expect("interactive startup should stop without console input");
+                assert!(!retry);
+                assert!(sup.stdin_tx.lock().unwrap().is_none());
+                assert!(sup.child_pid.lock().unwrap().is_none());
+                let guard = sup.shared.read().unwrap();
+                assert!(guard.snapshot.pid.is_none());
+                assert_eq!(
+                    guard.snapshot.state,
+                    ServerLifecycleState::Crashed(WORLD_CREATION_MENU_ERROR.to_string())
+                );
+                assert_eq!(guard.snapshot.status_detail, WORLD_CREATION_MENU_ERROR);
+                assert!(guard.logs.iter().any(|line| {
+                    line.is_error && line.text.contains(WORLD_CREATION_MENU_ERROR)
+                }));
+            }
+        });
     }
 
     #[test]

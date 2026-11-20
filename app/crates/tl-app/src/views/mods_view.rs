@@ -44,6 +44,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
             ui.horizontal_wrapped(|ui| {
                 for (sub, icon) in [
                     (ModsSubTab::Installed, UiIcon::Pack),
+                    (ModsSubTab::Configs, UiIcon::Settings),
                     (ModsSubTab::GitHub, UiIcon::Download),
                     (ModsSubTab::ModPacks, UiIcon::Key),
                     (ModsSubTab::Workshop, UiIcon::Workshop),
@@ -70,6 +71,7 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
 
     match state.mods_tab {
         ModsSubTab::Installed => render_installed_tab(state, ui),
+        ModsSubTab::Configs => super::mod_configs_view::render(state, ui),
         ModsSubTab::GitHub => render_github_tab(state, ui),
         ModsSubTab::ModPacks => render_modpacks_tab(state, ui),
         ModsSubTab::Workshop => render_workshop_tab(state, ui),

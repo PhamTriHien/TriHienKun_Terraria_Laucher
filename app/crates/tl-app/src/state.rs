@@ -93,6 +93,7 @@ impl ServerSubTab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModsSubTab {
+    Configs,
     Installed,
     GitHub,
     ModPacks,
@@ -103,6 +104,7 @@ impl ModsSubTab {
     pub fn label(self) -> &'static str {
         match self {
             Self::Installed => "Đã cài",
+            Self::Configs => "Cấu hình",
             Self::GitHub => "GitHub & URL",
             Self::ModPacks => "ModPack",
             Self::Workshop => "Workshop",
@@ -207,6 +209,7 @@ pub struct AppState {
     pub active_tab: NavTab,
     pub server_tab: ServerSubTab,
     pub mods_tab: ModsSubTab,
+    pub mod_config_editor: crate::views::mod_configs_view::ModConfigEditor,
     pub notification: Option<AppNotification>,
     pub last_poll_at: Instant,
 
@@ -382,6 +385,7 @@ impl AppState {
             active_tab: NavTab::Play,
             server_tab: ServerSubTab::Config,
             mods_tab: ModsSubTab::Installed,
+            mod_config_editor: Default::default(),
             notification: None,
             last_poll_at: Instant::now(),
             active_game: None,
@@ -2940,7 +2944,7 @@ impl AppState {
                     .retain(|e| e.profile_id.as_deref() != Some(profile_id.as_str()));
                 self.notify_ok(format!("Đang khởi chạy {profile_name}..."));
             }
-            Err(e) => self.notify_err(e.to_string()),
+            Err(e) => self.notify_err(clean_launcher_error_msg(e)),
         }
     }
 
@@ -4635,6 +4639,10 @@ impl AppState {
                 });
             pack_matches(ext_pack.trim())
         })
+    }
+
+    pub fn is_mod_config_write_locked(&self) -> bool {
+        self.is_tml_client_running() || self.has_running_server_for_edition(GameEdition::TModLoader)
     }
 
     pub fn is_tml_mods_locked(&self) -> bool {
